@@ -1,0 +1,138 @@
+/**
+ * Harness detector — auto-detect which AI harnesses are present.
+ *
+ * Instantiates all 42 adapters and checks each for presence in
+ * the workspace. Returns a DetectedHarness array for reporting.
+ *
+ * HLD §3.14 — Harness Onboarding Matrix
+ * @module
+ */
+
+import type { DetectedHarness } from '@intutic/shared-types'
+import type { IHarnessAdapter } from './types.js'
+import { cursorAdapter } from './cursor.js'
+import { claudeCodeAdapter } from './claudeCode.js'
+import { antigravityAdapter } from './antigravity.js'
+import { windsurfAdapter } from './windsurf.js'
+import { aiderAdapter } from './aider.js'
+import { openhandsAdapter } from './openhands.js'
+import { codexAdapter } from './codex.js'
+import { n8nAdapter } from './n8n.js'
+import { clineAdapter } from './cline.js'
+import { rooCodeAdapter } from './rooCode.js'
+import { continueAdapter } from './continue.js'
+import { claudeDesktopAdapter } from './claudeDesktop.js'
+import { gooseAdapter } from './goose.js'
+import { openWebUIAdapter } from './openWebUI.js'
+import { openclawAdapter } from './openclaw.js'
+import { piAdapter } from './pi.js'
+import { hermesAdapter } from './hermes.js'
+import { githubCopilotAdapter } from './githubCopilot.js'
+import { langgraphAdapter } from './langgraph.js'
+import { museAdapter } from './muse.js'
+import { grokAdapter } from './grok.js'
+import { opencodeAdapter } from './opencode.js'
+import { dshAdapter } from './dsh.js'
+import { xirpAdapter } from './xirp.js'
+import { agenticOrchestratorAdapter } from './agenticOrchestrator.js'
+import { langchainAdapter } from './langchain.js'
+import { crewaiAdapter } from './crewai.js'
+import { autogenAdapter } from './autogen.js'
+import { ag2Adapter } from './ag2.js'
+import { googleAdkAdapter } from './googleAdk.js'
+import { openaiAgentsAdapter } from './openaiAgents.js'
+import { pydanticAiAdapter } from './pydanticAi.js'
+import { smolagentsAdapter } from './smolagents.js'
+import { strandsAdapter } from './strands.js'
+import { agentFrameworkAdapter } from './agentFramework.js'
+import { mastraAdapter } from './mastra.js'
+import { vercelAiSdkAdapter } from './vercelAiSdk.js'
+import { eveAdapter } from './eve.js'
+import { trueforgeAdapter } from './trueforge.js'
+import { aiSdkHarnessAdapter } from './aiSdkHarness.js'
+import { aiSdkWorkflowAdapter } from './aiSdkWorkflow.js'
+import { agentcoreAdapter } from './agentcore.js'
+import { resolve } from 'node:path'
+
+/** All registered harness adapters. */
+export const ALL_ADAPTERS: IHarnessAdapter[] = [
+  cursorAdapter,
+  claudeCodeAdapter,
+  antigravityAdapter,
+  windsurfAdapter,
+  aiderAdapter,
+  openhandsAdapter,
+  codexAdapter,
+  n8nAdapter,
+  clineAdapter,
+  rooCodeAdapter,
+  continueAdapter,
+  claudeDesktopAdapter,
+  gooseAdapter,
+  openWebUIAdapter,
+  openclawAdapter,
+  piAdapter,
+  hermesAdapter,
+  githubCopilotAdapter,
+  langgraphAdapter,
+  museAdapter,
+  grokAdapter,
+  opencodeAdapter,
+  dshAdapter,
+  xirpAdapter,
+  agenticOrchestratorAdapter,
+  langchainAdapter,
+  crewaiAdapter,
+  autogenAdapter,
+  ag2Adapter,
+  googleAdkAdapter,
+  openaiAgentsAdapter,
+  pydanticAiAdapter,
+  smolagentsAdapter,
+  strandsAdapter,
+  agentFrameworkAdapter,
+  mastraAdapter,
+  vercelAiSdkAdapter,
+  eveAdapter,
+  trueforgeAdapter,
+  aiSdkHarnessAdapter,
+  aiSdkWorkflowAdapter,
+  agentcoreAdapter,
+]
+
+/**
+ * Detect which harnesses are present in a workspace.
+ *
+ * @param workspaceRoot - Absolute path to workspace root
+ * @returns Array of DetectedHarness results
+ */
+export async function detectHarnesses(workspaceRoot: string): Promise<DetectedHarness[]> {
+  const results: DetectedHarness[] = []
+
+  for (const adapter of ALL_ADAPTERS) {
+    const detected = await adapter.detect(workspaceRoot)
+    results.push({
+      type: adapter.type,
+      // Relative to the workspace for most harnesses; absolute for the few
+      // that keep their config in the home directory (Claude Desktop), which
+      // `join` used to append to the workspace root.
+      configPath: adapter.configFileName
+        ? resolve(workspaceRoot, adapter.configFileName)
+        : '',
+      detected,
+      lastWriteAt: null,
+    })
+  }
+
+  return results
+}
+
+/**
+ * Get adapter for a specific harness type.
+ *
+ * @param type - Harness type to look up
+ * @returns The adapter, or undefined if not found
+ */
+export function getAdapter(type: string): IHarnessAdapter | undefined {
+  return ALL_ADAPTERS.find((a) => a.type === type)
+}

@@ -1,0 +1,385 @@
+/**
+ * FinOps ledger types for cost tracking and attribution.
+ *
+ * These types correspond to the `execution_traces` table and the
+ * `finops_attribution_4d` materialized view defined in
+ * the data-architecture schema.
+ *
+ * HLD §3.6 (FinOps Ledger), §3.19 (4D Attribution)
+ *
+ * @module
+ */
+
+import type {
+  AnomalyType,
+  EnforcementAction,
+  RoutingTier,
+  TokenUtility,
+} from './enums.js'
+
+// ─── Workspace spend caps ────────────────────────────────────────────
+
+/**
+ * The daily spend cap, in USD, of a workspace that has never saved one. A
+ * hard cap: the proxy refuses a request that would take the day's spend over
+ * it (`429 BUDGET_EXCEEDED`). An owner or admin changes it on Settings ›
+ * Billing › Budget Limits or with `PUT /api/v1/budget`.
+ */
+export const DEFAULT_DAILY_BUDGET_USD = 100
+
+/**
+ * The monthly cap, in USD, of a workspace that has never saved one. Alerts
+ * only: reaching it raises budget alerts and refuses nothing.
+ */
+export const DEFAULT_MONTHLY_BUDGET_USD = 500
+
+// ─── Trace Entry ─────────────────────────────────────────────────────
+
+/**
+ * A single row in the `execution_traces` table — the append-only FinOps ledger.
+ *
+ * This is the canonical financial audit trail for every LLM call flowing
+ * through the platform. INSERT only; UPDATE and DELETE are forbidden by
+ * a database trigger.
+ *
+ * LLD §3.1 — execution_traces table definition
+ */
+export interface TraceEntry {
+  /** Unique trace identifier — `newId('tr')`. */
+  traceId: string
+
+  /** Session that produced this trace — FK to `agent_sessions`. */
+  sessionId: string
+
+  /** Idempotency key — UNIQUE constraint. */
+  requestId: string
+
+  /** Timestamp of the trace event. */
+  timestamp: string
+
+  /** Effective date of the SOP governing this call. */
+  sopEffectiveDate: string
+
+  // ── Model routing ──
+  /** Model requested by the agent/user. */
+  requestedModel: string
+
+  /** Model actually routed to after complexity scoring. */
+  actualModelRouted: string
+
+  /** Routing tier for this call. */
+  routingTier: RoutingTier
+
+  /** Complexity score used for routing (0.0–1.0). */
+  complexityScore: number
+
+  // ── Token accounting ──
+  /** Raw input tokens before compression. */
+  rawInputTokens: number
+
+  /**
+   * Input tokens after compression.
+   *
+   * Written equal to `rawInputTokens` by every proxy trace path — the input
+   * compressor is not wired. Do not derive a saving from the difference.
+   */
+  compressedInputTokens: number
+
+  /**
+   * Bytes the SnipCompactor removed from the response body.
+   *
+   * The measured saving, in bytes rather than tokens, and response-side: it
+   * reduces the *next* turn's prompt, not this trace's input count.
+   */
+  toolResultBytesSaved?: number
+
+  /** Output tokens generated. */
+  outputTokens: number
+
+  // ── Cost accounting (append-only, tamper-evident) ──
+  /** Cost at the raw model rate (USD). */
+  rawCostUsd: number
+
+  /** Actual cost after routing optimization (USD). */
+  actualCostUsd: number
+
+  /** Savings from routing optimization (USD) — generated column. */
+  savingsUsd: number
+
+  // ── Token utility classification ──
+  /** Whether the token spend was useful or wasted. */
+  tokenUtility: TokenUtility
+
+  /** Utility confidence score (0.0–1.0). */
+  tokenUtilityScore: number
+
+  // ── Enforcement ──
+  /** Compliance score from policy evaluation (0.0–1.0). */
+  complianceScore: number
+
+  /** Enforcement action applied to this call. */
+  enforcementAction: EnforcementAction
+
+  // ── Anomaly detection ──
+  /** Detected anomaly type, if any. */
+  anomalyDetected: AnomalyType | null
+
+  /** Anomaly detection confidence score (0.0–1.0). */
+  anomalyConfidenceScore: number | null
+
+  /** Additional anomaly taxonomy metadata. */
+  taxonomyMetadata: Record<string, unknown> | null
+
+  // ── Forensics ──
+  /** Raw request/response payload for audit. SENSITIVE. */
+  rawPayloadJson: Record<string, unknown> | null
+
+  // ── 4D Attribution (§3.19) ──
+  /** Application identifier for attribution. */
+  appId: string | null
+
+  /** Agent chain identifier for attribution. */
+  agentChainId: string | null
+
+  /** Full agent delegation chain (JSON). */
+  agentChain: Record<string, unknown> | null
+
+  // ── Cache accounting ──
+  /** Whether this call was served from cache. */
+  cacheHit: boolean
+
+  /** Savings from cache hit (USD). */
+  cacheSavingsUsd: number
+
+  // ── Root cause & corrective action ──
+  /** Structured root cause attribution for anomalies. */
+  rootCauseAttribution: Record<string, unknown> | null
+
+  /** Corrective prompt card generated for this anomaly. */
+  correctivePromptCard: Record<string, unknown> | null
+}
+
+// ─── Cost Breakdown ──────────────────────────────────────────────────
+
+/**
+ * Summarized cost breakdown for a session, workspace, or time window.
+ *
+ * HLD §3.6 — FinOps cost accounting
+ */
+export interface CostBreakdown {
+  /** Cost at raw model rates (USD). */
+  rawCost: number
+
+  /** Actual cost after optimization (USD). */
+  actualCost: number
+
+  /** Total savings from model routing (USD). */
+  savings: number
+
+  /** Total savings from cache hits (USD). */
+  cacheSavings: number
+}
+
+// ─── Trace Query & List ──────────────────────────────────────────────
+
+/** Summary row for listing traces in the UI. */
+export interface TraceSummary {
+  traceId: string
+  timestamp: string
+  requestedModel: string
+  actualModelRouted: string
+  enforcementAction: EnforcementAction | string
+  complianceScore: number
+  actualCostUsd: number
+  anomalyDetected: AnomalyType | string | null
+  /** True when the request was served under a valid break-glass token, global or scoped (migration 170). */
+  breakGlass?: boolean
+  /** The approval this trace ran under, joinable to `break_glass_requests`; null when `breakGlass` is false. */
+  breakGlassRequestId?: string | null
+}
+
+/** Paginated result from trace listing. */
+export interface TraceListResult {
+  traces: TraceSummary[]
+  total: number
+  limit: number
+  offset: number
+}
+
+/**
+ * One persisted detector finding on a trace, from `detector_findings`
+ * (migration 115). Distinct from `TraceDetail.anomalyDetected` /
+ * `anomalyConfidenceScore`, which carry only the single winning finding —
+ * this is every detector that fired, which is what lets a reviewer see two
+ * independent detectors agreeing (`detector_findings.md`-shaped corroboration)
+ * instead of one winner masking the rest.
+ */
+export interface TraceFindingSummary {
+  findingId: string
+  detectorId: string
+  anomalyKind: string
+  severity: string
+  /** STEER | REASK | ASK | KILL — what this finding actually did. */
+  disposition: string
+  confidence: number
+  reason: string
+  /** True when the workspace was in shadow mode — recorded, not enforced. */
+  shadowed: boolean
+}
+
+export interface TraceStep {
+  logId: string
+  toolName: string
+  toolArguments: unknown
+  riskCategory: string | null
+  verdict: string
+  confidence: number
+  reason: string
+  loopDetected: boolean
+  latencyMs: number | null
+  timestamp: string
+}
+
+/**
+ * One upstream call the LLM proxy made for a request: a retry of the routed
+ * model or a fallback target. `outcome` is `ok`, `http_<status>`, `timeout`,
+ * `connect_error`, `transport_error`, or `skipped` for a fallback target that
+ * was not called; `stopped` says why no further call was made (`max_attempts`,
+ * `time_budget`, `retry_after_exceeds_budget`, `provider_declined`,
+ * `quota_exhausted`) or, for a skipped target, why it was skipped
+ * (`same_target`, `wire_mismatch`, `model_not_allowed`, `budget` — priced
+ * for its model, the request would not fit a spend budget — `no_credential`,
+ * `unknown_provider`, `time_budget`).
+ */
+export interface UpstreamAttempt {
+  model: string
+  provider: string
+  outcome: string
+  status?: number
+  latencyMs: number
+  /** The wait before the next call. */
+  backoffMs?: number
+  /** True when that wait was the provider's own `retry-after`. */
+  serverDelay?: boolean
+  stopped?: string
+}
+
+/** The fallback target that served a request after the routed model's retries ran out. */
+export interface UpstreamFallback {
+  fromModel: string
+  toModel: string
+  toProvider: string
+  /** True when the routed model's prompt cache was warm and the fallback is another model family. */
+  cacheAffinityBroken?: boolean
+}
+
+/** Full detail of a single trace. */
+export interface TraceDetail {
+  traceId: string
+  sessionId: string
+  requestId: string
+  timestamp: string
+  sopEffectiveDate: string
+  requestedModel: string
+  actualModelRouted: string
+  routingTier: RoutingTier | string
+  complexityScore: number
+  rawInputTokens: number
+  compressedInputTokens: number
+  toolResultBytesSaved?: number
+  outputTokens: number
+  rawCostUsd: number
+  actualCostUsd: number
+  savingsUsd: number
+  /** Who re-classified this trace, if anyone. Null when it holds its insert-time value. */
+  tokenUtilityClassifiedBy?: string | null
+  /** Null when nobody classified the trace and ingest did not mark it WASTED. */
+  tokenUtility: TokenUtility | string | null
+  /** A person's label's score (1 USEFUL, 0 WASTED); null without one. */
+  tokenUtilityScore: number | null
+  complianceScore: number
+  enforcementAction: EnforcementAction | string
+  anomalyDetected: AnomalyType | string | null
+  anomalyConfidenceScore: number | null
+  taxonomyMetadata: unknown | null
+  rootCauseAttribution: unknown | null
+  correctivePromptCard: unknown | null
+  reasoningTokens?: number | null
+  /**
+   * Provider-reported prompt-cache token counts (migration 165) —
+   * Anthropic's `usage.cache_read_input_tokens` / `cache_creation_input_tokens`
+   * today. Null when the provider/proxy build doesn't report them; distinct
+   * from `cacheHit`/`cacheSavingsUsd` (the proxy's own semantic response
+   * cache) — see `execution_traces.cache_read_input_tokens`'s column comment.
+   */
+  cacheReadInputTokens?: number | null
+  cacheCreationInputTokens?: number | null
+  toolCallMetrics?: unknown | null
+  /**
+   * 0–100 integrity score backing a WASTED `tokenUtility` verdict; null when
+   * the trace was never scored (e.g. it wasn't a candidate for waste
+   * classification). Written at ingest; previously selected nowhere, so a
+   * WASTED badge had no way to explain itself — see `qualityFault` below.
+   */
+  responseIntegrity?: number | null
+  /**
+   * The specific check that failed when `responseIntegrity` is low — e.g.
+   * the first-failing-check name. Pairs with `responseIntegrity`; both are
+   * null together.
+   */
+  qualityFault?: string | null
+  /**
+   * The model a shadow-routing evaluation would have picked for this trace,
+   * if the workspace has shadow routing configured; null otherwise. Written
+   * at ingest on both the streaming and non-streaming ingest paths; reading
+   * it back is what the shadow-routing savings report aggregates.
+   */
+  routingShadowModel?: string | null
+  /**
+   * Every upstream call the proxy made when it retried or ran fallbacks, in
+   * order (migration 216). Null for the ordinary request that took one call.
+   */
+  upstreamAttempts?: UpstreamAttempt[] | null
+  /** The fallback target that served the request, or null when none did (migration 216). */
+  upstreamFallback?: UpstreamFallback | null
+  /** True when the request was served under a valid break-glass token, global or scoped (migration 170). */
+  breakGlass?: boolean
+  /** The approval this trace ran under; what it skipped is that approval's `policyId`. */
+  breakGlassRequestId?: string | null
+  /**
+   * What this request touched (migration 105). `toolCallMetrics` is token
+   * accounting per tool; this is the files, URLs and commands they named.
+   */
+  changeManifest?: ChangeManifestEntry[] | null
+  steps?: TraceStep[]
+  /**
+   * Every detector finding persisted for this trace, most severe first —
+   * see {@link TraceFindingSummary}. `anomalyDetected`/`anomalyConfidenceScore`
+   * above stay as the single winner for backward compatibility; this is the
+   * full set, present on allowed traces as well as blocked ones.
+   */
+  findings?: TraceFindingSummary[]
+}
+
+/**
+ * One thing an agent touched, as recorded by the proxy's change manifest.
+ * Mirrors `ChangeEntry` in `packages/proxy/src/manifest.rs`.
+ */
+export interface ChangeManifestEntry {
+  tool: string
+  op: 'write' | 'edit' | 'delete' | 'move' | 'execute' | 'read' | 'fetch' | 'unknown'
+  target: string
+  target_kind: 'path' | 'url' | 'command' | 'opaque'
+  risk?: string[]
+  bytes?: number
+}
+
+/** Filters for trace query. */
+export interface TraceFilters {
+  enforcement?: string
+  model?: string
+  since?: string
+  limit?: number
+  offset?: number
+}
+

@@ -1,0 +1,164 @@
+# Anthropic Managed Agents
+
+Integrate Intutic governance with [Anthropic's Managed Agents](https://platform.claude.com/docs/en/agents-and-tools/managed-agents/overview) (public beta since 2026-04-08) — a "session" that Anthropic itself hosts and executes, rather than your own process running the tool-call loop.
+
+::: warning Not detected by `intutic init` / `intutic gates install` — no `HarnessType` for this
+Managed Agents is architecturally different from every framework in this directory: your code does not execute tool calls directly, so there is no local process, config file, or hook file for `intutic init`/`intutic gates install` to write. It is also not detectable the way `strands-agents` or `@openai/agents` are: those are dedicated framework packages whose presence in `requirements.txt`/`package.json` implies "this repo runs an agent tool loop." `anthropic` / `@anthropic-ai/sdk`, by contrast, is used for plain Messages API calls in the overwhelming majority of the codebases that depend on it — its presence says nothing about whether Managed Agents specifically is in use. Auto-detecting this integration from a manifest would therefore be near-meaningless signal, unlike every other SDK-gated adapter in this directory. This page is a wiring guide for your own backend code, the same shape as [Strands](/integrations/strands) or [OpenAI Agents](/integrations/openai-agents) — just with no CLI step.
+:::
+
+## Why this is different from every other adapter
+
+Every other SDK-gated adapter in this directory (Strands, OpenAI Agents, LangChain, ...) attaches a hook INSIDE your process's tool-call loop: the gate runs, then the tool body runs, in the same call stack. Managed Agents has no such loop on your side — Anthropic runs it. Your backend receives a stream (or webhook notification) of session **events** and must respond to the ones that pause:
+
+- **`agent.tool_use`** (built-in agent-toolset tools — bash, edit, read, write, glob, grep, web_fetch, web_search) and **`agent.mcp_tool_use`** (MCP-server tools) both carry `evaluated_permission: "allow" | "ask" | "deny"`. A call the server evaluated to `"ask"` — e.g. because the tool's `permission_policy` is `always_ask` — **pauses the whole session** until your backend sends a `user.tool_confirmation` event (`result: "allow" | "deny"` + an optional `deny_message`). Anthropic's own docs: "Denied tools do not run." This is a real, verified pre-execution veto — not an audit log. Under the `auto` policy (typed in `@anthropic-ai/sdk` 0.131 and `anthropic` 1.11), the server judges each call itself and records why on the event's `evaluation` field; when it reaches no judgement the top-level value is `"ask"` and the call pauses exactly like an `always_ask` one.
+- **`agent.custom_tool_use`** — a tool YOUR code implements — has no `evaluated_permission` and no pause concept at all: it always executes in whichever client is listening for its name. This is the one surface that looks like every other adapter in this directory (a local function call you can wrap).
+- Self-hosted sessions run built-in agent-toolset tools inside your own `EnvironmentWorker` sandbox — but that sandbox is built on the SAME `agent.tool_use` / confirmation mechanism, so it is covered the same way as a hosted session. What differs is only where the tool BODY executes, not how the pre-execution veto works.
+
+`IntuticSessionConfirmer` (both SDKs) is the piece that answers the pauses: it evaluates `Gate.guard()` and turns the verdict into the real `user.tool_confirmation` wire shape.
+
+## Coverage at a glance
+
+| Surface | Pauses? | How Intutic governs it |
+|---|---|---|
+| `agent.tool_use` (built-in tools), hosted session | Only if the tool's `permission_policy` is `always_ask`, or `auto` and the server's judgement is `ask` | `IntuticSessionConfirmer` answers the pause with a `Gate.guard()` verdict |
+| `agent.tool_use`, **self-hosted** `EnvironmentWorker` | Same as hosted — identical mechanism | Same — `IntuticSessionConfirmer` does not care where the tool body runs |
+| `agent.mcp_tool_use` (MCP tools) | Only if the MCP toolset's `permission_policy` is `always_ask`. Set it explicitly; don't rely on a default | Same as `agent.tool_use` |
+| `agent.custom_tool_use` (your own tools) | Never — no `permission_policy` concept | `wrapManagedAgentsCustomTool`/`wrapManagedAgentsCustomTools` (TS) or `@guard` applied **before** `@beta_tool` (Python) — see below |
+| A tool configured `auto` | Only the calls the server judges `ask` | Those pauses are answered like `always_ask` ones. Calls the server judges `allow` run without reaching Intutic (same ceiling as `always_allow`); calls it judges `deny` (high-risk) never run. Unknown future `evaluation` variants are ignored — the top-level `evaluated_permission` alone decides. |
+| A subagent's pause, cross-posted to the primary thread's stream | Same as the subagent's own tool | Answered once, by `tool_use_id`. The event's `session_thread_id` is informational and is not sent back in the confirmation. |
+| A tool configured `always_allow` | Never | **Not governed by Intutic at all** — the call never reaches your backend as an event to answer. This is an architectural ceiling, not a bug. Configure the tools you want gated as `always_ask`. |
+| The sandbox tool BODY (self-hosted) | N/A | **Not governed** — once a call is allowed, what the tool implementation does inside your `EnvironmentWorker` is outside this adapter's reach, same posture as every adapter toward a framework's built-in tool bodies. |
+
+## Setup — TypeScript
+
+```bash
+npm install @intutic/gate @anthropic-ai/sdk
+```
+
+### 1. Configure your session's tools to pause
+
+When creating (or updating) the session, set `permission_policy: { type: "always_ask" }` on the tools/toolsets you want Intutic to see. A tool left `always_allow` never reaches Intutic. `{ type: "auto" }` is a middle ground: Intutic sees only the calls the server can't judge on its own — see the coverage table above.
+
+### 2. Wire the confirmer
+
+```ts
+import { Anthropic } from '@anthropic-ai/sdk'
+import { Gate, install } from '@intutic/gate'
+import { IntuticSessionConfirmer } from '@intutic/gate/managed-agents'
+
+install(new Gate({ workspaceId: process.env.INTUTIC_WORKSPACE_ID }))
+const client = new Anthropic()
+
+// Right after creating a session, or on a poll/cron loop:
+const confirmer = new IntuticSessionConfirmer(client, session.id)
+await confirmer.poll() // answers every currently-pending tool_use/mcp_tool_use pause
+```
+
+Webhook-driven (recommended for production — no persistent connection needed):
+
+```ts
+app.post('/webhooks/anthropic', (req, res) => {
+  const event = client.beta.webhooks.unwrap(req.rawBody, { headers: req.headers })
+  if (event.data.type === 'session.requires_action') {
+    void new IntuticSessionConfirmer(client, event.data.id).poll()
+  }
+  res.sendStatus(200)
+})
+```
+
+The webhook payload carries only the session id, not the tool call, so the handler always polls. `poll()` lists the session's `agent.tool_use`, `agent.mcp_tool_use` and `user.tool_confirmation` events (up to 1,000 by default; pass `limit`) and reads every confirmation before it answers anything, so a fresh confirmer created per delivery answers only the pauses that have no confirmation yet. `confirmer.handleWebhook(event)` checks that the event is a `session.requires_action` for the confirmer's own session, then polls.
+
+Or a live stream. `watch()` follows the session's event stream and reconnects when it drops — backoff from 500 ms doubling to 10 s, reset on any event — re-polling after every reconnect so a pause raised while the stream was down is still answered, and each `tool_use_id` is confirmed exactly once. A fatal 4xx (anything but 408 and 429) is rethrown rather than retried; the loop ends on a terminal event or on `signal` abort, and throws once `maxReconnects` (unbounded by default) is exhausted. `idleTimeoutMs` drops a silent stream and reopens it:
+
+```ts
+const ac = new AbortController()
+for await (const sent of confirmer.watch({ signal: ac.signal, idleTimeoutMs: 120_000 })) {
+  console.log(sent.tool_use_id, sent.result) // 'allow' | 'deny'
+}
+```
+
+### 3. Gate your custom tools
+
+`agent.custom_tool_use` never pauses (see above), so it is gated at the point YOUR code executes it — not through `IntuticSessionConfirmer`. `BetaRunnableTool` (the shape `SessionToolRunner`/`EnvironmentWorker` dispatch against) exposes `run(args, context)`, not `execute(input)`, so the package's generic `wrapTools()` cannot wrap it directly (it throws rather than silently skipping — but still needs the right helper):
+
+```ts
+import { wrapManagedAgentsCustomTools } from '@intutic/gate/managed-agents'
+
+const tools = wrapManagedAgentsCustomTools([myCustomTool, ...builtinTools])
+```
+
+## Setup — Python
+
+```bash
+pip install intutic-clawde anthropic
+```
+
+No optional extra is needed — unlike the framework adapters (`intutic-clawde[strands]`, etc.), this adapter never imports `anthropic` at runtime; it duck-types the client object it's given.
+
+### 1. Configure your session's tools to pause
+
+Same as the TypeScript section above — set `permission_policy` to `always_ask` on whichever tools/toolsets you want Intutic to see.
+
+### 2. Wire the confirmer
+
+```python
+from anthropic import Anthropic
+from intutic_clawde.gate import Gate, GateConfig, install
+from intutic_clawde.gate.adapters.managed_agents import IntuticSessionConfirmer
+
+install(Gate(GateConfig()))
+client = Anthropic()
+
+confirmer = IntuticSessionConfirmer(client, session.id)
+confirmer.poll()  # answers every currently-pending tool_use/mcp_tool_use pause
+```
+
+Webhook-driven:
+
+```python
+@app.post("/webhooks/anthropic")
+def handle_webhook(request):
+    event = client.beta.webhooks.unwrap(request.body, headers=request.headers)
+    if event.data.type == "session.requires_action":
+        IntuticSessionConfirmer(client, event.data.id).poll()
+    return "", 200
+```
+
+As in TypeScript, `poll()` (`limit=1000` by default) reads every confirmation before answering, so a confirmer per delivery answers only unanswered pauses. `confirmer.handle_webhook(event)` is the one-call form.
+
+Or a live stream, with the same reconnect loop as the TS side (`max_reconnects`, `backoff_start_s`, `backoff_cap_s`, `idle_timeout_s` — passed to the SDK stream as its read timeout — and `stop`, a `threading.Event`):
+
+```python
+stop = threading.Event()
+for sent in confirmer.watch(stop=stop, idle_timeout_s=120.0):
+    print(sent["tool_use_id"], sent["result"])  # 'allow' | 'deny'
+```
+
+### 3. Gate your custom tools — decorator order matters
+
+`agent.custom_tool_use` never pauses, so gate it at the point your code executes it: apply `@guard` **directly to the underlying function, before** `@beta_tool` wraps it. Applying `guard_tools()`'s generic `.func`-patch AFTER `@beta_tool` has already wrapped the function is a **silent no-op** — verified against `anthropic`'s real source; `BetaFunctionTool.call()` invokes a pydantic-validated copy of the function captured at construction time, not the `.func` attribute `guard_tools()` patches.
+
+```python
+from anthropic.lib.tools import beta_tool
+from intutic_clawde.gate import guard
+
+@beta_tool
+@guard                      # innermost: gate wraps the raw function first
+def read_internal_doc(doc_id: str) -> str:
+    ...
+```
+
+## Fail-closed posture
+
+Matches every other Intutic adapter: no gate configured, or an unexpected exception out of `Gate.guard()`, both produce a `"deny"` confirmation — never a silently-allowed, unevaluated call.
+
+## LLM egress and ZDR
+
+Routing your OWN calls to the Messages API through the Intutic proxy is unrelated to this integration — set `ANTHROPIC_BASE_URL` as usual. Managed Agents itself is **not currently eligible for ZDR/HIPAA**, and the Intutic proxy's own wire-shape parser does not understand the Managed Agents "sessions" protocol — this adapter closes the governance-side gap (the confirmation veto), not raw proxy passthrough for session traffic.
+
+## Known gaps
+
+- **Coverage is opt-in per tool.** `always_allow` tools, and calls an `auto` policy allows, are invisible to Intutic. An agent created without a `permission_policy` gets `always_allow` for the built-in tools (bash, edit, read, write, glob, grep, web_fetch, web_search) and `always_ask` for an MCP toolset, so set `always_ask` on every built-in tool you want governed.
+- **Python decorator order.** `@guard` must go on the function before `@beta_tool` wraps it (see step 3).
+- **Beta product.** Managed Agents is in public beta. Both adapters were run against live sessions with `@anthropic-ai/sdk` 0.131.0 and Python `anthropic` 1.11.0 (pause, allow, deny, stream and poll) on 2026-10-14; a signed webhook delivery has not been exercised live. An SDK or beta-header change can alter the event shapes.
+- **One responder per session.** `watch()` reconnects when the stream drops; what it cannot see is a session serviced by two responders at once (each answers what it sees; the server accepts a second answer to one `tool_use_id` without applying it, but the extra event wakes an idle session).

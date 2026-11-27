@@ -1,0 +1,537 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # The nightly pricing re-pin (pricing-repin.yml) starts CI on its branch
+  # itself: a pull request opened with GITHUB_TOKEN starts no workflows.
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  TURBO_TELEMETRY_DISABLED: 1
+
+jobs:
+  lint:
+    name: Lint (TS Workspaces) - Run ESLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11.6.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run ESLint
+        run: pnpm turbo lint
+
+      - name: Run Style Lint (Design System Check)
+        run: pnpm lint:styles
+
+      # Every claim and docs-drift gate, once: the chain in package.json's
+      # `lint:claims`. Each script's header says what it guards and the defect
+      # that made it. A gate added to the chain is enforced here without a
+      # workflow edit. Gates whose inputs this tree does not carry report a
+      # skip rather than a pass.
+      - name: Run every claim and docs-drift gate (lint:claims)
+        run: pnpm lint:claims
+
+  typecheck:
+    name: Typecheck (TS Workspaces) - Run TypeScript typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11.6.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run TypeScript typecheck
+        run: pnpm turbo typecheck
+
+  # 2026-08-30 architecture audit (Wave 4): the pre-commit secret scan only
+  # ever sees a commit's staged additions, so a credential-shaped literal
+  # already sitting in history (or added by a commit made with --no-verify)
+  # is invisible to it. This job runs the same pattern set repo-wide on
+  # every push/PR, as a regression gate rather than a point-in-time sweep.
+  secret-scan:
+    name: Secret Scan (Repo-Wide) - Check for credential-shaped literals
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11.6.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared-types (source of the pattern set)
+        run: pnpm turbo build --filter=@intutic/shared-types
+
+      - name: Scan the tree for credential-shaped literals
+        run: |
+          ALTERNATION="$(node -e "console.log(require('./packages/shared-types/dist/secretPatterns.js').secretPatternAlternation())")"
+          if [ -z "$ALTERNATION" ]; then
+            echo "secretPatternAlternation() returned empty — treat as a build failure, not a clean scan." >&2
+            exit 1
+          fi
+          FINDINGS="$(git grep -InE "$ALTERNATION" -- . ':!**/node_modules/**' ':!**/dist/**' ':!**/target/**' ':!**/*.lock' ':!pnpm-lock.yaml' || true)"
+          if [ -n "$FINDINGS" ]; then
+            echo "Credential-shaped literal(s) found in tracked source:" >&2
+            echo "$FINDINGS" >&2
+            echo "" >&2
+            echo "Assemble the value at runtime instead of writing it as one contiguous literal (see packages/shared-types/src/secretPatterns.ts's consumers for the repo's convention)." >&2
+            exit 1
+          fi
+
+  test:
+    name: Test (TS Workspaces) - Run Vitest Suite (Sync Daemon, CLI, Packages)
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: mirror.gcr.io/valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      VALKEY_URL: redis://localhost:6379
+      JWT_SECRET: test-jwt-secret-for-ci
+      ENCRYPTION_KEY: ci-test-encryption-key-32-bytes-ok!
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+ 
+      - name: Install pnpm
+        run: npm install -g pnpm@11.6.0
+ 
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+ 
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+ 
+      - name: Run Vitest Suite (Sync Daemon, CLI, Packages)
+        run: pnpm turbo test
+
+      # Tests that load every core, or leave a stuck rule's worker burning one,
+      # run alone after the package suites rather than beside their timing
+      # (packages/mcp-proxy/vitest.load.config.ts).
+      - name: MCP proxy rule limits under load
+        run: pnpm --filter @intutic/mcp-governance-proxy test:load
+
+  changes:
+    name: Detect Rust inputs
+    runs-on: ubuntu-latest
+    # The Rust job takes ~19 minutes and most PRs touch no Rust. It runs
+    # on every push to main, and on a PR only when an input of the crate's build
+    # or tests changed. That is more than packages/proxy: tests read the anomaly
+    # taxonomy, shared-types fixtures, the agent-commands doc and the bundled
+    # SOPs. When the diff cannot be computed, the job runs (fail open to testing).
+    # The same diff gates the Terraform provider job: the provider, its
+    # generated reference pages on the docs site, and this workflow.
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      terraform: ${{ steps.filter.outputs.terraform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then printf 'rust=true\nterraform=true\n' >> "$GITHUB_OUTPUT"; exit 0; fi
+          if ! changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA"); then
+            printf 'rust=true\nterraform=true\n' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if printf '%s\n' "$changed" | grep -qE '^(packages/terraform-provider-intutic/|apps/docs/reference/terraform/|\.github/workflows/ci\.yml$)'; then terraform=true; else terraform=false; fi
+          echo "terraform=$terraform" >> "$GITHUB_OUTPUT"
+          echo "Terraform provider inputs changed: $terraform"
+          inputs='^(packages/proxy/|packages/anomaly-taxonomy/|packages/shared-types/fixtures/|infra/kubernetes/base/proxy/sops/|\.cargo/|Cargo\.(toml|lock)$|rust-toolchain|apps/docs/guide/agent-commands\.md$|\.github/workflows/ci\.yml$)'
+          if printf '%s\n' "$changed" | grep -qE "$inputs"; then rust=true; else rust=false; fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "Rust inputs changed: $rust"
+
+  # The Terraform provider (packages/terraform-provider-intutic): vet, unit and
+  # plan-time validation tests, and a check that the generated docs still
+  # match its schema. Its acceptance tests need a control plane and run where
+  # one is available.
+  terraform-provider:
+    name: Terraform Provider (Go)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    defaults:
+      run:
+        working-directory: packages/terraform-provider-intutic
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: packages/terraform-provider-intutic/go.mod
+          cache-dependency-path: packages/terraform-provider-intutic/go.sum
+
+      # Install Terraform once. The provider tests otherwise download the CLI
+      # at run time through hc-install, and a 502 from releases.hashicorp.com
+      # failed the job with no code change.
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./... -count=1
+
+      - name: Check the generated docs match the schema
+        run: |
+          go generate ./...
+          git diff --exit-code -- . ../../apps/docs/reference/terraform
+          # A file go generate creates (a new resource's page) is untracked, so
+          # git diff never sees it: the page would ship missing from the repo.
+          untracked="$(git status --porcelain -- . ../../apps/docs/reference/terraform)"
+          if [ -n "$untracked" ]; then
+            echo "::error::go generate left files out of step with the commit; run it and commit them:"
+            echo "$untracked"
+            exit 1
+          fi
+          # The registry's own checks on docs/ (front matter, file names, one
+          # page per resource and data source).
+          go tool tfplugindocs validate --provider-name intutic
+
+  rust:
+    name: Rust Proxy (Build & Test)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    # Valkey is REQUIRED, not optional: tests/reward_test.rs and
+    # tests/wasm_local_test.rs read VALKEY_URL and return early when it is
+    # unset, so without this service block their bodies never execute and the
+    # job reports green on tests that never ran.
+    services:
+      valkey:
+        image: mirror.gcr.io/valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      VALKEY_URL: redis://localhost:6379
+      # The crate embeds every grammar .wasm via include_bytes!, so each test
+      # binary (the lib tests plus one per tests/*.rs) links the whole thing.
+      # Full DWARF made those debug binaries several GB apiece; line tables keep
+      # file:line in panics and backtraces at a fraction of the size.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Checkout (with Git LFS)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true   # pulls real .wasm bytes; without this, git-lfs pointers are checked out
+
+      # Three runs in one afternoon (2026-09-24, main and two PRs touching no
+      # Rust) died in rust-lld with `ld terminated with signal 7 [Bus error]`
+      # while linking the lib test binary, and passed on a fresh runner. A
+      # SIGBUS from a linker is what an mmap'd output file does when the disk
+      # under it fills: the workspace `target/` (debug + release, every test
+      # binary) is built from scratch here and the hosted image leaves ~15 GB
+      # free. Drop the toolchains this job never uses (~20 GB) and print the
+      # numbers, so the next such failure carries its own evidence.
+      - name: Free runner disk and report it
+        run: |
+          df -h / | tail -1 | awk '{print "free before: " $4 " of " $2}'
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost 2>/dev/null || true
+          df -h / | tail -1 | awk '{print "free after:  " $4 " of " $2}'
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          # Pinned: a floating `stable` brings new clippy lints that fail the
+          # -D warnings gate on untouched code (1.98's chunks_exact_to_as_chunks
+          # did, hours after the gate landed). Bump deliberately, with
+          # `rustup run <ver> cargo clippy --all-targets --all-features -- -D warnings`
+          # clean first.
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cd packages/proxy && cargo fmt -- --check
+
+      - name: Cache cargo registry and release build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # The workspace's target/, not the crate's: packages/proxy is a member
+          # of the root Cargo.toml workspace, so `cd packages/proxy && cargo
+          # build` resolves the root Cargo.lock and writes the root target/.
+          # The old paths (packages/proxy/target, keyed on
+          # packages/proxy/Cargo.lock, which only the Docker build reads)
+          # restored nothing. Only target/release: the debug half that clippy
+          # and the test suites leave would carry the entry toward the 10 GB
+          # cache limit, and is the cheaper half to rebuild.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release
+          key: ${{ runner.os }}-cargo-release-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ steps.toolchain.outputs.cachekey }}-
+
+      # ── Grammar .wasm files ──────────────────────────────────────────────────
+      # Strategy: LFS pull is the fast path (files already built and stored).
+      # If any .wasm is missing or is still a pointer stub (<256 bytes), we
+      # install emscripten + tree-sitter-cli and rebuild from GRAMMAR_PINS.toml.
+      - name: Verify grammar .wasm files (LFS pull)
+        id: grammar_check
+        run: |
+          MISSING=0
+          for wasm in packages/proxy/assets/grammars/*.wasm; do
+            size=$(wc -c < "$wasm" 2>/dev/null || echo 0)
+            if [ "$size" -lt 1024 ]; then
+              echo "WARN: $wasm is missing or a stub (${size}B) — will rebuild"
+              MISSING=1
+            fi
+          done
+          echo "missing=$MISSING" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild grammars from GRAMMAR_PINS.toml (fallback)
+        if: steps.grammar_check.outputs.missing == '1'
+        run: |
+          echo "Installing emscripten..."
+          sudo apt-get update -qq
+          sudo apt-get install -y emscripten nodejs npm
+          npm install -g tree-sitter-cli@0.26.13
+          emcc --version
+          tree-sitter --version
+          echo "Rebuilding .wasm grammars..."
+          cd packages/proxy && bash scripts/download-grammars.sh
+
+      - name: Show grammar files
+        run: |
+          echo "Grammar .wasm files:"
+          ls -lh packages/proxy/assets/grammars/*.wasm
+      # ── End grammar section ──────────────────────────────────────────────────
+
+      # After the grammar section: the crate embeds the .wasm files, so clippy
+      # cannot compile it without them. Every target (tests, benches), and a
+      # warning fails the job.
+      - name: cargo clippy (all targets, warnings are errors)
+        run: cd packages/proxy && cargo clippy --all-targets --all-features -- -D warnings
+
+      # `--all-features` above is the build Intutic's own images ship (the
+      # control-plane clients compiled in); this is the open-core build, which
+      # is what a plain `cargo build` produces.
+      - name: cargo clippy, default features (no control-plane clients)
+        run: cd packages/proxy && cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build --release (embeds grammars via include_bytes!)
+        run: cd packages/proxy && cargo build --release
+
+      - name: cargo test (all suites, nocapture for grammar load logs)
+        run: |
+          cd packages/proxy
+          cargo test --test snip_test -- --nocapture 2>&1 | grep -E '(\[(grammar|grammar-status|java)\]|test result|FAILED|running)'
+          cargo test
+
+      # Always, so a linker death above still leaves the disk picture behind.
+      - name: Report disk after the build
+        if: always()
+        run: |
+          df -h / | tail -1 | awk '{print "free after build: " $4 " of " $2}'
+          du -sh "$GITHUB_WORKSPACE/target" 2>/dev/null || true
+
+      # The external corpus gate: measured false positives on 1,000 published
+      # benign trajectories, plus mutation liveness for the detectors a public
+      # corpus can reach.
+      #
+      # Deliberately its own step, and deliberately unpiped. The step above
+      # survives its `| grep` only because the bare `cargo test` on the next line
+      # re-runs everything; a piped gate would report the grep's exit status and
+      # a failing corpus would land as green.
+      #
+      # No `paths:` filter either. The thresholds this gate watches are private
+      # consts spread across detectors.rs, actions.rs, injection.rs and proxy.rs
+      # — any path filter would let the one edit that matters skip the check.
+      - name: Anomaly corpus gate (external FPR + mutation liveness)
+        run: cd packages/proxy && cargo test --test anomaly_corpus_test
+
+      # The response-echo corpus gate: a self-authored, pinned measurement of
+      # how often the five injection patterns fire on MODEL OUTPUT (both the
+      # streaming `scan` path and the non-streaming `scan_response_body`
+      # path). Unlike the gate above, this corpus is NOT external — see
+      # tests/corpus/PROVENANCE.md, "Response-echo corpus" — so it pins a
+      # regression set on our own regexes rather than measuring a real-world
+      # false-positive rate. Unpiped for the same reason as the gate above: a
+      # piped gate reports the pipeline's last exit status.
+      - name: Response-echo corpus gate (output-echo FP set, both scan entry points)
+        run: cd packages/proxy && cargo test --test response_echo_corpus_test
+
+      # The suites that drive the control-plane clients against a mock control
+      # plane do not exist in the default build. Last, and after cleaning the
+      # crate's own debug artifacts, so the runner's disk holds one set of test
+      # binaries at a time; the dependencies stay built.
+      - name: cargo test, control-plane feature (all suites)
+        run: |
+          cd packages/proxy
+          cargo clean -p intutic-proxy
+          cargo test --features control-plane
+
+  python:
+    name: Python SDK (intutic-clawde) - Run pytest
+    runs-on: ubuntu-latest
+    # packages/intutic-clawde is published to PyPI and carries its own pytest
+    # suite, but no CI job ever ran it — the same silent gap the `rust` job had
+    # before it was given a Valkey service. Its 6 tests now gate the release.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          # Matches `python = "^3.9"` in packages/intutic-clawde/pyproject.toml.
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      # poetry.lock lived in the enterprise repo only — this repo's own
+      # checkout had no lockfile at all, and `poetry install` with none
+      # resolves every dependency fresh from its open pyproject.toml range on
+      # every run: the exact malicious-release-window exposure the March
+      # 2026 LiteLLM PyPI compromise (a 40-minute bad release) depends on.
+      # `check --lock` fails loud if the lock is missing or has drifted from
+      # pyproject.toml, instead of silently falling back to an unlocked
+      # resolve.
+      - name: Verify poetry.lock is present and matches pyproject.toml
+        working-directory: packages/intutic-clawde
+        run: poetry check --lock
+
+      - name: Install package + dev dependencies
+        working-directory: packages/intutic-clawde
+        run: poetry install --with dev
+
+      - name: Run pytest
+        working-directory: packages/intutic-clawde
+        run: poetry run pytest -q
+
+      # The Python half of the SDK API reference on the docs site
+      # (apps/docs/reference/sdk/python/), generated from this package's
+      # source with the griffe its dev dependencies pin. Here rather than in
+      # `lint:claims`, which checks the TypeScript half: this job has the
+      # Poetry environment. Fails when a docstring or an `__all__` changed
+      # and `pnpm gen:sdk-reference` was not run.
+      - name: Check the generated Python SDK reference is current
+        working-directory: packages/intutic-clawde
+        run: poetry run python ../../tools/scripts/gen-sdk-reference-python.py --check
+
+  build:
+    name: Build (TS Workspaces) - Bundle TS apps and packages
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, test, rust, python, secret-scan]
+    # A skipped Rust job (see `changes`) must not skip Build, and a failed one must
+    # still stop it: always() alone would run Build after any failure.
+    if: ${{ !cancelled() && needs.lint.result == 'success' && needs.typecheck.result == 'success' && needs.test.result == 'success' && needs.python.result == 'success' && needs['secret-scan'].result == 'success' && (needs.rust.result == 'success' || needs.rust.result == 'skipped') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11.6.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Bundle TS apps and packages
+        run: pnpm turbo build
+
+      - name: Check published package entry points are packed
+        # Every main/types/bin/exports/typesVersions path of a published
+        # package must be in its npm tarball (@intutic/gate once pointed
+        # typesVersions at src/, which `files` does not ship).
+        run: node tools/scripts/check-package-entrypoints.js
+
+  # The one step no container can reach: a real macOS keychain. Hosted runners are
+  # thrown away afterwards, and the script refuses to run anywhere else.
+  ca-trust-macos:
+    name: CA trust on a real macOS keychain
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    if: github.repository == 'intutic/intutic'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11.6.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the CLI
+        run: pnpm turbo build --filter=@intutic/cli
+
+      - name: Add, use and remove the CA
+        run: tools/scripts/ca-trust-macos-check.sh

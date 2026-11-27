@@ -1,0 +1,5649 @@
+//! Role-scoped SOPs — resolving which policy text a given node should be told.
+//!
+//! In a multi-agent graph the nodes do different jobs, and the rules that
+//! matter differ with the job. A reviewer needs the review policy; telling it
+//! the deployment policy as well spends context on something it will never act
+//! on, and dilutes the part it should follow.
+//!
+//! So each SOP declares the roles it applies to, and a node receives only the
+//! ones matching the role it reported.
+//!
+//! # Where they come from
+//!
+//! `.intutic/sops/*.md` in the workspace, and `.intutic/sops/<set>/*.md` one
+//! folder down (see [`sop_files`]), each optionally carrying YAML-ish front
+//! matter:
+//!
+//! ```markdown
+//! ---
+//! roles: reviewer, deployer
+//! ---
+//! ## Review policy
+//! - Never approve a change that removes a test.
+//! ```
+//!
+//! A file with no `roles:` applies to every node, so an existing flat set of
+//! SOPs keeps working untouched and gains scoping only when someone asks for
+//! it.
+//!
+//! # Trust
+//!
+//! The role comes from a request header and is therefore unverifiable. That is
+//! fine for *scoping* — the worst a lying node achieves is being shown the
+//! wrong advice — but it is why SOP text must never be the thing standing
+//! between an agent and a capability. Enforcement is the detectors and the
+//! WASM rules, which do not consult the role. See ADR-009.
+
+use crate::decide::DecideDecl;
+use crate::plugins::anomaly::actions::LaneClass;
+use crate::plugins::hook_rules::HookRuleDecl;
+use crate::plugins::sql_guard::{SqlGuardPolicy, SqlGuardSeverity};
+use crate::store::{LocalStore, PinScope, PinnedSopBlock};
+use crate::wasm::context::RiskLevel;
+use serde::Serialize;
+#[cfg(feature = "control-plane")]
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+#[cfg(feature = "control-plane")]
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// How long a resolved set is reused before the directory is re-read.
+///
+/// Reading and parsing every SOP on every request would put filesystem I/O in
+/// the hot path. Thirty seconds is short enough that an edit shows up while
+/// someone is still iterating on it.
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Ceiling on injected policy text, in bytes.
+///
+/// Injected content is prepended to every request in the session, so its cost
+/// is paid on each turn and grows the context the model must attend to. A
+/// large SOP set silently doubling someone's token bill is a worse failure
+/// than truncating advice they can still read in full on disk.
+const MAX_INJECTED_BYTES: usize = 8 * 1024;
+
+/// Which policy floor this SOP represents (migration 139).
+///
+/// `Workspace` (the default) is every SOP this proxy has ever enforced.
+/// `Org` is a mandatory ceiling an org admin declared, applied IN ADDITION
+/// TO a workspace's own SOPs, never instead of them — see
+/// `collect_harnesses`/`collect_scope_paths`/`collect_plan_steps` for the
+/// three fields where "in addition to" means intersection rather than
+/// union (those three are enforced disjunctively: "passes if it matches
+/// ANY applicable SOP's set", so naively unioning an org allowlist with a
+/// workspace allowlist would widen permissions, the opposite of a floor).
+/// The other six declarative fields plus `risk_tier` are already
+/// restriction-monotonic under plain union, so an `Org`-scoped SOP needs
+/// no special handling there at all — it is just another entry in the
+/// slice `governance_fields_from` already unions over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SopScope {
+    #[default]
+    Workspace,
+    Org,
+}
+
+/// `mode: shadow` in front matter, mirroring `wasm::registry::RuleMode`.
+///
+/// A shadow SOP's declared fields (`deny_tools`, `max_calls`, `requires_before`
+/// and the rest) are excluded from `governance_fields_from`'s enforcing set —
+/// they never reach a live `RequestContext` and so cannot block, hold or steer
+/// anything — and are instead evaluated against a shadow copy of the context
+/// in `proxy.rs`, which records what the SOP would have done without doing it.
+/// The one place this record lands is `ExecutionTrace::sop_shadow_reports`;
+/// there is no `WOULD_HAVE` sentinel disposition for the same reason
+/// `FindingWire.shadowed` and `wasm::registry::ShadowReport` document theirs:
+/// a synthetic verdict is invisible to every consumer matching on the real one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SopMode {
+    #[default]
+    Enforce,
+    Shadow,
+}
+
+impl SopScope {
+    /// Parse the wire value `GET /api/v1/workspace/sops-policy` sends
+    /// (`"org"` or `"workspace"`). Anything else -- including `None`, which
+    /// covers both an older control plane that predates this field and a
+    /// workspace SOP whose scope was never anything but the implicit
+    /// default -- resolves to `Workspace`, today's exact behaviour. Never
+    /// silently promotes an unrecognised value to `Org`: an unexpected
+    /// string here must not become a ceiling nobody declared.
+    #[cfg(any(feature = "control-plane", test))]
+    fn from_wire(raw: Option<&str>) -> Self {
+        match raw {
+            Some("org") => SopScope::Org,
+            _ => SopScope::Workspace,
+        }
+    }
+}
+
+/// `advise` (the default) or `enforce`: how `scope_paths_mode:`,
+/// `plan_steps_mode:` and `context_isolation:` act.
+///
+/// Ordered weakest first, so the strongest declaration across lines and SOPs
+/// is a `max()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckMode {
+    #[default]
+    Advise,
+    Enforce,
+}
+
+impl CheckMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "advise" => Some(CheckMode::Advise),
+            "enforce" => Some(CheckMode::Enforce),
+            _ => None,
+        }
+    }
+}
+
+/// `plan_approval: required|strict` — read by the hook gates and SDKs, which
+/// hold a session's calls until its plan is approved. The
+/// gateway does not enforce it; it is parsed here so an SOP declaring only it
+/// is not reported inert, and so the two front-matter parsers stay equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlanApproval {
+    Required,
+    Strict,
+}
+
+impl PlanApproval {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "required" => Some(PlanApproval::Required),
+            "strict" => Some(PlanApproval::Strict),
+            _ => None,
+        }
+    }
+}
+
+/// `on_reask_exhausted: block|pause` — what a loop run's third failed
+/// correction does. `block` is today's refusal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OnReaskExhausted {
+    #[default]
+    Block,
+    Pause,
+}
+
+impl OnReaskExhausted {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "block" => Some(OnReaskExhausted::Block),
+            "pause" => Some(OnReaskExhausted::Pause),
+            _ => None,
+        }
+    }
+}
+
+/// The node kinds `node_kind:` may name. The limits each carries
+/// live with the graph detectors; here they are only validated.
+pub const NODE_KINDS: &[&str] = &["splitter", "worker", "code", "gate"];
+
+/// The limits `node_kind_allow:` may lift.
+pub const NODE_KIND_ALLOWANCES: &[&str] = &["model", "write", "shell", "spawn"];
+
+/// One policy document, the roles it applies to, and anything it forbids.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sop {
+    pub title: String,
+    pub body: String,
+    /// `Workspace` (default) or `Org` -- see [`SopScope`].
+    pub scope: SopScope,
+    /// Lowercased roles this applies to. Empty means every role.
+    pub roles: Vec<String>,
+    /// Tool names this SOP forbids for the roles it covers.
+    ///
+    /// This is what makes an SOP enforceable rather than advisory. The prose
+    /// tells the agent not to do something; this is the part the proxy acts on
+    /// when it tries anyway — which is the entire premise, since a rule an
+    /// agent can read is a rule an agent can decide to ignore.
+    ///
+    /// Empty by default, so an SOP forbids nothing until someone says so.
+    /// Open core has no policy service to consult, and defaulting to
+    /// "everything not explicitly permitted is denied" would block every tool
+    /// call for every user who never wrote a policy.
+    pub deny_tools: Vec<String>,
+    /// Harnesses this SOP permits for the roles it covers.
+    ///
+    /// Empty means unrestricted. Present, it becomes an allowlist — safe here
+    /// where it is not for tools, because a workspace has a handful of
+    /// harnesses that someone can enumerate, not the open-ended tool surface
+    /// each of them exposes.
+    pub allow_harnesses: Vec<String>,
+    /// The steps this SOP's task is expected to consist of — plan adherence.
+    ///
+    /// Distinct from `deny_tools`, and the distinction is the point.
+    /// `deny_tools` is "never do this, whatever you are working on".
+    /// `plan_steps` is "for the task this SOP governs, these are the steps" —
+    /// a scoped allowlist rather than a global denylist.
+    ///
+    /// That makes it the one place an allowlist over tools is safe, for the
+    /// reason the `deny_tools` comment above rules it out everywhere else:
+    /// this list is empty unless an author explicitly wrote a plan, and an
+    /// empty list means "no plan declared, nothing to compare against" rather
+    /// than "deny everything unlisted". A workspace that never writes one is
+    /// never affected.
+    ///
+    /// Entries may be raw tool names (`Bash`, `Write`) or the synthesised
+    /// action vocabulary (`action:run_tests`, `action:deploy`), because a plan
+    /// is more naturally written in terms of what the agent should *do* than
+    /// which tool it happens to reach for.
+    pub plan_steps: Vec<String>,
+    /// Repo paths this SOP's role may change — blast radius, declared up front.
+    ///
+    /// The third scoped allowlist, and the same reasoning that makes
+    /// `plan_steps` safe applies: empty means "no scope declared, nothing to
+    /// compare against", never "deny everything unlisted". A workspace that
+    /// never writes one is never affected.
+    ///
+    /// Where `plan_steps` says *what* the task consists of, this says *where* it
+    /// may happen. They compose: a deployer whose plan is read/edit/deploy and
+    /// whose scope is `infra/` is bounded on both axes.
+    ///
+    /// Prefix matches against the paths a request's tool calls actually named,
+    /// so `packages/proxy` covers everything beneath it.
+    pub scope_paths: Vec<String>,
+    /// `allow_commands:`, the shell commands allowed. The union of every
+    /// applicable SOP's; see `plugins::anomaly::shell_parse`.
+    pub allow_commands: Vec<String>,
+    /// Actions that must not proceed until a human has looked.
+    ///
+    /// Entries are action tokens (`action:deploy`) or raw tool names. Unlike
+    /// every other field here, a match does not merely record something — it
+    /// holds the whole loop run until someone approves or rejects it. That is
+    /// why it is declaration-only and has no heuristic behind it: nothing
+    /// blocks a person's work unless a person asked for it to.
+    pub review_before: Vec<String>,
+    /// Severity band, declared in front matter as `risk_tier: HIGH`.
+    ///
+    /// Feeds `RequestContext.risk_tier`, which the WASM SDK documents as
+    /// `Low | Medium | High | Critical` and which customer rules are told they
+    /// can gate on. Before this it was hardcoded `Low` at its single producer,
+    /// so a rule written `if (ctx.risk_tier == "Critical") return BLOCK` was
+    /// validated locally against the SDK's mock context — which supplies
+    /// `"Critical"` — and then never fired once in production.
+    ///
+    /// Declared, not inferred. The proxy has no basis for guessing a severity
+    /// band, and the promotion rule forbids inventing one; the control plane
+    /// already models this exact field on `sop_registry.riskTier`.
+    pub risk_tier: Option<RiskLevel>,
+    /// Ordering rules this SOP declares: `A -> B` means B must not run unless A
+    /// ran before it. Parsed from `requires_before:`.
+    ///
+    /// Stored as parsed pairs rather than raw strings so an unparseable rule is
+    /// rejected once, at load, instead of failing to match silently forever on
+    /// the hot path — the difference between a warning an operator can see and a
+    /// guardrail that quietly does nothing.
+    pub requires_before: Vec<(String, String, bool)>,
+    /// At most N calls to this tool or action in one run.
+    pub max_calls: Vec<(String, usize)>,
+    /// `(taint, token)` — these two must not co-occur in one request.
+    pub forbid_with: Vec<(String, String)>,
+    /// Ordering rules this SOP forbids: `A -> B` means B must not run *after* A.
+    /// Parsed from `forbid_after:`.
+    pub forbid_after: Vec<(String, String, bool)>,
+    /// `Enforce` (default) or `Shadow` — see [`SopMode`].
+    pub mode: SopMode,
+    /// `sql_guard: refuse|warn` — the DSN-aware destructive-SQL rule
+    /// (`plugins::sql_guard`). `None` means this SOP leaves it off.
+    /// Set to `Refuse` when only `sql_allow_dsns:` is written, because
+    /// declaring an allowlist is asking for the rule.
+    pub sql_guard: Option<SqlGuardSeverity>,
+    /// `sql_allow_dsns:` — target patterns destructive SQL may run against.
+    /// Case is kept as written; matching lowercases both sides.
+    pub sql_allow_dsns: Vec<String>,
+    /// `hook_rule: {json}` — one per line: a hook-rule guardrail, enforced on
+    /// the tool calls in a model's response (`plugins::hook_rules`). A line
+    /// that does not parse is kept as [`HookRuleDecl::Unreadable`], which
+    /// refuses rather than enforcing nothing.
+    pub hook_rules: Vec<HookRuleDecl>,
+    /// `decide: {json}` — one per line: a rule a self-hosted model answers
+    /// (`crate::decide`). A line that does not parse is kept as
+    /// [`DecideDecl::Unreadable`], which refuses every response while it is
+    /// in force. The gateway asks `on: tool_call` rules about the tool calls
+    /// in a model's response and `on: response` rules about its text
+    /// (`crate::decide::gateway`).
+    pub decide_rules: Vec<DecideDecl>,
+    /// `scope_paths_mode: enforce` — an out-of-scope write is refused, not
+    /// steered.
+    pub scope_paths_mode: CheckMode,
+    /// `plan_steps_mode: enforce` — an off-plan step in this turn re-asks.
+    pub plan_steps_mode: CheckMode,
+    /// `plan_approval:` — a gate-side rule; see [`PlanApproval`].
+    pub plan_approval: Option<PlanApproval>,
+    /// `closed_lanes:` — the reversibility classes whose actions are held for
+    /// a person.
+    pub closed_lanes: Vec<LaneClass>,
+    /// `open_actions:` — action tokens this SOP's own `closed_lanes:` leave
+    /// open. Read at the top level only, because it weakens.
+    pub open_actions: Vec<String>,
+    /// `on_reask_exhausted: pause` — a loop run's exhausted correction pauses
+    /// the run for review instead of refusing one request.
+    pub on_reask_exhausted: OnReaskExhausted,
+    /// `context_isolation: enforce` — sibling workers handed the same context
+    /// are re-asked rather than steered.
+    pub context_isolation: CheckMode,
+    /// `node_kind:` — the graph node kinds this SOP declares for its roles.
+    pub node_kinds: Vec<String>,
+    /// `node_kind_allow:` — limits lifted from those kinds. Top level only.
+    pub node_kind_allow: Vec<String>,
+}
+
+impl Sop {
+    /// Whether hook rules are the only thing this SOP enforces — evaluated on
+    /// the response's tool calls rather than by a request-side detector.
+    /// Decide rules are not read by a request-side detector either.
+    pub fn only_hook_rules(&self) -> bool {
+        !self.hook_rules.is_empty() && {
+            let mut rest = self.clone();
+            rest.hook_rules.clear();
+            rest.decide_rules.clear();
+            !is_enforceable(&rest)
+        }
+    }
+
+    /// Does this apply to a node reporting `role`?
+    ///
+    /// An unscoped SOP applies to everyone. A node that reported no role at
+    /// all gets only the unscoped ones — it has not told us enough to receive
+    /// anything more specific.
+    pub fn applies_to(&self, role: &str) -> bool {
+        if self.roles.is_empty() {
+            return true;
+        }
+        if role.is_empty() {
+            return false;
+        }
+        let role = role.to_ascii_lowercase();
+        self.roles.contains(&role)
+    }
+}
+
+/// Everything a front-matter block can declare, plus the body below it.
+///
+/// A struct rather than a tuple. This started as `(roles, body)` and grew a
+/// field per policy dimension; by five, every call site was a positional
+/// destructure whose correctness depended on remembering an order written down
+/// in one doc comment. A field name is the cheapest possible fix, and it means
+/// the next dimension is an additive change rather than a rename of ten
+/// destructures.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct FrontMatter {
+    roles: Vec<String>,
+    allow_harnesses: Vec<String>,
+    deny_tools: Vec<String>,
+    plan_steps: Vec<String>,
+    scope_paths: Vec<String>,
+    allow_commands: Vec<String>,
+    review_before: Vec<String>,
+    requires_before: Vec<(String, String, bool)>,
+    forbid_after: Vec<(String, String, bool)>,
+    max_calls: Vec<(String, usize)>,
+    forbid_with: Vec<(String, String)>,
+    /// The severity band this SOP declares, if any. `None` means unstated.
+    risk_tier: Option<RiskLevel>,
+    /// `mode: shadow` in front matter, or `Enforce` (the default) otherwise.
+    mode: SopMode,
+    sql_guard: Option<SqlGuardSeverity>,
+    sql_allow_dsns: Vec<String>,
+    hook_rules: Vec<HookRuleDecl>,
+    decide_rules: Vec<DecideDecl>,
+    scope_paths_mode: CheckMode,
+    plan_steps_mode: CheckMode,
+    plan_approval: Option<PlanApproval>,
+    closed_lanes: Vec<LaneClass>,
+    open_actions: Vec<String>,
+    on_reask_exhausted: OnReaskExhausted,
+    context_isolation: CheckMode,
+    node_kinds: Vec<String>,
+    node_kind_allow: Vec<String>,
+    /// Rules that failed to parse, kept so they can be reported rather than
+    /// dropped. A malformed ordering rule must not read as "no rule declared".
+    rule_errors: Vec<String>,
+    body: String,
+}
+
+impl FrontMatter {
+    /// A file with no usable front matter: everything is body.
+    ///
+    /// Used for both "no fence" and "unterminated fence". The second is the
+    /// important one — a malformed fence must not silently disarm a rule its
+    /// author believes is active, so the text is kept as policy prose rather
+    /// than discarded.
+    fn body_only(raw: &str) -> Self {
+        Self {
+            body: raw.trim().to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+/// `risk_tier: HIGH` in front matter, or `None` if unstated or unrecognised.
+///
+/// Case-insensitive, like every other declaration comparison in this module.
+/// An unrecognised value returns `None` rather than a default: silently reading
+/// `risk_tier: HGIH` as `Low` is how a declared band becomes a control the
+/// operator believes is set and the code never sees.
+fn parse_risk_tier(front: &str) -> Option<RiskLevel> {
+    let raw = top_level_values(front, "risk_tier:")
+        .next()?
+        .trim()
+        .trim_matches(['"', '\''])
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "low" => Some(RiskLevel::Low),
+        "medium" => Some(RiskLevel::Medium),
+        "high" => Some(RiskLevel::High),
+        "critical" => Some(RiskLevel::Critical),
+        _ => None,
+    }
+}
+
+/// `mode: shadow` in front matter, or `SopMode::Enforce` (the default) for
+/// anything else — unstated, misspelled, or `mode: enforce` written out
+/// explicitly. Unlike `parse_risk_tier`, an unrecognised value falls back to
+/// the safe default rather than `None`: the failure direction that matters
+/// here is a typo silently *disabling* enforcement, not merely being unread,
+/// so `mode: shaddow` enforces exactly as if the line were never written.
+fn parse_mode(front: &str) -> SopMode {
+    let raw = top_level_values(front, "mode:")
+        .next()
+        .map(|v| v.trim().trim_matches(['"', '\'']).to_ascii_lowercase());
+    match raw.as_deref() {
+        Some("shadow") => SopMode::Shadow,
+        _ => SopMode::Enforce,
+    }
+}
+
+/// `sql_guard: refuse|warn`, with any parse error.
+///
+/// An unrecognised value enforces as `refuse` and is reported, the same
+/// direction `parse_mode` fails in: a typo must never be what switches a guard
+/// off. An `sql_allow_dsns:` with no `sql_guard:` turns the rule on at
+/// `refuse`, because writing an allowlist is asking for it.
+fn parse_sql_guard(front: &str, any_allowlist: bool) -> (Option<SqlGuardSeverity>, Option<String>) {
+    let raw = top_level_values(front, "sql_guard:")
+        .next()
+        .map(|v| v.trim().trim_matches(['"', '\'']).to_string());
+    match raw {
+        Some(v) => match SqlGuardSeverity::parse(&v) {
+            Ok(sev) => (Some(sev), None),
+            Err(e) => (
+                Some(SqlGuardSeverity::Refuse),
+                Some(format!("sql_guard: {e}")),
+            ),
+        },
+        None if any_allowlist => (Some(SqlGuardSeverity::Refuse), None),
+        None => (None, None),
+    }
+}
+
+/// The values of `key` at any indentation: the reader for keys that can only
+/// strengthen a SOP (`scope_paths_mode:`, `plan_approval:`, …), whose every
+/// line counts and whose strongest value wins.
+fn enum_value<'a>(front: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    front
+        .lines()
+        .filter_map(move |l| l.trim().strip_prefix(key))
+}
+
+/// The strongest value `key` declares across its lines, by `parse`. An
+/// unrecognised value enforces as `strongest` and is reported — a typo must
+/// never be what switches a guard off, as with `sql_guard:`. `None` when the
+/// key is not written.
+fn strongest_value<T: Ord + Copy>(
+    front: &str,
+    key: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    strongest: T,
+    explain: &str,
+    errors: &mut Vec<String>,
+) -> Option<T> {
+    let mut out: Option<T> = None;
+    for raw in enum_value(front, key) {
+        let v = raw.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        if v.is_empty() {
+            continue;
+        }
+        let parsed = parse(&v).unwrap_or_else(|| {
+            errors.push(format!("{key} {} {explain}", json_quoted(&v)));
+            strongest
+        });
+        out = Some(out.map_or(parsed, |o| o.max(parsed)));
+    }
+    out
+}
+
+/// `v` quoted as JSON (and as the TypeScript parser's errors quote it).
+fn json_quoted(v: &str) -> String {
+    serde_json::to_string(v).unwrap_or_default()
+}
+
+/// The entries of a list that `accept` admits; each other entry is dropped
+/// and reported as `<key> "<entry>" <explain>`.
+fn accepted(
+    key: &str,
+    values: Vec<String>,
+    accept: impl Fn(&str) -> bool,
+    explain: &str,
+    errors: &mut Vec<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for v in values {
+        if accept(&v) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        } else {
+            errors.push(format!("{key} {} {explain}", json_quoted(&v)));
+        }
+    }
+    out
+}
+
+/// The values of `key` written at the top level of the front matter: lines
+/// that start with the key, with no indentation before it.
+///
+/// Keys that can only weaken a SOP are read this way: `mode:` (shadow),
+/// `roles:` (narrows who the rules apply to), `risk_tier:`, `sql_guard:`
+/// (`warn`), `sql_allow_dsns:` and `intutic_enforced:`. An indented line
+/// belongs to some nested block, and a nested `mode: shadow` must not switch
+/// the whole SOP, `deny_tools` included, to shadow. Keys that add a rule are
+/// still read at any indentation, so a rule written indented keeps enforcing.
+fn top_level_values<'a>(front: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    front.lines().filter_map(move |l| l.strip_prefix(key))
+}
+
+/// Split optional front matter from the body.
+///
+/// Intentionally not a YAML parser. The directives that matter are
+/// comma-separated lists, and taking a YAML dependency to read one would be a
+/// poor trade — as would silently failing to load a policy because its front
+/// matter had a tab in it.
+fn parse_front_matter(raw: &str) -> FrontMatter {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with("---") {
+        return FrontMatter::body_only(raw);
+    }
+    let rest = &trimmed[3..];
+    let Some(end) = rest.find("\n---") else {
+        return FrontMatter::body_only(raw);
+    };
+    let (front, body) = rest.split_at(end);
+
+    let split = |values: Vec<&str>, lower: bool| -> Vec<String> {
+        values
+            .into_iter()
+            .flat_map(|v| v.split(','))
+            .map(|r| {
+                let t = r.trim().trim_matches(['"', '\'', '[', ']']).to_string();
+                if lower {
+                    t.to_ascii_lowercase()
+                } else {
+                    t
+                }
+            })
+            .filter(|r| !r.is_empty())
+            .collect()
+    };
+    let list = |key: &str, lower: bool| -> Vec<String> {
+        split(
+            front
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix(key))
+                .collect(),
+            lower,
+        )
+    };
+    let top_level_list = |key: &str, lower: bool| -> Vec<String> {
+        split(top_level_values(front, key).collect(), lower)
+    };
+
+    let requires = parse_rules(front, "requires_before:");
+    let forbids = parse_rules(front, "forbid_after:");
+    // 3.0 keys. Modifier keys that strengthen are read at any
+    // indentation (`enum_value`); the two that weaken — `open_actions:` and
+    // `node_kind_allow:` — at the top level only, like `mode:`.
+    let mut lld75_errors: Vec<String> = Vec::new();
+    let scope_paths_mode = strongest_value(
+        front,
+        "scope_paths_mode:",
+        CheckMode::parse,
+        CheckMode::Enforce,
+        "is not advise or enforce, so it enforces",
+        &mut lld75_errors,
+    )
+    .unwrap_or_default();
+    let plan_steps_mode = strongest_value(
+        front,
+        "plan_steps_mode:",
+        CheckMode::parse,
+        CheckMode::Enforce,
+        "is not advise or enforce, so it enforces",
+        &mut lld75_errors,
+    )
+    .unwrap_or_default();
+    let plan_approval = strongest_value(
+        front,
+        "plan_approval:",
+        PlanApproval::parse,
+        PlanApproval::Strict,
+        "is not required or strict, so it is strict",
+        &mut lld75_errors,
+    );
+    let on_reask_exhausted = strongest_value(
+        front,
+        "on_reask_exhausted:",
+        OnReaskExhausted::parse,
+        OnReaskExhausted::Pause,
+        "is not block or pause, so it pauses",
+        &mut lld75_errors,
+    )
+    .unwrap_or_default();
+    let context_isolation = strongest_value(
+        front,
+        "context_isolation:",
+        CheckMode::parse,
+        CheckMode::Enforce,
+        "is not advise or enforce, so it enforces",
+        &mut lld75_errors,
+    )
+    .unwrap_or_default();
+    let closed_lanes: Vec<LaneClass> = accepted(
+        "closed_lanes:",
+        list("closed_lanes:", true),
+        |v| LaneClass::parse_closable(v).is_some(),
+        "is not a lane (irreversible, reversible_wide)",
+        &mut lld75_errors,
+    )
+    .iter()
+    .filter_map(|v| LaneClass::parse_closable(v))
+    .collect();
+    let open_actions = accepted(
+        "open_actions:",
+        top_level_list("open_actions:", true),
+        |v| crate::plugins::anomaly::actions::ACTION_TOKENS.contains(&v),
+        "is not an action token",
+        &mut lld75_errors,
+    );
+    let node_kinds = accepted(
+        "node_kind:",
+        list("node_kind:", true),
+        |v| NODE_KINDS.contains(&v),
+        "is not a node kind (splitter, worker, code, gate)",
+        &mut lld75_errors,
+    );
+    let node_kind_allow = accepted(
+        "node_kind_allow:",
+        top_level_list("node_kind_allow:", true),
+        |v| NODE_KIND_ALLOWANCES.contains(&v),
+        "is not a limit (model, write, shell, spawn)",
+        &mut lld75_errors,
+    );
+    // `max_calls:` splits on commas (each item is `A <= N`); `forbid_with:`
+    // does NOT, because a comma is its own separator between taint and token.
+    let counts = parse_items(front, "max_calls:", true, parse_count_bound);
+    let cooccur = parse_items(front, "forbid_with:", false, parse_cooccurrence);
+    // Patterns keep their case as written; the matcher lowercases both sides.
+    let sql_allow_dsns = top_level_list("sql_allow_dsns:", false);
+    let (sql_guard, sql_guard_error) = parse_sql_guard(front, !sql_allow_dsns.is_empty());
+
+    FrontMatter {
+        roles: top_level_list("roles:", true),
+        // Harness names are lowercase by convention (`claude-code`, `cursor`).
+        allow_harnesses: list("allow_harnesses:", true),
+        // Tool names keep their case — harnesses ship tools called `Bash` and
+        // `Write`, and lowercasing them would stop the denylist matching.
+        deny_tools: list("deny_tools:", false),
+        // Same case rule as deny_tools, and for the same reason: a plan naming
+        // `Bash` must match the tool the harness actually calls. Action tokens are
+        // lowercase by construction, so this is safe for both.
+        plan_steps: list("plan_steps:", false),
+        // Paths keep their case because filesystems outside macOS care about it,
+        // and a scope written `Packages/Proxy` must not silently match nothing on
+        // a Linux CI runner. Comparison lowercases both sides.
+        scope_paths: list("scope_paths:", false),
+        allow_commands: list("allow_commands:", false),
+        // Action tokens (`action:deploy`) are lowercase by construction, but raw
+        // tool names are accepted here too — see the detector — so case is kept
+        // and the comparison ignores it.
+        review_before: list("review_before:", false),
+        risk_tier: parse_risk_tier(front),
+        mode: parse_mode(front),
+        requires_before: requires.0,
+        forbid_after: forbids.0,
+        max_calls: counts.0,
+        forbid_with: cooccur.0,
+        sql_guard,
+        sql_allow_dsns,
+        // One rule per line, never split on commas: the value is JSON.
+        hook_rules: front
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("hook_rule:"))
+            .map(crate::plugins::hook_rules::parse_line)
+            .collect(),
+        // Also one JSON rule per line, at any indentation: it adds a rule.
+        decide_rules: crate::decide::parse_lines(
+            front
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("decide:")),
+        ),
+        scope_paths_mode,
+        plan_steps_mode,
+        plan_approval,
+        closed_lanes,
+        open_actions,
+        on_reask_exhausted,
+        context_isolation,
+        node_kinds,
+        node_kind_allow,
+        rule_errors: {
+            let mut e = requires.1;
+            e.extend(forbids.1);
+            e.extend(counts.1);
+            e.extend(cooccur.1);
+            e.extend(sql_guard_error);
+            e.extend(lld75_errors);
+            e
+        },
+        body: body.trim_start_matches("\n---").trim().to_string(),
+    }
+}
+
+/// Parse one `A -> B` ordering rule.
+///
+/// Both sides read left-to-right as sequence order, so the same arrow means the
+/// same thing in both keys: `requires_before: A -> B` is "A must precede B", and
+/// `forbid_after: A -> B` is "B must not follow A". A rule that read in one
+/// direction for one key and the other for the other key would be a trap nobody
+/// could remember, and an ordering rule pointed backwards fails silently.
+///
+/// Returns `Err(reason)` rather than dropping the rule. An ordering rule that
+/// cannot match is indistinguishable from no rule at all once it reaches the hot
+/// path, so the only place it can be reported is here.
+/// Parse `A -> B` or `A ~> B`, returning `(before, after, adjacent)`.
+///
+/// `~>` is a **tightening** of `->`, not a different kind of rule: it says the
+/// two must be *adjacent* rather than merely ordered. Reusing the same key with
+/// a stricter arrow keeps one concept in one place — a separate
+/// `forbid_directly_after:` key would make an operator learn two names for one
+/// idea and then guess which the built-ins use.
+fn parse_ordering(raw: &str) -> Result<(String, String, bool), String> {
+    let (lhs, rhs, adjacent) = if let Some((l, r)) = raw.split_once("~>") {
+        (l, r, true)
+    } else if let Some((l, r)) = raw.split_once("->") {
+        (l, r, false)
+    } else {
+        return Err(format!("{raw:?}: expected `A -> B` or `A ~> B`"));
+    };
+    let lhs = lhs.trim();
+    let rhs = rhs.trim();
+    if lhs.is_empty() || rhs.is_empty() {
+        return Err(format!("{raw:?}: both sides must be non-empty"));
+    }
+    for side in [lhs, rhs] {
+        // A token with whitespace is a shell command, not a tool or an action.
+        //
+        // This is the single most likely authoring mistake: the rules are about
+        // `action:deploy`, but the thing an operator has in mind is `git push`.
+        // A command never matches — no harness emits a tool by that name, and
+        // `classify` synthesises only the `action:` tokens — so such a rule
+        // compiles, loads, and silently never fires. Refusing it here is the only
+        // moment anyone finds out.
+        if side.split_whitespace().count() > 1 {
+            return Err(format!(
+                "{side:?} looks like a shell command. Ordering rules name tools \
+                 (`Bash`) or actions (`action:deploy`), never commands — \
+                 `classify` in plugins::anomaly::actions maps commands onto the \
+                 action tokens, and a rule naming the command itself can \
+                 never match."
+            ));
+        }
+    }
+    Ok((lhs.to_string(), rhs.to_string(), adjacent))
+}
+
+/// Split one front-matter key into comma-free items, then parse each.
+fn parse_items<T>(
+    front: &str,
+    key: &str,
+    split_on_comma: bool,
+    f: impl Fn(&str) -> Result<T, String>,
+) -> (Vec<T>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut errs = Vec::new();
+    for raw in front
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(key))
+        .flat_map(|v| {
+            if split_on_comma {
+                v.split(',').map(str::to_string).collect::<Vec<_>>()
+            } else {
+                vec![v.to_string()]
+            }
+        })
+        .map(|r| {
+            r.trim()
+                .trim_matches(['"', '\'', '[', ']'])
+                .trim()
+                .to_string()
+        })
+        .filter(|r| !r.is_empty())
+    {
+        match f(&raw) {
+            Ok(v) => ok.push(v),
+            Err(e) => errs.push(format!("{key} {e}")),
+        }
+    }
+    (ok, errs)
+}
+
+/// Parse `A <= N` — at most N calls to A in one run.
+///
+/// The one bound an operator can state without knowing anything about our
+/// internals: "this run should not call the deploy path eleven times."
+fn parse_count_bound(raw: &str) -> Result<(String, usize), String> {
+    let Some((lhs, rhs)) = raw.split_once("<=") else {
+        return Err(format!("{raw:?}: expected `A <= N`"));
+    };
+    let token = lhs.trim();
+    if token.is_empty() {
+        return Err(format!("{raw:?}: the tool or action must be named"));
+    }
+    if token.split_whitespace().count() > 1 {
+        return Err(format!(
+            "{token:?} looks like a shell command. Count bounds name tools \
+             (`Bash`) or actions (`action:deploy`), never commands."
+        ));
+    }
+    let n: usize = rhs
+        .trim()
+        .parse()
+        .map_err(|_| format!("{raw:?}: {:?} is not a whole number", rhs.trim()))?;
+    Ok((token.to_string(), n))
+}
+
+/// Parse `secrets(), action:http_post` — two things that must not co-occur.
+///
+/// Taint, expressed as **co-occurrence rather than succession**, and the
+/// distinction is a limit of what we can honestly know. `dlp_findings` is the
+/// scan of the whole request body: it says a secret is *present*, not which tool
+/// call carried it. Writing this as an ordering rule would imply a position in
+/// the sequence that nothing in the data supports — the exact "shipping it as if
+/// it were real" failure. So the rule is "these two together, in this request".
+fn parse_cooccurrence(raw: &str) -> Result<(String, String), String> {
+    let Some((lhs, rhs)) = raw.split_once(',') else {
+        return Err(format!(
+            "{raw:?}: expected `taint(), token` — e.g. `secrets(), action:http_post`"
+        ));
+    };
+    let taint = lhs.trim().to_ascii_lowercase();
+    if !matches!(taint.as_str(), "secrets()" | "pii()") {
+        return Err(format!(
+            "{:?}: the left side must be `secrets()` or `pii()` — `secrets()` \
+             covers secrets and credentials, `pii()` personal data including \
+             custom `phi` patterns",
+            lhs.trim()
+        ));
+    }
+    let token = rhs.trim();
+    if token.is_empty() {
+        return Err(format!(
+            "{raw:?}: the right side must name a tool or action"
+        ));
+    }
+    // The same guard `parse_ordering` and `parse_count_bound` already carry, and
+    // for the same reason — it was the one of the three siblings written without
+    // it. Two failures it lets through, both silent:
+    //
+    //   forbid_with: secrets(), rm -rf
+    //   forbid_with: secrets(), action:http_post, pii(), action:http_post
+    //
+    // The first is a command, and no harness emits a tool by that name. The
+    // second is the sharper one: `forbid_with:` deliberately does NOT split on
+    // commas — the comma separates the two *sides* of one rule — so a second
+    // rule written on the same line is swallowed into the first rule's token.
+    // Both produced a token matching nothing, so the rule loaded, warned
+    // nothing, and could never fire. Given the asymmetry with `max_calls:`
+    // directly above it, two rules on one line is the likeliest way to write
+    // this key wrong.
+    if token.split_whitespace().count() > 1 {
+        return Err(format!(
+            "{token:?} is not a single tool or action token. Write one rule per \
+             line — `forbid_with:` does not split on commas, because the comma \
+             separates `taint(), token`, so a second rule on this line becomes \
+             part of the first rule's token and can never match."
+        ));
+    }
+    Ok((taint, token.to_string()))
+}
+
+/// Parse every `A -> B` under one front-matter key, splitting good from bad.
+fn parse_rules(front: &str, key: &str) -> (Vec<(String, String, bool)>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut errs = Vec::new();
+    for raw in front
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(key))
+        .flat_map(|v| v.split(','))
+        .map(|r| {
+            r.trim()
+                .trim_matches(['"', '\'', '[', ']'])
+                .trim()
+                .to_string()
+        })
+        .filter(|r| !r.is_empty())
+    {
+        match parse_ordering(&raw) {
+            Ok((before, after, adjacent)) => {
+                use crate::plugins::anomaly::outcome::{qualifier_error, strip_any_qualifier};
+                // A misplaced or unknown qualifier is reported and the rule
+                // kept so that it still refuses: the left side stays literal
+                // (a token nothing emits leaves the rule unmet), the right
+                // side loses the qualifier (so it still names the gated call).
+                // `forbid_after:` takes no qualifier at all, so both sides
+                // lose it there and the rule keeps forbidding.
+                let error = if key == "requires_before:" {
+                    qualifier_error(&before, &after)
+                } else {
+                    let lhs_q = strip_any_qualifier(&before) != before.trim();
+                    let rhs_q = strip_any_qualifier(&after) != after.trim();
+                    (lhs_q || rhs_q).then(|| {
+                        format!("{raw:?}: [ok] qualifies only action:run_tests, on the left of -> in requires_before:")
+                    })
+                };
+                match error {
+                    Some(e) => {
+                        errs.push(format!("{key} {e}"));
+                        let before = if key == "requires_before:" {
+                            before
+                        } else {
+                            strip_any_qualifier(&before)
+                        };
+                        ok.push((before, strip_any_qualifier(&after), adjacent));
+                    }
+                    None => ok.push((before, after, adjacent)),
+                }
+            }
+            Err(e) => errs.push(format!("{key} {e}")),
+        }
+    }
+    (ok, errs)
+}
+
+/// Parse one SOP's raw markdown+front-matter content into a [`Sop`], given its
+/// title. Factored out of `read_dir_sops` so the *same* parser — one
+/// definition of what `deny_tools:` front matter means — serves both the
+/// local on-disk path and the per-workspace fetch path
+/// (`fetch_workspace_sops`): the control plane sends
+/// raw `{title, markdownContent}` pairs rather than a pre-parsed structured
+/// shape specifically so this is the only place YAML-frontmatter parsing
+/// happens, ever.
+///
+/// `source` names where `raw` came from, for the unparseable-rule warning
+/// (a file path locally, `workspace:{id}` for a fetched SOP) — the warning
+/// exists so an operator can find the file/SOP with the typo, and "from
+/// nowhere in particular" would defeat that.
+///
+/// Returns `None` for a file/entry that parses to nothing at all: no prose
+/// and no declarative field set. A declaration-only SOP (whole content is
+/// `scope_paths:`) is still real and must not be dropped — every declarative
+/// field is checked here for exactly that reason.
+pub(crate) fn parse_sop_content(
+    title: String,
+    raw: &str,
+    source: &str,
+    scope: SopScope,
+) -> Option<Sop> {
+    let fm = parse_front_matter(raw);
+    if fm.body.is_empty()
+        && fm.deny_tools.is_empty()
+        && fm.allow_harnesses.is_empty()
+        && fm.plan_steps.is_empty()
+        && fm.scope_paths.is_empty()
+        && fm.allow_commands.is_empty()
+        && fm.review_before.is_empty()
+        && fm.requires_before.is_empty()
+        && fm.forbid_after.is_empty()
+        && fm.max_calls.is_empty()
+        && fm.forbid_with.is_empty()
+        && fm.sql_guard.is_none()
+        && fm.hook_rules.is_empty()
+        && fm.decide_rules.is_empty()
+        && fm.plan_approval.is_none()
+        && fm.closed_lanes.is_empty()
+        && fm.node_kinds.is_empty()
+        && fm.rule_errors.is_empty()
+    {
+        return None;
+    }
+    // Report unparseable ordering rules at load, once, naming the source.
+    //
+    // A rule that cannot parse is indistinguishable from no rule at all by the
+    // time it reaches a detector — the vec is simply shorter — so this is the
+    // only moment anyone can find out. The SOP is still loaded: dropping the
+    // whole thing because one rule had a typo would silently disarm the rules
+    // that were fine.
+    for err in &fm.rule_errors {
+        tracing::warn!(sop = %source, "Ignoring unparseable ordering rule: {err}");
+    }
+    // An unreadable entry refuses every shell call, so say why here too.
+    for entry in &fm.allow_commands {
+        if !crate::plugins::anomaly::shell_parse::is_allow_entry(entry) {
+            tracing::warn!(sop = %source, entry = %entry, "Unreadable allow_commands entry — every shell call is refused while it is in force");
+        }
+    }
+    // An unreadable hook rule is not ignored: it refuses every tool call
+    // (`plugins::hook_rules`), so say why where an operator will look.
+    for decl in &fm.hook_rules {
+        if let HookRuleDecl::Unreadable { error, .. } = decl {
+            tracing::warn!(sop = %source, "Unreadable hook rule — every tool call is refused while it is in force: {error}");
+        }
+    }
+    // The gateway judges each complete response by these
+    // (`crate::decide::gateway`); named once per SOP at load, so an operator
+    // can see which rules a response is held to.
+    let response_rules: Vec<&str> = fm
+        .decide_rules
+        .iter()
+        .filter_map(|d| match d {
+            DecideDecl::Rule(r) if matches!(r.on, crate::decide::On::Response) => {
+                Some(r.id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if !response_rules.is_empty() {
+        tracing::info!(
+            sop = %source,
+            rules = %response_rules.join(", "),
+            "Decide rules with on: response judge each complete response at the gateway"
+        );
+    }
+    for decl in &fm.decide_rules {
+        if let DecideDecl::Unreadable { error, .. } = decl {
+            tracing::warn!(sop = %source, "Unreadable decide rule — every response is refused, and the gates refuse the tools it names, until it is fixed: {error}");
+        }
+    }
+    Some(Sop {
+        title,
+        body: fm.body,
+        scope,
+        roles: fm.roles,
+        deny_tools: fm.deny_tools,
+        allow_harnesses: fm.allow_harnesses,
+        plan_steps: fm.plan_steps,
+        scope_paths: fm.scope_paths,
+        allow_commands: fm.allow_commands,
+        review_before: fm.review_before,
+        risk_tier: fm.risk_tier,
+        requires_before: fm.requires_before,
+        forbid_after: fm.forbid_after,
+        max_calls: fm.max_calls,
+        forbid_with: fm.forbid_with,
+        mode: fm.mode,
+        sql_guard: fm.sql_guard,
+        sql_allow_dsns: fm.sql_allow_dsns,
+        hook_rules: fm.hook_rules,
+        decide_rules: fm.decide_rules,
+        scope_paths_mode: fm.scope_paths_mode,
+        plan_steps_mode: fm.plan_steps_mode,
+        plan_approval: fm.plan_approval,
+        closed_lanes: fm.closed_lanes,
+        open_actions: fm.open_actions,
+        on_reask_exhausted: fm.on_reask_exhausted,
+        context_isolation: fm.context_isolation,
+        node_kinds: fm.node_kinds,
+        node_kind_allow: fm.node_kind_allow,
+    })
+}
+
+/// The SOP files in `dir`, each with the title it is loaded under: every `.md`
+/// file directly in it (titled by its stem, `deploy`) and every `.md` file one
+/// folder down (titled `<folder>/<stem>`, `safety/rules`). Both layouts are the
+/// documented one — `intutic sops pull` and `intutic guardrails pull` write flat
+/// files, and a rule set is a folder — and `intutic connect` reads the same two.
+///
+/// Folders whose name starts with `.` are not read: a Kubernetes ConfigMap
+/// volume links each top-level file into `..data/`, a timestamped `..<date>/`
+/// folder, and reading those as rule sets would load every SOP three times.
+fn sop_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let md_stem = |path: &Path| -> Option<String> {
+        if !path.is_file() || path.extension()?.to_str()? != "md" {
+            return None;
+        }
+        path.file_stem()?.to_str().map(str::to_string)
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            out.extend(md_stem(&path).map(|stem| (stem, path)));
+            continue;
+        }
+        let Some(folder) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if folder.starts_with('.') {
+            continue;
+        }
+        let Ok(inner) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for file in inner.flatten().map(|e| e.path()) {
+            out.extend(md_stem(&file).map(|stem| (format!("{folder}/{stem}"), file)));
+        }
+    }
+    out
+}
+
+/// Whether `intutic sops pull` marked this file `intutic_enforced: false`: a
+/// copy of a SOP the control plane does not enforce (a draft, one under review
+/// or invalidated, one no longer active). Such a file is not loaded at all, so
+/// a SOP is not enforced here because it was pulled. Only that exact value
+/// switches a file off — a typo leaves it enforced — and only on disk: a SOP
+/// the control plane serves is in force by being served. Same fence rules as
+/// [`parse_front_matter`]; the sync daemon reads the key the same way
+/// (`markedNotEnforced` in `services/sync-daemon/src/lib/sopFiles.ts`).
+fn pulled_but_not_enforced(raw: &str) -> bool {
+    let Some(rest) = raw.trim_start().strip_prefix("---") else {
+        return false;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return false;
+    };
+    top_level_values(&rest[..end], "intutic_enforced:").any(|v| {
+        v.trim()
+            .trim_matches(['"', '\''])
+            .eq_ignore_ascii_case("false")
+    })
+}
+
+fn read_dir_sops(dir: &Path) -> Vec<Sop> {
+    let mut sops: Vec<Sop> = sop_files(dir)
+        .into_iter()
+        .filter_map(|(title, path)| {
+            let raw = std::fs::read_to_string(&path).ok()?;
+            if pulled_but_not_enforced(&raw) {
+                return None;
+            }
+            let source = path.display().to_string();
+            parse_sop_content(title, &raw, &source, SopScope::Workspace)
+        })
+        .collect();
+    // Stable order, so the injected block does not reshuffle between requests
+    // and defeat prompt caching upstream.
+    sops.sort_by(|a, b| a.title.cmp(&b.title));
+    sops
+}
+
+struct Cached {
+    sops: Vec<Sop>,
+    read_at: Instant,
+}
+
+static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+
+/// How far up the tree to look for a workspace before giving up.
+///
+/// Bounded so a proxy started somewhere unexpected walks a few levels rather
+/// than stat-ing its way to `/`.
+const MAX_ANCESTOR_WALK: usize = 12;
+
+/// Explicit override for the SOP directory.
+///
+/// The walk below is right for a developer machine and useless in a cluster,
+/// where the binary runs with `cwd` `/home/intutic` and no ancestor holds
+/// `.intutic/sops`. This is how policy gets delivered by a mounted volume
+/// instead of by an accident of the working directory.
+const SOPS_DIR_ENV: &str = "INTUTIC_SOPS_DIR";
+
+/// Where the SOP directory came from.
+///
+/// Kept rather than collapsed to an `Option<PathBuf>` because "which source
+/// won" is the question an operator staring at an unenforced policy needs
+/// answered, and the two ways of finding nothing call for different advice.
+#[derive(Debug, PartialEq)]
+enum SopsSource {
+    /// [`SOPS_DIR_ENV`] named a directory that exists.
+    Env(PathBuf),
+    /// [`SOPS_DIR_ENV`] is set but names nothing readable. Deliberately does not
+    /// fall through to the walk: an operator who mounted a policy volume needs
+    /// to hear that it is missing, not to silently inherit whatever happens to
+    /// sit above the working directory.
+    EnvNotADirectory(PathBuf),
+    /// Found by walking up from the working directory.
+    Walk(PathBuf),
+    /// No override set, and nothing above the working directory.
+    NotFound,
+}
+
+impl SopsSource {
+    /// The directory to read, when there is one.
+    fn dir(&self) -> Option<&Path> {
+        match self {
+            SopsSource::Env(p) | SopsSource::Walk(p) => Some(p),
+            SopsSource::EnvNotADirectory(_) | SopsSource::NotFound => None,
+        }
+    }
+
+    /// How this resolution happened, for the log line.
+    fn label(&self) -> &'static str {
+        match self {
+            SopsSource::Env(_) | SopsSource::EnvNotADirectory(_) => SOPS_DIR_ENV,
+            SopsSource::Walk(_) => "cwd-ancestor-walk",
+            SopsSource::NotFound => "none",
+        }
+    }
+}
+
+/// Locate the SOP directory, and the working directory it was resolved from.
+fn resolve_sops_dir() -> (SopsSource, PathBuf) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let source = resolve_sops_dir_from(std::env::var(SOPS_DIR_ENV).ok().as_deref(), &cwd);
+    (source, cwd)
+}
+
+/// The resolution itself, with both inputs passed in.
+///
+/// [`SOPS_DIR_ENV`] wins when set, because it is the only way to say where
+/// policy lives on a host whose working directory carries no answer. The walk
+/// remains the fallback, and stays the whole story on a developer machine.
+///
+/// Walking up rather than reading a fixed relative path, because the proxy's
+/// working directory is not reliably the workspace root. `intutic connect`
+/// sets `cwd` to the workspace, but `intutic start` inherits whatever
+/// directory the user happened to be in, and `intutic-proxy` can be run
+/// directly from anywhere. A plain `.intutic/sops` therefore resolves to
+/// nothing whenever someone starts the proxy from a subdirectory — with no
+/// error, since an absent directory is indistinguishable from an empty one.
+///
+/// Same rule a developer already expects from `.git`: the project is wherever
+/// its marker is, not wherever the shell happens to be pointing.
+///
+/// Split from [`resolve_sops_dir`] so the tests drive the real branch order
+/// without mutating the environment or working directory every other test in
+/// this binary shares.
+fn resolve_sops_dir_from(env_override: Option<&str>, cwd: &Path) -> SopsSource {
+    // An empty or blank value is how a Kubernetes env block spells "unset";
+    // honouring it would point the proxy at "" and disable the walk as well.
+    if let Some(raw) = env_override.map(str::trim).filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(raw);
+        return if path.is_dir() {
+            SopsSource::Env(path)
+        } else {
+            SopsSource::EnvNotADirectory(path)
+        };
+    }
+    cwd.ancestors()
+        .take(MAX_ANCESTOR_WALK)
+        .map(|dir| dir.join(".intutic").join("sops"))
+        .find(|candidate| candidate.is_dir())
+        .map_or(SopsSource::NotFound, SopsSource::Walk)
+}
+
+/// What to say when the resolved SOP set is empty.
+///
+/// Built here rather than inline at the `warn!` so a test can assert on the
+/// text the code actually emits; [`report_resolution`] is the only caller.
+fn empty_sops_warning(source: &SopsSource, cwd: &Path) -> String {
+    let looked = match source {
+        SopsSource::Env(p) => format!(
+            "{SOPS_DIR_ENV}={} is a directory but holds no readable SOP files",
+            p.display()
+        ),
+        SopsSource::EnvNotADirectory(p) => {
+            format!("{SOPS_DIR_ENV}={} is not a directory", p.display())
+        }
+        SopsSource::Walk(p) => format!(
+            "{} (found by walking up from cwd {}) holds no readable SOP files",
+            p.display(),
+            cwd.display()
+        ),
+        SopsSource::NotFound => format!(
+            "no .intutic/sops directory exists at cwd {} or in its first \
+             {MAX_ANCESTOR_WALK} ancestors, and {SOPS_DIR_ENV} is not set",
+            cwd.display()
+        ),
+    };
+    format!(
+        "No SOPs resolved — every SOP-derived control is inert: nothing declared \
+         through {ENFORCING_FIELDS} can fire, and no \
+         governance block is injected into any request. {looked}. Point \
+         {SOPS_DIR_ENV} at a directory of .md SOP files — a mounted policy volume \
+         in a cluster, where the cwd walk finds nothing."
+    )
+}
+
+/// Say, once, where the SOPs came from — or that there are none.
+///
+/// Silence is what let the empty case survive: in a cluster the walk finds
+/// nothing, so `deny_tools`, `plan_steps`, `scope_paths` and `review_before`
+/// all resolve to empty and every SOP-derived control does nothing, with no
+/// line anywhere saying so. A user who wrote SOPs sees a governed session with
+/// none of their policy in it.
+/// Whether this SOP declares anything the proxy can act on.
+///
+/// Prose is not enforcement. A SOP with a body and no declarations is a
+/// document the agent may read and ignore, which is the whole reason the
+/// enforceable fields exist.
+#[cfg(test)]
+mod enforceability_tests {
+    use super::*;
+
+    /// A declared severity band must survive parsing and resolve as the max.
+    ///
+    /// `RequestContext.risk_tier` was `RiskLevel::Low` hardcoded at its only
+    /// producer, while the WASM SDK documents the field as
+    /// `Low | Medium | High | Critical` and tells rule authors they can gate on
+    /// it — and the SDK's `mock_context.json` supplies `"Critical"`. So a rule
+    /// written `if (ctx.risk_tier == "Critical") return BLOCK` validated
+    /// locally, shipped, and never fired once.
+    #[test]
+    fn a_declared_risk_tier_parses_and_the_highest_wins() {
+        let parse = |raw: &str| parse_front_matter(raw).risk_tier;
+
+        assert_eq!(
+            parse("---\nrisk_tier: HIGH\n---\nbody"),
+            Some(RiskLevel::High)
+        );
+        assert_eq!(
+            parse("---\nrisk_tier: critical\n---\nbody"),
+            Some(RiskLevel::Critical)
+        );
+        assert_eq!(
+            parse("---\nrisk_tier: \"Medium\"\n---\nbody"),
+            Some(RiskLevel::Medium)
+        );
+
+        // Unstated is None, not a silent Low — the caller renders the default,
+        // so "declared low" and "declared nothing" stay distinguishable here.
+        assert_eq!(parse("---\ndeny_tools: curl\n---\nbody"), None);
+
+        // And a typo is None rather than a quiet default. Reading `HGIH` as Low
+        // is how a declared band becomes a control the operator believes is set
+        // and the code never sees.
+        assert_eq!(parse("---\nrisk_tier: HGIH\n---\nbody"), None);
+    }
+
+    /// Two SOPs applying to one role: the work is as risky as the riskiest.
+    #[test]
+    fn the_highest_declared_band_wins_across_sops() {
+        let mut low = Sop {
+            risk_tier: Some(RiskLevel::Low),
+            ..Default::default()
+        };
+        low.roles = vec!["implementer".into()];
+        let mut high = Sop {
+            risk_tier: Some(RiskLevel::Critical),
+            ..Default::default()
+        };
+        high.roles = vec!["implementer".into()];
+
+        let best = [low, high]
+            .iter()
+            .filter(|s| s.applies_to("implementer"))
+            .filter_map(|s| s.risk_tier)
+            .max();
+        assert_eq!(
+            best,
+            Some(RiskLevel::Critical),
+            "taking either arbitrarily would make the answer depend on directory order",
+        );
+    }
+
+    /// An ordering-only SOP enforces something, and used to be told it did not.
+    ///
+    /// `is_enforceable` checked five of the nine declarative fields. The four it
+    /// missed — `requires_before`, `forbid_after`, `max_calls`, `forbid_with` —
+    /// are the ones Phase 4 added, and I added them without extending this. So
+    /// a policy that declares only ordering rules loads, resolves per role, and
+    /// *does* block a deploy without a prior test run, while the boot log says
+    /// "every SOP-derived control is inert".
+    ///
+    /// That is worse than a cosmetic mislabel. This warning exists to catch a
+    /// one-character typo (`review_befor:`) that loads clean and enforces
+    /// nothing; an operator who has learned it cries wolf will not read it on
+    /// the day it is right.
+    #[test]
+    fn an_ordering_only_sop_counts_as_enforceable() {
+        let ordering = Sop {
+            requires_before: vec![("action:run_tests".into(), "action:deploy".into(), false)],
+            ..Default::default()
+        };
+        assert!(
+            is_enforceable(&ordering),
+            "requires_before enforces an order"
+        );
+
+        let ceiling = Sop {
+            max_calls: vec![("action:deploy".into(), 1usize)],
+            ..Default::default()
+        };
+        assert!(
+            is_enforceable(&ceiling),
+            "max_calls is a hard ceiling that kills"
+        );
+
+        let forbid = Sop {
+            forbid_after: vec![(
+                "action:secret_read".into(),
+                "action:http_post".into(),
+                false,
+            )],
+            ..Default::default()
+        };
+        assert!(
+            is_enforceable(&forbid),
+            "forbid_after is the exfiltration rule"
+        );
+
+        let taint = Sop {
+            forbid_with: vec![("secrets()".into(), "action:http_post".into())],
+            ..Default::default()
+        };
+        assert!(is_enforceable(&taint), "forbid_with is co-occurrence taint");
+    }
+
+    /// And prose alone still is not enforcement, or the warning means nothing.
+    #[test]
+    fn a_prose_only_sop_is_still_inert() {
+        assert!(!is_enforceable(&Sop::default()));
+    }
+
+    /// `risk_tier:` is the one declaration this warning used to misreport.
+    ///
+    /// No proxy detector reads it, so `is_enforceable` is right to return
+    /// false — but the field is placed on `RequestContext` and handed to WASM
+    /// rules, which may act on it. Telling that workspace "every SOP-derived
+    /// control is inert" invites someone to delete a declaration that is doing
+    /// something, which is the wrong direction to be wrong in.
+    #[test]
+    fn the_inert_warning_says_where_risk_tier_does_reach() {
+        let sop = Sop {
+            title: "tiers".to_string(),
+            risk_tier: Some(RiskLevel::High),
+            ..Default::default()
+        };
+        assert!(
+            !is_enforceable(&sop),
+            "risk_tier must stay outside is_enforceable — making it enforceable \
+             would silence this warning for a policy the proxy cannot act on, \
+             and catching that is the only reason the warning exists"
+        );
+
+        let msg = inert_sops_warning(&SopsSource::NotFound, &["tiers".to_string()], true);
+        assert!(
+            msg.contains("risk_tier"),
+            "the warning must name the field: {msg}"
+        );
+        assert!(
+            msg.contains("WASM"),
+            "the warning must say where it does reach: {msg}"
+        );
+
+        // And a SOP with no risk_tier gets the plain message, with no dangling
+        // note about a field it never declared.
+        let plain = inert_sops_warning(&SopsSource::NotFound, &["prose".to_string()], false);
+        assert!(!plain.contains("risk_tier"), "unwanted addendum: {plain}");
+    }
+}
+
+/// The front-matter keys that make an SOP enforceable, named once.
+///
+/// Three messages enumerated this list by hand and two had drifted:
+/// `is_enforceable` gained four fields in Phase 4 and neither warning was
+/// updated, so an operator running an ordering-only policy was told which keys
+/// to use and the four that would have worked were not among them. Parallel
+/// lists that disagree is the same defect class as the tool-name lists in
+/// `actions.rs` — one place, or they drift.
+const ENFORCING_FIELDS: &str = "deny_tools, allow_harnesses, plan_steps, scope_paths, allow_commands, \
+     review_before, requires_before, forbid_after, max_calls, forbid_with, sql_guard, sql_allow_dsns, \
+     closed_lanes, plan_approval, node_kind, hook_rule or decide";
+
+/// Does this SOP declare anything the proxy can act on?
+///
+/// **Every declarative field belongs here.** It listed five of nine, and the
+/// four missing ones — `requires_before`, `forbid_after`, `max_calls`,
+/// `forbid_with` — were the ordering rules added in Phase 4, added without
+/// extending this. So a policy declaring only ordering rules loaded, resolved
+/// per role, blocked what it said it would, and was told at boot that "every
+/// SOP-derived control is inert".
+///
+/// That matters more than a mislabel, because of what this warning is *for*: it
+/// catches a one-character typo (`review_befor:`) that parses clean and enforces
+/// nothing. An operator who has learned it cries wolf will not read it on the
+/// day it is right.
+fn is_enforceable(sop: &Sop) -> bool {
+    !sop.deny_tools.is_empty()
+        || !sop.allow_harnesses.is_empty()
+        || !sop.plan_steps.is_empty()
+        || !sop.scope_paths.is_empty()
+        || !sop.allow_commands.is_empty()
+        || !sop.review_before.is_empty()
+        || !sop.requires_before.is_empty()
+        || !sop.forbid_after.is_empty()
+        || !sop.max_calls.is_empty()
+        || !sop.forbid_with.is_empty()
+        || sop.sql_guard.is_some()
+        || !sop.hook_rules.is_empty()
+        || !sop.decide_rules.is_empty()
+        || !sop.closed_lanes.is_empty()
+        || sop.plan_approval.is_some()
+        || !sop.node_kinds.is_empty()
+}
+
+/// What to say when policy loaded but none of it can fire.
+///
+/// The gap this closes is one character wide. `review_befor:` instead of
+/// `review_before:` parses fine — unknown front-matter keys are ignored, as they
+/// must be for forward compatibility — and produced a green
+/// "Loaded role-scoped SOPs count=1" with zero enforcement behind it. The empty
+/// -set warning could never catch that, because the set was not empty.
+///
+/// That is the same defect this whole subsystem keeps producing, one layer in:
+/// a control that looks installed and reaches nothing. Here it is worse than
+/// usual, because the operator did the work — they wrote the policy, mounted it,
+/// and watched it load.
+fn inert_sops_warning(source: &SopsSource, titles: &[String], any_risk_tier: bool) -> String {
+    // `risk_tier:` is the one field this message used to misreport. No detector
+    // in the proxy reads it, so `is_enforceable` correctly returns false — but
+    // it IS placed on `RequestContext` and delivered to WASM rules, which may
+    // well act on it. Saying "every SOP-derived control is inert" to a
+    // workspace whose WASM rule gates on exactly that field is wrong in the
+    // direction that matters: it invites someone to delete a declaration that
+    // is doing something.
+    //
+    // The predicate stays as it is. Making `risk_tier` enforceable would
+    // silence this warning for a policy that genuinely enforces nothing through
+    // the proxy, and catching that is the only reason the warning exists.
+    let addendum = if any_risk_tier {
+        " Note: `risk_tier:` IS declared here. No proxy detector reads it, which \
+         is why this warning fired — but it is delivered to WASM rules, so a \
+         custom rule gating on it is still acting on this policy."
+    } else {
+        ""
+    };
+    format!(
+        "{} SOP(s) loaded and NONE declares anything the proxy's own detectors \
+         can act on — every SOP-derived control is inert despite policy being \
+         present. Affected: {}. \
+         An SOP enforces something only through {ENFORCING_FIELDS} in its front \
+         matter; prose alone is advisory. Check for a misspelled key — an unrecognised one is ignored \
+         silently, by design, so it loads clean. Source: {}.{}",
+        titles.len(),
+        titles.join(", "),
+        source.label(),
+        addendum
+    )
+}
+
+fn report_resolution(source: &SopsSource, cwd: &Path, sops: &[Sop]) {
+    let count = sops.len();
+    if count == 0 {
+        tracing::warn!(
+            source = source.label(),
+            "{}",
+            empty_sops_warning(source, cwd)
+        );
+        return;
+    }
+
+    // Policy present is not policy enforced. Reported before the success line so
+    // an operator scanning the boot log sees the warning, not a green count.
+    let inert: Vec<String> = sops
+        .iter()
+        .filter(|s| !is_enforceable(s))
+        .map(|s| s.title.clone())
+        .collect();
+    if inert.len() == count {
+        let any_risk_tier = sops
+            .iter()
+            .filter(|s| !is_enforceable(s))
+            .any(|s| s.risk_tier.is_some());
+        tracing::warn!(
+            source = source.label(),
+            "{}",
+            inert_sops_warning(source, &inert, any_risk_tier)
+        );
+        return;
+    }
+    if !inert.is_empty() {
+        // Some enforce and some do not. Not an alarm — a mixed set is normal,
+        // an SOP can legitimately be reference prose — but named, because a
+        // misspelling in one file of several would otherwise hide behind the
+        // others' success.
+        tracing::info!(
+            source = source.label(),
+            advisory = %inert.join(", "),
+            "Some SOPs declare nothing enforceable and are advisory only"
+        );
+    }
+
+    tracing::info!(
+        path = %source.dir().unwrap_or(cwd).display(),
+        source = source.label(),
+        count,
+        enforceable = count - inert.len(),
+        "Loaded role-scoped SOPs"
+    );
+}
+
+/// Resolve and report the SOP set now, at startup.
+///
+/// Called from `main` so the warning above lands in the boot log where an
+/// operator reads it. Left to the first request instead, it appears minutes
+/// later interleaved with traffic, which is not where anyone looks when asking
+/// why their policy never fires.
+pub fn report_at_startup() {
+    let _ = all_sops();
+}
+
+/// All SOPs on disk, re-reading at most once per [`CACHE_TTL`].
+fn all_sops() -> Vec<Sop> {
+    let mut guard = match CACHE.lock() {
+        Ok(g) => g,
+        // A poisoned lock means another thread panicked mid-read. Falling back
+        // to an uncached read keeps policy flowing rather than failing shut on
+        // an unrelated fault.
+        Err(p) => p.into_inner(),
+    };
+    if let Some(c) = guard.as_ref() {
+        if c.read_at.elapsed() < CACHE_TTL {
+            return c.sops.clone();
+        }
+    }
+
+    let (source, cwd) = resolve_sops_dir();
+    let sops = source.dir().map(read_dir_sops).unwrap_or_default();
+
+    if guard.is_none() {
+        report_resolution(&source, &cwd, &sops);
+    }
+
+    *guard = Some(Cached {
+        sops: sops.clone(),
+        read_at: Instant::now(),
+    });
+    sops
+}
+
+// ── Per-workspace SOP resolution ──────────────────────────────────────────
+//
+// Everything above this point is process-global: one `.intutic/sops`
+// directory (or `INTUTIC_SOPS_DIR` override) for the whole proxy process.
+// Correct for the shipped topology — one proxy per developer, or one proxy
+// per company in an enterprise self-hosted deployment — but
+// wrong for a shared, multi-tenant gateway, where every tenant would
+// otherwise get the same policy, or none.
+//
+// This section adds a SECOND, workspace-keyed resolution path, consulted only
+// in gateway mode (`crate::gateway::requires_vk_only()`). Outside gateway mode
+// nothing here is ever called — `all_sops_for_workspace` returns the ordinary
+// process-global `all_sops()` unchanged, so every one of the 66 tests above
+// and every existing `*_for_role` caller is unaffected.
+
+/// A workspace's raw SOP entry as `GET /api/v1/workspace/sops-policy` returns
+/// it — title + unparsed markdown, deliberately not a pre-parsed structured
+/// shape. `parse_sop_content` (the same function `read_dir_sops` uses for the
+/// local path) is the one place YAML-frontmatter parsing happens; duplicating
+/// that logic in TypeScript would be a second definition of what `deny_tools:`
+/// means that could quietly drift from this one.
+#[cfg(any(feature = "control-plane", test))]
+#[derive(serde::Deserialize)]
+struct WorkspaceSopEntry {
+    title: String,
+    #[serde(rename = "markdownContent")]
+    markdown_content: String,
+    /// `"org"` or `"workspace"` (migration 139). `#[serde(default)]` so a
+    /// control plane older than this field -- or a response from before it
+    /// shipped -- deserializes as `None`, which `SopScope::from_wire`
+    /// resolves to `Workspace`: today's exact behaviour, no coordinated
+    /// deploy required in either direction.
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[cfg(any(feature = "control-plane", test))]
+#[derive(serde::Deserialize)]
+struct WorkspaceSopsResponse {
+    sops: Vec<WorkspaceSopEntry>,
+}
+
+/// The SOPs a `GET /api/v1/workspace/sops-policy` answer carries, parsed as
+/// the local path parses a file and sorted by title.
+#[cfg(any(feature = "control-plane", test))]
+fn workspace_sops_from_body(workspace_id: &str, body: WorkspaceSopsResponse) -> Vec<Sop> {
+    let mut sops: Vec<Sop> = body
+        .sops
+        .into_iter()
+        .filter_map(|entry| {
+            let source = format!("workspace:{workspace_id}:{}", entry.title);
+            let scope = SopScope::from_wire(entry.scope.as_deref());
+            parse_sop_content(entry.title, &entry.markdown_content, &source, scope)
+        })
+        .collect();
+    sops.sort_by(|a, b| a.title.cmp(&b.title));
+    sops
+}
+
+#[cfg(feature = "control-plane")]
+struct WorkspaceCached {
+    sops: Vec<Sop>,
+    read_at: Instant,
+    /// The workspace's policy version at fetch time; `None`
+    /// when no version was readable, in which case only the TTL applies.
+    version: Option<u64>,
+}
+
+#[cfg(feature = "control-plane")]
+fn workspace_cache() -> &'static Mutex<HashMap<String, WorkspaceCached>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, WorkspaceCached>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fetch and cache one workspace's ENFORCED (`VALIDATED`) SOP set from the
+/// control plane. Re-fetches at most once per [`CACHE_TTL`] per workspace —
+/// the same discipline as the process-global `all_sops()` cache, keyed by
+/// workspace instead.
+///
+/// `virtual_key` is the SAME `vk_` virtual key that authenticated the inbound
+/// request, reused rather than inventing a separate service credential —
+/// exactly how `validate_key_via_control_plane` (`proxy.rs`) already reuses it
+/// for auth. The control plane's own auth middleware resolves the workspace
+/// from the token; this function never trusts a bare caller-supplied
+/// workspace-id string on its own to select whose policy comes back — the
+/// cache key is only ever the value the control plane itself already bound
+/// the token to when it issued the 200.
+///
+/// Fails closed toward EMPTY on any error, matching `read_dir_sops`'s own
+/// precedent (an unreadable directory also returns `Vec::new()`) rather than
+/// serving a stale cached entry past its TTL — on a shared gateway, "silently
+/// keep enforcing what this workspace's policy used to be five minutes ago"
+/// is a worse failure mode than "enforce nothing for this one request and say
+/// so in the log," because the former can mask a policy the operator just
+/// tightened (e.g. added a `deny_tools:` after an incident).
+#[cfg(feature = "control-plane")]
+async fn fetch_workspace_sops(
+    http_client: &reqwest::Client,
+    control_plane_url: &str,
+    workspace_id: &str,
+    virtual_key: &crate::credential::VirtualKey,
+    policy_version: Option<u64>,
+) -> Vec<Sop> {
+    {
+        let cache = workspace_cache().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = cache.get(workspace_id) {
+            // Within the TTL AND the workspace's policy version has not moved
+            // since the fetch (or no version is readable on either side): serve
+            // the cache. A bumped version — a guardrail promoted or retired —
+            // refetches now rather than up to CACHE_TTL later.
+            let version_moved =
+                matches!((policy_version, c.version), (Some(now), Some(then)) if now != then);
+            if c.read_at.elapsed() < CACHE_TTL && !version_moved {
+                return c.sops.clone();
+            }
+        }
+    }
+
+    let url = format!("{control_plane_url}/api/v1/workspace/sops-policy");
+    let fetched: Option<Vec<Sop>> = async {
+        let resp = virtual_key
+            .authorize(http_client.get(&url))
+            .timeout(std::time::Duration::from_millis(2000))
+            .send()
+            .await
+            .map_err(|e| tracing::warn!(workspace_id = %workspace_id, error = %e, "workspace SOP fetch failed"))
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!(workspace_id = %workspace_id, status = %resp.status(), "workspace SOP fetch returned non-success");
+            return None;
+        }
+        let body: WorkspaceSopsResponse = resp
+            .json()
+            .await
+            .map_err(|e| tracing::warn!(workspace_id = %workspace_id, error = %e, "workspace SOP response did not parse"))
+            .ok()?;
+        Some(workspace_sops_from_body(workspace_id, body))
+    }
+    .await;
+
+    match fetched {
+        Some(sops) => {
+            let mut cache = workspace_cache().lock().unwrap_or_else(|p| p.into_inner());
+            cache.insert(
+                workspace_id.to_string(),
+                WorkspaceCached {
+                    sops: sops.clone(),
+                    read_at: Instant::now(),
+                    version: policy_version,
+                },
+            );
+            sops
+        }
+        None => Vec::new(),
+    }
+}
+
+/// A build without the `control-plane` feature has nowhere to fetch a workspace's
+/// SOPs from: the same empty set a gateway gets with no control-plane URL.
+#[cfg(not(feature = "control-plane"))]
+async fn fetch_workspace_sops(
+    _http_client: &reqwest::Client,
+    _control_plane_url: &str,
+    _workspace_id: &str,
+    _virtual_key: &crate::credential::VirtualKey,
+    _policy_version: Option<u64>,
+) -> Vec<Sop> {
+    Vec::new()
+}
+
+/// Resolve the SOP set to enforce for a request, gateway-mode-aware.
+///
+/// Outside gateway mode (today's behaviour, unchanged for every existing
+/// deployment): always the process-global on-disk set. In gateway mode with a
+/// known workspace and credential: that workspace's own `VALIDATED` SOPs from
+/// the control plane — never the process-global set, since the whole point is
+/// that a shared gateway process must not let one workspace's on-disk (or a
+/// DIFFERENT workspace's fetched) policy leak into another's enforcement.
+///
+/// In gateway mode with an unresolved workspace (`None`/`"unknown"`) or no
+/// control-plane URL/token, returns empty rather than falling back to the
+/// process-global set — the process-global set does not belong to any
+/// particular tenant on a shared gateway, so falling back to it would be
+/// exactly the cross-tenant leak this increment exists to close.
+pub async fn all_sops_for_workspace(
+    http_client: &reqwest::Client,
+    control_plane_url: Option<&str>,
+    workspace_id: Option<&str>,
+    virtual_key: Option<&crate::credential::VirtualKey>,
+    control_plane: Option<&dyn crate::store::ControlPlaneCache>,
+) -> Vec<Sop> {
+    if !crate::gateway::requires_vk_only() {
+        return all_sops();
+    }
+    match (control_plane_url, workspace_id, virtual_key) {
+        (Some(cp), Some(ws), Some(key)) if ws != "unknown" && !ws.is_empty() => {
+            // Read BEFORE the fetch: a bump that lands during the request is
+            // seen as "moved" on the next request, never missed.
+            let version = match control_plane {
+                Some(store) => store.policy_version(ws).await,
+                None => None,
+            };
+            fetch_workspace_sops(http_client, cp, ws, key, version).await
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Cheap, deterministic, load-order-independent fingerprint over one SOP
+/// set. `workspace_id` is folded in so two workspaces with byte-identical
+/// SOP content still produce different fingerprints once combined by
+/// [`sop_status_snapshot`] — pass `""` for the process-global set. Hashes
+/// `title`+`body` only: every other [`Sop`] field is deterministically
+/// derived from `body` by [`parse_sop_content`], so content changes there
+/// are already covered without re-serialising each `Vec` by hand.
+///
+/// Truncated to 16 hex chars (64 bits) — this is a cheap drift-detection
+/// signal for a heartbeat payload, not a security hash; 64 bits is far more
+/// headroom than a realistic SOP-set count needs before a collision becomes
+/// plausible.
+pub fn fingerprint_sop_set(workspace_id: &str, sops: &[Sop]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut entries: Vec<String> = sops
+        .iter()
+        .map(|s| {
+            let mut h = Sha256::new();
+            h.update(workspace_id.as_bytes());
+            h.update(b"\x1f");
+            h.update(s.title.as_bytes());
+            h.update(b"\x1f");
+            h.update(s.body.as_bytes());
+            format!("{:x}", h.finalize())
+        })
+        .collect();
+    entries.sort_unstable();
+
+    let mut combined = Sha256::new();
+    for e in &entries {
+        combined.update(e.as_bytes());
+        combined.update(b"\x1e");
+    }
+    format!("{:x}", combined.finalize())[..16].to_string()
+}
+
+/// Gateway-mode status piggyback for `heartbeat.rs`'s optional
+/// `sopCount`/`sopHash` fields.
+#[cfg(feature = "control-plane")]
+pub(crate) struct SopStatusSnapshot {
+    pub sop_count: u32,
+    pub sop_hash: String,
+}
+
+/// Cheap, read-only fingerprint of whatever SOP set(s) are ALREADY cached in
+/// memory. NEVER triggers a fetch, a disk read, or a control-plane
+/// round-trip: only reads [`CACHE`] (process-global, on-disk) and
+/// [`workspace_cache`] (per-workspace, control-plane-fetched under gateway
+/// `require_vk` mode) exactly as they stand. A cold tick — nothing resolved
+/// yet, or every entry past [`CACHE_TTL`] — returns `None`; the request path
+/// that actually needs the SOP set will (re)populate the cache as it always
+/// does, and the FOLLOWING heartbeat tick picks that up for free, at zero
+/// extra cost to this loop.
+///
+/// Combines BOTH sources unconditionally rather than branching on
+/// `gateway::requires_vk_only()`: a shared gateway can legitimately have
+/// entries in EITHER or BOTH caches depending on request mix and mode
+/// history, and this must never under-report just because a mode flag
+/// doesn't match a caller's assumption about which cache is "the" active
+/// one.
+///
+/// This is a GATEWAY-LEVEL AGGREGATE across every workspace this process
+/// currently holds a fresh SOP set for — `sop_count` sums across all of
+/// them, `sop_hash` folds all of them into one fingerprint. It is a coarse
+/// "is this gateway holding policy, and did the aggregate change since the
+/// last heartbeat" health signal, deliberately NOT a per-workspace
+/// enforcement confirmation. A dashboard consumer must not read this as
+/// "workspace X's SOPs are in sync" — a change here can just as easily mean
+/// a DIFFERENT workspace's cache entry expired and repopulated at that tick.
+#[cfg(feature = "control-plane")]
+pub(crate) fn sop_status_snapshot() -> Option<SopStatusSnapshot> {
+    let mut fresh_sets: Vec<(String, Vec<Sop>)> = Vec::new();
+
+    {
+        let guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = guard.as_ref() {
+            if c.read_at.elapsed() < CACHE_TTL {
+                fresh_sets.push((String::new(), c.sops.clone()));
+            }
+        }
+    }
+    {
+        let cache = workspace_cache().lock().unwrap_or_else(|p| p.into_inner());
+        let mut ws_ids: Vec<&String> = cache.keys().collect();
+        ws_ids.sort_unstable(); // deterministic iteration order
+        for ws in ws_ids {
+            let c = &cache[ws];
+            if c.read_at.elapsed() < CACHE_TTL {
+                fresh_sets.push((ws.clone(), c.sops.clone()));
+            }
+        }
+    }
+
+    if fresh_sets.is_empty() {
+        return None;
+    }
+
+    let sop_count: u32 = fresh_sets.iter().map(|(_, s)| s.len() as u32).sum();
+    let mut per_set_hashes: Vec<String> = fresh_sets
+        .iter()
+        .map(|(ws, sops)| fingerprint_sop_set(ws, sops))
+        .collect();
+    per_set_hashes.sort_unstable();
+
+    use sha2::{Digest, Sha256};
+    let mut combined = Sha256::new();
+    for h in &per_set_hashes {
+        combined.update(h.as_bytes());
+        combined.update(b"\x1e");
+    }
+    Some(SopStatusSnapshot {
+        sop_count,
+        sop_hash: format!("{:x}", combined.finalize())[..16].to_string(),
+    })
+}
+
+/// Every governance-context field for `role`, resolved against an explicit
+/// SOP set — the single-resolution twin of calling every `*_for_role`
+/// function separately (each of which independently calls the
+/// process-global `all_sops()`). Building this from an already-resolved slice
+/// is what lets gateway mode substitute a workspace-scoped set without
+/// touching any of the process-global-based public functions above or their
+/// 66 tests — those keep working exactly as before for every non-gateway
+/// deployment.
+pub struct GovernanceFields {
+    pub risk_tier: Option<RiskLevel>,
+    pub denied_tools: Vec<String>,
+    /// `(tool, SOP title)` for every `deny_tools` entry, so a refusal can name
+    /// the SOP that declared it — the union above cannot.
+    pub denied_tool_sources: Vec<(String, String)>,
+    pub plan_steps: Vec<String>,
+    pub scope_paths: Vec<String>,
+    /// `allow_commands:`, the shell commands allowed. The union of every
+    /// applicable SOP's; see `plugins::anomaly::shell_parse`.
+    pub allow_commands: Vec<String>,
+    pub review_before: Vec<String>,
+    pub requires_before: Vec<(String, String, bool)>,
+    pub forbid_after: Vec<(String, String, bool)>,
+    pub max_calls: Vec<(String, usize)>,
+    pub forbid_with: Vec<(String, String)>,
+    pub allowed_harnesses: Vec<String>,
+    /// The destructive-SQL rule in force, if any SOP declares one. Enforced
+    /// on the response side (`plugins::response_gate`), not by a detector —
+    /// see `plugins::sql_guard` for why.
+    pub sql_guard: Option<SqlGuardPolicy>,
+    pub governance_block: Option<String>,
+    /// Any applicable SOP says `scope_paths_mode: enforce`.
+    pub scope_paths_enforce: bool,
+    /// Any applicable SOP says `plan_steps_mode: enforce`.
+    pub plan_steps_enforce: bool,
+    /// Any applicable SOP says `context_isolation: enforce`.
+    pub context_isolation_enforce: bool,
+    /// Any applicable SOP says `on_reask_exhausted: pause`.
+    pub on_reask_pause: bool,
+    /// The action tokens closed lanes hold ([`collect_lane_holds`]), already
+    /// merged into `review_before` above; kept apart so a refusal can say a
+    /// lane held it.
+    pub lane_holds: Vec<String>,
+    /// The node kinds the applicable SOPs declare, and the limits they lift.
+    pub node_kinds: Vec<String>,
+    pub node_kind_allow: Vec<String>,
+}
+
+/// Split a resolved SOP set into `(enforcing, shadow)` by [`SopMode`].
+///
+/// The only caller is the request path, right before building the enforcing
+/// `GovernanceFields` — `governance_fields_from` takes whatever slice it is
+/// given at face value, so excluding shadow-mode SOPs here is what keeps their
+/// declared fields out of the live `RequestContext` entirely, rather than
+/// relying on every detector to separately know to ignore them.
+pub fn split_by_mode(sops: &[Sop]) -> (Vec<Sop>, Vec<Sop>) {
+    sops.iter()
+        .cloned()
+        .partition(|s| s.mode != SopMode::Shadow)
+}
+
+/// One shadow-mode SOP's outcome on one request.
+///
+/// Mirrors `wasm::registry::ShadowReport` (rule_id/name/would_act/verdict):
+/// carries the real finding kinds that fired, not a `WOULD_HAVE` sentinel, for
+/// the same reason documented there and on `FindingWire.shadowed` — a
+/// synthetic value is invisible to any consumer matching on the real one.
+#[derive(Debug, Clone, Serialize)]
+pub struct SopShadowReport {
+    pub title: String,
+    /// Where the SOP lives, so the control plane credits an org-scope title
+    /// against `org_sop_registry` rather than filing it as unknown.
+    /// Serialised as `"workspace"` / `"org"`; a control plane that
+    /// predates the field ignores it.
+    pub scope: SopScope,
+    /// False when this SOP's declared fields matched nothing on this request.
+    /// Both are reported, not just the acts — the acts alone have no
+    /// denominator, exactly as `wasm::registry::ShadowReport::would_act`
+    /// documents.
+    pub would_act: bool,
+    /// Which detector kinds fired against this SOP's shadow context, for a
+    /// human reading the trace without re-deriving them from raw findings.
+    pub findings: Vec<String>,
+}
+
+pub fn governance_fields_from(sops: &[Sop], role: &str) -> GovernanceFields {
+    governance_fields_with_lanes(sops, role, &[])
+}
+
+/// [`governance_fields_from`], with the workspace's own closed lanes
+/// (`closedLanes` on key-context), which apply to every role and which no
+/// SOP's `open_actions:` reopens.
+pub fn governance_fields_with_lanes(
+    sops: &[Sop],
+    role: &str,
+    workspace_lanes: &[LaneClass],
+) -> GovernanceFields {
+    let applicable = || sops.iter().filter(|s| s.applies_to(role));
+    let lane_holds = collect_lane_holds(sops, role, workspace_lanes);
+    let mut review_before = collect_review_before(sops, role);
+    review_before.extend(lane_holds.iter().cloned());
+    review_before.sort();
+    review_before.dedup();
+    let mut node_kinds: Vec<String> = applicable()
+        .flat_map(|s| s.node_kinds.iter().cloned())
+        .collect();
+    node_kinds.sort();
+    node_kinds.dedup();
+    let mut node_kind_allow: Vec<String> = applicable()
+        .flat_map(|s| s.node_kind_allow.iter().cloned())
+        .collect();
+    node_kind_allow.sort();
+    node_kind_allow.dedup();
+
+    let mut max_calls: Vec<(String, usize)> = sops
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.max_calls.iter().cloned())
+        .collect();
+    max_calls.sort();
+    max_calls.dedup();
+
+    let mut forbid_with: Vec<(String, String)> = sops
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.forbid_with.iter().cloned())
+        .collect();
+    forbid_with.sort();
+    forbid_with.dedup();
+
+    GovernanceFields {
+        risk_tier: sops
+            .iter()
+            .filter(|s| s.applies_to(role))
+            .filter_map(|s| s.risk_tier)
+            .max(),
+        denied_tools: collect_denies(sops, role),
+        denied_tool_sources: collect_deny_sources(sops, role),
+        plan_steps: collect_plan_steps(sops, role),
+        scope_paths: collect_scope_paths(sops, role),
+        allow_commands: {
+            let mut out: Vec<String> = applicable()
+                .flat_map(|s| s.allow_commands.iter().cloned())
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        },
+        review_before,
+        requires_before: collect_requires_before(sops, role),
+        forbid_after: collect_forbid_after(sops, role),
+        max_calls,
+        forbid_with,
+        allowed_harnesses: collect_harnesses(sops, role),
+        sql_guard: sql_guard_from(sops, role, false),
+        governance_block: render(sops, role),
+        scope_paths_enforce: applicable().any(|s| s.scope_paths_mode == CheckMode::Enforce),
+        plan_steps_enforce: applicable().any(|s| s.plan_steps_mode == CheckMode::Enforce),
+        context_isolation_enforce: applicable().any(|s| s.context_isolation == CheckMode::Enforce),
+        on_reask_pause: applicable().any(|s| s.on_reask_exhausted == OnReaskExhausted::Pause),
+        lane_holds,
+        node_kinds,
+        node_kind_allow,
+    }
+}
+
+/// The action tokens closed reversibility lanes hold for `role` (3.0
+/// §5.2), once each, in the class table's order:
+///
+/// 1. each applicable SOP that declares `closed_lanes:` holds the tokens of
+///    the classes it lists — plus `reversible_wide` when its `risk_tier` is
+///    HIGH or CRITICAL — less its own `open_actions:`;
+/// 2. the workspace's `closedLanes` hold their tokens for every role, and no
+///    `open_actions:` reopens them;
+/// 3. the union of the two.
+///
+/// `risk_tier` alone closes nothing: it is read by WASM rules today, and
+/// making it close lanes would start holding SOPs written for them.
+pub fn collect_lane_holds(sops: &[Sop], role: &str, workspace_lanes: &[LaneClass]) -> Vec<String> {
+    use crate::plugins::anomaly::actions::tokens_of_class;
+    let mut out: Vec<String> = Vec::new();
+    for sop in sops
+        .iter()
+        .filter(|s| s.applies_to(role) && !s.closed_lanes.is_empty())
+    {
+        let mut classes = sop.closed_lanes.clone();
+        if matches!(sop.risk_tier, Some(RiskLevel::High | RiskLevel::Critical)) {
+            classes.push(LaneClass::ReversibleWide);
+        }
+        for class in classes {
+            out.extend(
+                tokens_of_class(class)
+                    .into_iter()
+                    .filter(|t| !sop.open_actions.iter().any(|o| o.eq_ignore_ascii_case(t)))
+                    .map(str::to_string),
+            );
+        }
+    }
+    for class in workspace_lanes {
+        out.extend(tokens_of_class(*class).into_iter().map(str::to_string));
+    }
+    // In the class table's order (`ACTION_TOKENS`), as lanes.ts lists them.
+    crate::plugins::anomaly::actions::ACTION_TOKENS
+        .iter()
+        .filter(|t| out.iter().any(|o| o == *t))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// The SQL guard `sops` declare for `role`, or `None` when none does.
+///
+/// * severity — the strictest any applicable SOP declares;
+/// * allowlist — workspace-scope patterns union into `allow`, org-scope ones
+///   into `org_allow`, which `SqlGuardPolicy::permits` applies as a ceiling
+///   (a target must pass both lists that are non-empty). An org SOP that
+///   declares the guard with no patterns imposes no ceiling, the same
+///   convention `apply_org_ceiling` follows for the other allowlists.
+///
+/// `shadow` marks the result as a `mode: shadow` set's: evaluated and logged,
+/// never enforced. The caller passes the enforcing and shadow sets
+/// separately, so a shadow SOP's allowlist can never widen an enforcing one.
+pub fn sql_guard_from(sops: &[Sop], role: &str, shadow: bool) -> Option<SqlGuardPolicy> {
+    let applicable: Vec<&Sop> = sops
+        .iter()
+        .filter(|s| s.sql_guard.is_some() && s.applies_to(role))
+        .collect();
+    let severity = applicable.iter().filter_map(|s| s.sql_guard).max()?;
+    let patterns = |scope: SopScope| -> Vec<String> {
+        let mut v: Vec<String> = applicable
+            .iter()
+            .filter(|s| s.scope == scope)
+            .flat_map(|s| s.sql_allow_dsns.iter().cloned())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    Some(SqlGuardPolicy {
+        severity,
+        allow: patterns(SopScope::Workspace),
+        org_allow: patterns(SopScope::Org),
+        shadow,
+    })
+}
+
+/// Build the governance block for a node in a given role.
+///
+/// Returns `None` when nothing applies, so a request with no relevant policy
+/// carries no injected text at all rather than an empty header.
+pub fn governance_block_for_role(role: &str) -> Option<String> {
+    render(&all_sops(), role)
+}
+
+/// Every SOP loaded from disk, for inventory surfaces like the `/fix` command
+/// that report what governance is configured rather than enforce it.
+pub fn loaded_sops() -> Vec<Sop> {
+    all_sops()
+}
+
+/// Tool names forbidden for a node in this role, from every SOP that applies.
+///
+/// Empty means nothing is forbidden — the default, and the correct one. Open
+/// core has no policy service to ask, so treating an empty policy as
+/// "deny everything unlisted" would block every tool call for every user who
+/// never wrote one.
+pub fn denied_tools_for_role(role: &str) -> Vec<String> {
+    collect_denies(&all_sops(), role)
+}
+
+/// What an org ceiling leaves when a workspace list is disjoint from it.
+///
+/// The three allowlist keys read an EMPTY list as "unrestricted", which is the
+/// right default for a workspace that never declared one — but it made a
+/// ceiling that narrowed a list to nothing come out as *no ceiling at all*:
+/// the intersection was `[]`, and `[]` means everything. An org that pins
+/// `allow_harnesses: claude-code` over a workspace that declared `cursor`
+/// therefore permitted every harness. This sentinel is what such a narrowing
+/// yields instead: a value no harness name, path or plan step can equal, so
+/// the detectors read it as "restricted to nothing" — a harness is refused,
+/// every path is out of scope, every step is off-plan — and the reason they
+/// render carries it, so the operator sees why.
+pub const NARROWED_TO_NOTHING: &str = "<none: workspace list disjoint from org ceiling>";
+
+/// Apply an org ceiling to a workspace list, never widening.
+///
+/// - no org list → the workspace list as declared (empty stays unrestricted);
+/// - org list, no workspace list → the org list IS the effective list (the
+///   ceiling applies to a workspace that declared nothing, rather than being
+///   skipped because there was nothing to narrow);
+/// - both, intersecting → the survivors;
+/// - both, disjoint → [`NARROWED_TO_NOTHING`], with a warning naming both.
+fn apply_org_ceiling(
+    field: &str,
+    workspace: Vec<String>,
+    org: Vec<String>,
+    survives: impl Fn(&String) -> bool,
+) -> Vec<String> {
+    if org.is_empty() {
+        return workspace;
+    }
+    if workspace.is_empty() {
+        return org;
+    }
+    let before = workspace.len();
+    let out: Vec<String> = workspace.into_iter().filter(survives).collect();
+    if out.is_empty() {
+        tracing::warn!(
+            field,
+            workspace_entries = before,
+            org_ceiling = ?org,
+            "org ceiling narrowed the workspace {field} list to nothing — nothing is permitted, not everything"
+        );
+        return vec![NARROWED_TO_NOTHING.to_string()];
+    }
+    out
+}
+
+/// Harnesses permitted for this role. Empty means unrestricted; see
+/// [`NARROWED_TO_NOTHING`] for what an org ceiling that leaves nothing yields.
+pub fn allowed_harnesses_for_role(role: &str) -> Vec<String> {
+    collect_harnesses(&all_sops(), role)
+}
+
+/// The declared plan for this role — the steps its task is expected to consist of.
+///
+/// Empty means no SOP covering this role declared one, which is the default and must
+/// stay indistinguishable from "unconstrained". Plan adherence is opt-in: a workspace
+/// that never writes a plan is never measured against one.
+/// The path scope in force for `role`. Empty means unrestricted (never the
+/// result of a ceiling — see [`NARROWED_TO_NOTHING`]).
+///
+/// Sorted and deduped, unlike `collect_plan_steps` — this is a set of
+/// boundaries, and two SOPs naming the same directory should not make it count
+/// twice. Order carries nothing.
+/// Org-scope declarations narrow the workspace-scope union by
+/// containment (a workspace scope of `infra/k8s` legitimately survives an
+/// org ceiling of `infra` -- they are not string-equal, but `infra/k8s` is
+/// inside `infra`). An org set that is empty imposes no ceiling at all:
+/// an org SOP that exists but says nothing about `scope_paths` must never
+/// read as "intersect to empty", which would silently break every
+/// existing workspace SOP the moment any org SOP exists, even an
+/// unrelated one.
+fn collect_scope_paths(sops: &[Sop], role: &str) -> Vec<String> {
+    let workspace: Vec<String> = sops
+        .iter()
+        .filter(|s| s.scope == SopScope::Workspace && s.applies_to(role))
+        .flat_map(|s| s.scope_paths.iter().cloned())
+        .collect();
+    let org: Vec<String> = sops
+        .iter()
+        .filter(|s| s.scope == SopScope::Org && s.applies_to(role))
+        .flat_map(|s| s.scope_paths.iter().cloned())
+        .collect();
+
+    let org_ceiling = org.clone();
+    let mut out = apply_org_ceiling("scope_paths", workspace, org, |w| {
+        crate::plugins::anomaly::detectors::is_within_scope(w, &org_ceiling)
+    });
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn scope_paths_for_role(role: &str) -> Vec<String> {
+    collect_scope_paths(&all_sops(), role)
+}
+
+/// The actions requiring human review for `role`. Empty means none — this
+/// feature does nothing at all until someone declares something.
+fn collect_review_before(sops: &[Sop], role: &str) -> Vec<String> {
+    let mut out: Vec<String> = sops
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.review_before.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn review_before_for_role(role: &str) -> Vec<String> {
+    collect_review_before(&all_sops(), role)
+}
+
+pub fn plan_steps_for_role(role: &str) -> Vec<String> {
+    collect_plan_steps(&all_sops(), role)
+}
+
+/// Ordering rules declared for `role`, as `(before, after)` pairs.
+///
+/// Two separate collectors rather than one tagged list, and that is the design
+/// rather than an accident. Each detector reads only its own field, so declaring
+/// a `forbid_after:` rule cannot disarm the built-in `requires_before` table —
+/// with a single combined list and a kind filter, an "any rules declared?" gate
+/// would do exactly that, and the failure would be silent in the direction that
+/// removes enforcement.
+fn collect_requires_before(sops: &[Sop], role: &str) -> Vec<(String, String, bool)> {
+    let mut out: Vec<(String, String, bool)> = sops
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.requires_before.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The highest severity band declared by any SOP applicable to this role.
+///
+/// `None` when no applicable SOP states one — which the caller renders as
+/// `Low`, the same value the field carried unconditionally before. That keeps
+/// the default behaviour identical for anyone who has declared nothing, and
+/// makes the field mean something for anyone who has.
+///
+/// Max rather than first: two SOPs both applying to a role, one HIGH and one
+/// LOW, describe work that is HIGH. Taking either arbitrarily would make the
+/// answer depend on directory order.
+pub fn risk_tier_for_role(role: &str) -> Option<RiskLevel> {
+    all_sops()
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .filter_map(|s| s.risk_tier)
+        .max()
+}
+
+pub fn requires_before_for_role(role: &str) -> Vec<(String, String, bool)> {
+    collect_requires_before(&all_sops(), role)
+}
+
+fn collect_forbid_after(sops: &[Sop], role: &str) -> Vec<(String, String, bool)> {
+    let mut out: Vec<(String, String, bool)> = sops
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.forbid_after.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn forbid_after_for_role(role: &str) -> Vec<(String, String, bool)> {
+    collect_forbid_after(&all_sops(), role)
+}
+
+pub fn max_calls_for_role(role: &str) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = all_sops()
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.max_calls.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn forbid_with_for_role(role: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = all_sops()
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.forbid_with.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_plan_steps(sops: &[Sop], role: &str) -> Vec<String> {
+    // Deliberately NOT deduped or sorted, unlike the deny/harness collectors. A plan is
+    // a sequence; sorting it would destroy the only ordering information it carries,
+    // and dedup would collapse a step legitimately performed twice. The current check
+    // is set-membership, but the ordering is preserved so an order-aware check can be
+    // added later without changing the data.
+    let workspace: Vec<String> = sops
+        .iter()
+        .filter(|s| s.scope == SopScope::Workspace && s.applies_to(role))
+        .flat_map(|s| s.plan_steps.iter().cloned())
+        .collect();
+    let org: Vec<String> = sops
+        .iter()
+        .filter(|s| s.scope == SopScope::Org && s.applies_to(role))
+        .flat_map(|s| s.plan_steps.iter().cloned())
+        .collect();
+
+    // Case-insensitive membership (plan_steps keeps the author's original
+    // case, unlike allow_harnesses which is lowercased at parse time), but
+    // the surviving entries keep the workspace's own casing and order --
+    // the org set only decides membership, never supplies the text.
+    let org_set: std::collections::HashSet<String> =
+        org.iter().map(|s| s.to_ascii_lowercase()).collect();
+    apply_org_ceiling("plan_steps", workspace, org, |w| {
+        org_set.contains(&w.to_ascii_lowercase())
+    })
+}
+
+fn collect_harnesses(sops: &[Sop], role: &str) -> Vec<String> {
+    let workspace: Vec<String> = sops
+        .iter()
+        .filter(|s| s.scope == SopScope::Workspace && s.applies_to(role))
+        .flat_map(|s| s.allow_harnesses.iter().cloned())
+        .collect();
+    let org: Vec<String> = sops
+        .iter()
+        .filter(|s| s.scope == SopScope::Org && s.applies_to(role))
+        .flat_map(|s| s.allow_harnesses.iter().cloned())
+        .collect();
+
+    // allow_harnesses is lowercased at parse time (`list("allow_harnesses:", true)`),
+    // so plain equality is already case-insensitive -- no normalisation needed here.
+    let org_set: std::collections::HashSet<String> = org.iter().cloned().collect();
+    let mut out = apply_org_ceiling("allow_harnesses", workspace, org, |w| org_set.contains(w));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every `(tool, title)` pair behind [`collect_denies`]'s union, one per SOP
+/// that declares the tool. Sorted and deduped like the union.
+fn collect_deny_sources(sops: &[Sop], role: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = sops
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| {
+            s.deny_tools
+                .iter()
+                .map(move |t| (t.clone(), s.title.clone()))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_denies(sops: &[Sop], role: &str) -> Vec<String> {
+    let mut out: Vec<String> = sops
+        .iter()
+        .filter(|s| s.applies_to(role))
+        .flat_map(|s| s.deny_tools.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Rendering split out so it can be tested without touching the filesystem.
+///
+/// Provably permutation-invariant of its input slice: sorts the
+/// applicable SOPs by title itself rather than trusting `sops` to already
+/// arrive title-sorted. Two of today's callers happen to hand it a
+/// pre-sorted slice — `read_dir_sops` and `fetch_workspace_sops` sort their
+/// own caches, for their own reasons (`plan_steps` ordering, mainly) — but
+/// that was never a guarantee this function itself enforced, so a caller
+/// that *doesn't* pre-sort silently produced a differently-ordered block on
+/// no observable change in policy. Sorting here makes `render` a pure
+/// function of `(slice content, role)` regardless of input order, which is
+/// what makes it safe for `resolve_injection_block` to serve a pinned render
+/// across a session without re-deriving or comparing anything: two
+/// concurrent first-turn renders of the same (possibly differently-ordered)
+/// SOP slice converge on identical bytes.
+///
+/// **Greedy-skip truncation, deliberately not `break`.** A section that would
+/// push the block past [`MAX_INJECTED_BYTES`] is skipped (`continue`), not
+/// treated as a stopping point — a design review explicitly rejected
+/// switching this to `break`: that would let one oversized,
+/// alphabetically-first SOP blank the entire rendered block for every SOP
+/// after it, which is worse than the current coverage-maximizing behaviour of
+/// fitting as many SOPs as possible. What changed here is only that the
+/// omission note now NAMES the omitted titles (sorted, since `matching` is
+/// already sorted by the time they're skipped) instead of just counting them
+/// — making the nonlocal truncation effect visible instead of silent, without
+/// changing which SOPs get included.
+///
+/// **Never affects enforcement.** This function (and the byte budget it
+/// applies) only bounds the advisory TEXT block. `governance_fields_from`
+/// collects `deny_tools`/`plan_steps`/`scope_paths`/etc. from the full
+/// applicable slice with no byte budget of its own — an SOP omitted here for
+/// space still fully enforces. See `render_determinism_tests::
+/// truncated_sop_still_contributes_its_deny_tools_to_governance_fields_from`.
+fn render(sops: &[Sop], role: &str) -> Option<String> {
+    let mut matching: Vec<&Sop> = sops.iter().filter(|s| s.applies_to(role)).collect();
+    if matching.is_empty() {
+        return None;
+    }
+    matching.sort_by(|a, b| a.title.cmp(&b.title));
+
+    let mut out = String::from("[Intutic Governance] Standard operating procedures in force");
+    if !role.is_empty() {
+        out.push_str(&format!(" for role '{role}'"));
+    }
+    out.push_str(":\n\n");
+
+    // `matching` is already title-sorted, so titles land here in sorted
+    // order without a second sort.
+    let mut omitted_titles: Vec<String> = Vec::new();
+    for sop in matching {
+        let section = format!("## {}\n{}\n\n", sop.title, sop.body);
+        if out.len() + section.len() > MAX_INJECTED_BYTES {
+            omitted_titles.push(sop.title.clone());
+            continue;
+        }
+        out.push_str(&section);
+    }
+
+    if !omitted_titles.is_empty() {
+        // Say so rather than silently dropping policy — an agent told it has
+        // the full set when it does not will act with false confidence. Named
+        // rather than merely counted, so a reader can tell exactly which
+        // policy is missing without cross-referencing the SOP directory.
+        out.push_str(&format!(
+            "({} further SOP(s) omitted to bound context size: {}.)\n",
+            omitted_titles.len(),
+            omitted_titles.join(", ")
+        ));
+    }
+
+    Some(out.trim_end().to_string())
+}
+
+/// Resolve the injected SOP advisory block for a request, preferring a
+/// still-unexpired session pin over a fresh render.
+///
+/// `render` alone is a pure function of its input slice (see its doc
+/// comment), but the SLICE handed to it can itself change from one request
+/// to the next within the same session — a SOP edited, a tier flipped, a
+/// keyword override changed — so calling `render` fresh on every request
+/// still moves the injected prefix underneath `routing::bandit::
+/// route_model`'s session-locked model, defeating its KV-cache warmth. This
+/// function pins the RENDERED TEXT itself, independent of the model pin:
+/// once a session has a pin, every subsequent request in that session
+/// (until the pin's TTL elapses) serves the SAME bytes, regardless of what a
+/// fresh render would now produce.
+///
+/// `max_age_secs == 0` is the escape hatch/kill-switch: always return
+/// `freshly_rendered` unpinned — exactly today's per-request
+/// render-and-inject behaviour, restored in full. Unlike the cache-aware pricing fix, this
+/// one keeps a config off-switch on purpose: prompt content staleness for up
+/// to `max_age_secs` is a real, subjective product trade (see
+/// `RoutingConfig::sop_pin_max_age_secs`'s doc comment), not a correctness
+/// bug like the cache-aware pricing defect.
+///
+/// Otherwise: an existing unexpired pin for `scope` is served AS-IS — no
+/// fingerprint comparison, no "is this still fresh" check. Serving the
+/// pinned bytes unconditionally *is* the point; comparing fingerprints
+/// before serving would re-introduce the same per-request prefix churn this
+/// function exists to remove. Absent a pin (first request in this window,
+/// or a prior pin's TTL elapsed), `freshly_rendered` becomes the new pin —
+/// written via [`LocalStore::pin_sop_block`]'s NX-style "only if absent"
+/// semantics, so two concurrent first-turn requests for the same session
+/// converge on ONE winner's bytes rather than each pinning, and serving,
+/// its own. `fingerprint` (from [`fingerprint_sop_set`]) rides along on the
+/// pin purely as debugging metadata; see [`PinnedSopBlock`]'s doc comment
+/// for why it is never consulted to decide freshness.
+///
+/// A `None` `freshly_rendered` (nothing applicable to this role) is passed
+/// through unpinned — there is nothing to hold stable, and pinning "no
+/// block" would only cost a round trip for no benefit.
+///
+/// # Divergence from enforcement — intentional, not a bug
+///
+/// This function runs even on a request whose `fetch_workspace_sops` call
+/// failed toward an empty SOP set for THIS particular request (the SOP
+/// cache's own fail-closed behaviour — documented on that function). In that
+/// case the pinned advisory TEXT may still be served from before the
+/// failure: stale but non-empty, rather than reflecting this request's empty
+/// fetch. That is intentional, not a bug a future reader should "fix": the
+/// SEPARATE enforcement path — `governance_fields_from`, resolved
+/// independently against THIS request's own (possibly empty) SOP set —
+/// always sees the real thing regardless of what is pinned for display. A
+/// pinned advisory block can therefore be briefly, staleness-bounded wrong
+/// about what it *says* is enforced, while enforcement itself is never wrong
+/// about what it *does*.
+pub async fn resolve_injection_block(
+    store: &dyn LocalStore,
+    scope: &PinScope,
+    freshly_rendered: Option<String>,
+    fingerprint: &str,
+    max_age_secs: u64,
+) -> Option<String> {
+    if max_age_secs == 0 {
+        return freshly_rendered;
+    }
+
+    if let Some(pin) = store.pinned_sop_block(scope).await {
+        return Some(pin.block);
+    }
+
+    let fresh = freshly_rendered?;
+    let candidate = PinnedSopBlock {
+        block: fresh,
+        fingerprint: fingerprint.to_string(),
+        pinned_at: chrono::Utc::now().timestamp(),
+    };
+    let winner = store.pin_sop_block(scope, &candidate, max_age_secs).await;
+    Some(winner.block)
+}
+
+/// Prepend a governance block to a request body, in whatever shape the
+/// protocol expects.
+///
+/// Returns whether the body was modified, so the caller only pays to
+/// re-serialise when there was something to add.
+///
+/// Prepending rather than appending is deliberate: the caller's own system
+/// prompt is the more specific instruction and should be read last, closest to
+/// the task. Governance is the frame it sits inside.
+///
+/// **KV-cache hazard — mitigated, not eliminated.** This still
+/// writes at `system[0]` (Anthropic/Gemini) or `messages[0]` (OpenAI Chat) on
+/// every request; this function is unchanged. What changed is what `block`
+/// now typically IS: `resolve_injection_block` (above) pins the rendered
+/// advisory text per session for up to `RoutingConfig::sop_pin_max_age_secs`
+/// (default 10 minutes), so `block` is normally the SAME bytes across an
+/// active session's requests even if the underlying SOP set would render
+/// differently mid-session — closing the gap `routing::bandit::route_model`'s
+/// session lock could not close on its own (that lock only pins the model
+/// choice). Residual staleness — a SOP edited or a tier flipped takes up to
+/// `sop_pin_max_age_secs` to reach an active session's injected text — is a
+/// deliberate, documented trade, not a bug; see `resolve_injection_block`'s
+/// doc comment. Setting `sop_pin_max_age_secs: 0` restores exactly this
+/// function's original every-request-reflects-the-live-set behaviour.
+pub fn inject_into_body(
+    body: &mut serde_json::Value,
+    protocol: &crate::protocol::Protocol,
+    block: &str,
+) -> bool {
+    use crate::protocol::Protocol;
+    use serde_json::Value;
+
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+
+    match protocol {
+        // `system` is a string or an array of content blocks, depending on
+        // which SDK produced the request. Both shapes have to survive: coercing
+        // an array to a string would discard per-block cache_control markers
+        // and silently disable the caller's prompt caching.
+        Protocol::Anthropic => match obj.get_mut("system") {
+            Some(Value::String(existing)) => {
+                *existing = format!("{block}\n\n{existing}");
+            }
+            Some(Value::Array(blocks)) => {
+                blocks.insert(0, serde_json::json!({ "type": "text", "text": block }));
+            }
+            _ => {
+                obj.insert("system".into(), Value::String(block.to_string()));
+            }
+        },
+
+        Protocol::OpenAIChatCompletions => {
+            let Some(Value::Array(messages)) = obj.get_mut("messages") else {
+                return false;
+            };
+            messages.insert(0, serde_json::json!({ "role": "system", "content": block }));
+        }
+
+        // The Responses API carries its system text in `instructions`.
+        Protocol::OpenAIResponses => match obj.get_mut("instructions") {
+            Some(Value::String(existing)) => {
+                *existing = format!("{block}\n\n{existing}");
+            }
+            _ => {
+                obj.insert("instructions".into(), Value::String(block.to_string()));
+            }
+        },
+
+        Protocol::Gemini => {
+            let existing = obj
+                .get("systemInstruction")
+                .and_then(|v| v.get("parts"))
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut parts = vec![serde_json::json!({ "text": block })];
+            parts.extend(existing);
+            obj.insert(
+                "systemInstruction".into(),
+                serde_json::json!({ "parts": parts }),
+            );
+        }
+
+        // An unrecognised shape gets nothing. Guessing where system text
+        // belongs risks corrupting a body we do not understand, and a
+        // malformed request is a worse outcome than an un-injected one.
+        // A decision call's state is the customer's data, not a prompt.
+        Protocol::Unknown | Protocol::SystemOne | Protocol::OpenAIDecisions => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    /// `mode: shadow` parses case-insensitively and quoted; anything else,
+    /// including an unrecognised value, is `Enforce` — the safe default,
+    /// since the failure direction that matters is a typo silently
+    /// *disabling* enforcement, not merely going unread.
+    #[test]
+    fn mode_shadow_parses_case_insensitively_and_quoted() {
+        let parse = |raw: &str| parse_front_matter(raw).mode;
+        assert_eq!(parse("---\nmode: shadow\n---\nbody"), SopMode::Shadow);
+        assert_eq!(parse("---\nmode: SHADOW\n---\nbody"), SopMode::Shadow);
+        assert_eq!(parse("---\nmode: \"shadow\"\n---\nbody"), SopMode::Shadow);
+    }
+
+    #[test]
+    fn mode_defaults_to_enforce_when_unstated_or_unrecognised() {
+        let parse = |raw: &str| parse_front_matter(raw).mode;
+        assert_eq!(parse("---\nroles: deployer\n---\nbody"), SopMode::Enforce);
+        assert_eq!(parse("---\nmode: enforce\n---\nbody"), SopMode::Enforce);
+        assert_eq!(parse("---\nmode: shaddow\n---\nbody"), SopMode::Enforce);
+    }
+
+    /// A `mode:` line inside a nested block is not the SOP's mode. Read at any
+    /// indentation, it switched the whole SOP, `deny_tools` included, to shadow.
+    #[test]
+    fn nested_mode_does_not_switch_the_sop_to_shadow() {
+        let fm = parse_front_matter("---\ndeny_tools: rm\nother:\n  mode: shadow\n---\nbody");
+        assert_eq!(fm.mode, SopMode::Enforce);
+        assert_eq!(fm.deny_tools, vec!["rm".to_string()]);
+        let tab = parse_front_matter("---\ndeny_tools: rm\n\tmode: shadow\n---\nbody");
+        assert_eq!(tab.mode, SopMode::Enforce);
+    }
+
+    /// The other keys that can only weaken a SOP are read at the top level
+    /// too; keys that add a rule still count at any indentation.
+    #[test]
+    fn weakening_keys_count_only_at_the_top_level() {
+        let fm = parse_front_matter(
+            "---\nnested:\n  roles: viewer\n  risk_tier: low\n  sql_guard: warn\n  sql_allow_dsns: prod\n  deny_tools: curl\n---\nbody",
+        );
+        assert!(fm.roles.is_empty());
+        assert_eq!(fm.risk_tier, None);
+        assert_eq!(fm.sql_guard, None);
+        assert!(fm.sql_allow_dsns.is_empty());
+        assert_eq!(fm.deny_tools, vec!["curl".to_string()]);
+
+        let top = parse_front_matter(
+            "---\nroles: viewer\nrisk_tier: low\nsql_guard: warn\nsql_allow_dsns: prod\n---\nbody",
+        );
+        assert_eq!(top.roles, vec!["viewer".to_string()]);
+        assert_eq!(top.risk_tier, Some(RiskLevel::Low));
+        assert_eq!(top.sql_guard, Some(SqlGuardSeverity::Warn));
+        assert_eq!(top.sql_allow_dsns, vec!["prod".to_string()]);
+    }
+
+    #[test]
+    fn nested_intutic_enforced_false_does_not_switch_a_file_off() {
+        assert!(pulled_but_not_enforced(
+            "---\nintutic_enforced: false\n---\nbody"
+        ));
+        assert!(!pulled_but_not_enforced(
+            "---\nmeta:\n  intutic_enforced: false\n---\nbody"
+        ));
+    }
+
+    #[test]
+    fn parse_sop_content_carries_the_declared_mode() {
+        let raw = "---\nroles: deployer\ndeny_tools: rm\nmode: shadow\n---\nbody";
+        let sop = parse_sop_content("t".into(), raw, "src", SopScope::Workspace).unwrap();
+        assert_eq!(sop.mode, SopMode::Shadow);
+    }
+
+    /// `split_by_mode` is what keeps a shadow SOP's declared fields out of the
+    /// enforcing `GovernanceFields` entirely — this is the partition the
+    /// request path in `proxy.rs` relies on before calling
+    /// `governance_fields_from` on the enforcing half.
+    #[test]
+    fn split_by_mode_separates_enforcing_from_shadow() {
+        let enforcing_sop = Sop {
+            title: "enforcing".into(),
+            mode: SopMode::Enforce,
+            ..Sop::default()
+        };
+        let shadow_sop = Sop {
+            title: "shadow".into(),
+            mode: SopMode::Shadow,
+            ..Sop::default()
+        };
+        let (enforcing, shadow) = split_by_mode(&[enforcing_sop.clone(), shadow_sop.clone()]);
+        assert_eq!(
+            enforcing.iter().map(|s| &s.title).collect::<Vec<_>>(),
+            vec!["enforcing"]
+        );
+        assert_eq!(
+            shadow.iter().map(|s| &s.title).collect::<Vec<_>>(),
+            vec!["shadow"]
+        );
+    }
+
+    #[test]
+    fn split_by_mode_on_an_all_enforcing_set_has_an_empty_shadow_half() {
+        let (enforcing, shadow) = split_by_mode(&[Sop::default()]);
+        assert_eq!(enforcing.len(), 1);
+        assert!(shadow.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `GET /api/v1/workspace/sops-policy` answer in
+    /// `packages/shared-types/fixtures/responses/sops-policy.json`, which the
+    /// shared-types tests hold to `SopsPolicyResponse` (the schema the control
+    /// plane's route is held to), deserializes into the struct the fetch uses
+    /// and parses into the SOPs it describes.
+    #[test]
+    fn workspace_sops_policy_fixture_parses_into_its_sops() {
+        let body: WorkspaceSopsResponse = serde_json::from_str(include_str!(
+            "../../shared-types/fixtures/responses/sops-policy.json"
+        ))
+        .expect("the sops-policy fixture deserializes");
+        let sops = workspace_sops_from_body("ws_fixture", body);
+        let titles: Vec<&str> = sops.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "GUARDRAIL:pgr_fixture No recursive deletes",
+                "Never push to main",
+                "Reviewed plan before terraform apply",
+            ]
+        );
+        assert_eq!(sops[0].mode, SopMode::Shadow);
+        assert_eq!(sops[0].deny_tools, ["rm_rf"]);
+        assert_eq!(sops[1].scope, SopScope::Org);
+        assert_eq!(sops[1].deny_tools, ["git_push_main"]);
+        assert_eq!(sops[2].scope, SopScope::Workspace);
+        assert_eq!(sops[2].deny_tools, ["terraform_destroy"]);
+    }
+
+    fn sop(title: &str, roles: &[&str]) -> Sop {
+        Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: title.into(),
+            body: format!("- rule for {title}"),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            deny_tools: Vec::new(),
+            allow_harnesses: Vec::new(),
+            plan_steps: Vec::new(),
+            scope_paths: Vec::new(),
+            allow_commands: Vec::new(),
+            review_before: Vec::new(),
+            requires_before: Vec::new(),
+            forbid_after: Vec::new(),
+            mode: SopMode::default(),
+            max_calls: Vec::new(),
+            forbid_with: Vec::new(),
+            sql_guard: None,
+            sql_allow_dsns: Vec::new(),
+            hook_rules: Vec::new(),
+            decide_rules: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    // ── Per-workspace resolution ───────────────────────────────────────────
+
+    fn sop_with_risk(title: &str, roles: &[&str], risk: RiskLevel) -> Sop {
+        Sop {
+            risk_tier: Some(risk),
+            ..sop(title, roles)
+        }
+    }
+
+    /// The chain `the_request_context_resolves_its_risk_tier_from_sops`
+    /// (`proxy.rs`) relies on: `governance_fields_from` must read the actual
+    /// `risk_tier` a SOP declares, not a stub or a hardcoded value — the exact
+    /// class of bug that shipped once already (`RiskLevel::Low` hardcoded at
+    /// the field's only producer, silently defeating every rule gated on it).
+    #[test]
+    fn governance_fields_from_resolves_risk_tier_from_sops() {
+        let sops = vec![sop_with_risk(
+            "deploy-policy",
+            &["deployer"],
+            RiskLevel::Critical,
+        )];
+        let gov = governance_fields_from(&sops, "deployer");
+        assert_eq!(gov.risk_tier, Some(RiskLevel::Critical));
+
+        // A role with no applicable SOP resolves to None, not a default —
+        // callers decide the default (proxy.rs: `.unwrap_or(RiskLevel::Low)`).
+        let gov_other = governance_fields_from(&sops, "reviewer");
+        assert_eq!(gov_other.risk_tier, None);
+    }
+
+    /// The max-across-SOPs rule (documented on `risk_tier_for_role`) must hold
+    /// for the workspace-aware resolver too — a HIGH and a LOW SOP both
+    /// applying to a role describe work that is HIGH, and taking either
+    /// arbitrarily would make the answer depend on fetch/directory order.
+    #[test]
+    fn governance_fields_from_takes_the_max_risk_tier_across_applicable_sops() {
+        let sops = vec![
+            sop_with_risk("a", &["deployer"], RiskLevel::Low),
+            sop_with_risk("b", &["deployer"], RiskLevel::High),
+        ];
+        let gov = governance_fields_from(&sops, "deployer");
+        assert_eq!(gov.risk_tier, Some(RiskLevel::High));
+    }
+
+    /// `governance_fields_from` must resolve every field from the role scope,
+    /// not just risk_tier — otherwise a gateway workspace's deny_tools/
+    /// scope_paths/etc. would silently stop being enforced even though risk_tier
+    /// alone looked fine.
+    #[test]
+    fn governance_fields_from_resolves_every_role_scoped_field() {
+        let mut s = sop("full-policy", &["deployer"]);
+        s.deny_tools = vec!["rm".to_string()];
+        s.scope_paths = vec!["infra/".to_string()];
+        s.review_before = vec!["action:deploy".to_string()];
+        s.allow_harnesses = vec!["claude-code".to_string()];
+        s.max_calls = vec![("Bash".to_string(), 3)];
+        s.forbid_with = vec![("taint".to_string(), "token".to_string())];
+        let sops = vec![s];
+
+        let gov = governance_fields_from(&sops, "deployer");
+        assert_eq!(gov.denied_tools, vec!["rm".to_string()]);
+        assert_eq!(gov.scope_paths, vec!["infra/".to_string()]);
+        assert_eq!(gov.review_before, vec!["action:deploy".to_string()]);
+        assert_eq!(gov.allowed_harnesses, vec!["claude-code".to_string()]);
+        assert_eq!(gov.max_calls, vec![("Bash".to_string(), 3)]);
+        assert_eq!(
+            gov.forbid_with,
+            vec![("taint".to_string(), "token".to_string())]
+        );
+        assert!(
+            gov.governance_block.is_some(),
+            "an applicable SOP with a body must render a block"
+        );
+
+        // And a role with no applicable SOP gets none of it.
+        let gov_other = governance_fields_from(&sops, "reviewer");
+        assert!(gov_other.denied_tools.is_empty());
+        assert!(gov_other.governance_block.is_none());
+    }
+
+    /// `parse_sop_content` (factored out of `read_dir_sops` for reuse by the
+    /// workspace-fetch path) must still parse identically to the pre-refactor
+    /// inline closure — front matter, body, and the "declaration-only SOPs are
+    /// not empty" rule all included.
+    #[test]
+    fn parse_sop_content_parses_front_matter_and_body() {
+        let raw = "---\nroles: deployer\ndeny_tools: rm, curl\nrisk_tier: high\n---\nDo not delete production data.";
+        let parsed = parse_sop_content(
+            "my-sop".to_string(),
+            raw,
+            "test-source",
+            SopScope::Workspace,
+        )
+        .expect("should parse");
+        assert_eq!(parsed.title, "my-sop");
+        assert_eq!(parsed.roles, vec!["deployer".to_string()]);
+        assert_eq!(
+            parsed.deny_tools,
+            vec!["rm".to_string(), "curl".to_string()]
+        );
+        assert_eq!(parsed.risk_tier, Some(RiskLevel::High));
+        assert_eq!(parsed.body, "Do not delete production data.");
+    }
+
+    #[test]
+    fn allow_commands_are_a_union_across_the_sops_in_force() {
+        let mut a = sop("a", &["deployer"]);
+        a.allow_commands = vec!["git status".to_string(), "npm test *".to_string()];
+        let mut b = sop("b", &["deployer"]);
+        b.allow_commands = vec!["git diff".to_string(), "git status".to_string()];
+        let mut other = sop("other", &["reviewer"]);
+        other.allow_commands = vec!["ls".to_string()];
+        let gov = governance_fields_from(&[a, b, other], "deployer");
+        assert_eq!(
+            gov.allow_commands,
+            vec!["git diff", "git status", "npm test *"]
+        );
+    }
+
+    /// A declaration-only SOP (no prose, just a directive) must still parse —
+    /// the exact regression `read_dir_sops`'s own comment names: an SOP whose
+    /// whole content is `scope_paths:` must not be silently dropped.
+    #[test]
+    fn parse_sop_content_keeps_a_declaration_only_sop() {
+        let raw = "---\nscope_paths: infra/\n---\n";
+        let parsed = parse_sop_content(
+            "scope-only".to_string(),
+            raw,
+            "test-source",
+            SopScope::Workspace,
+        );
+        assert!(
+            parsed.is_some(),
+            "a declaration-only SOP must not be dropped"
+        );
+        assert_eq!(parsed.unwrap().scope_paths, vec!["infra/".to_string()]);
+    }
+
+    /// Genuinely empty content (no prose, no declarations) parses to nothing —
+    /// the counterpart to the declaration-only case above.
+    #[test]
+    fn parse_sop_content_drops_genuinely_empty_content() {
+        assert!(
+            parse_sop_content("empty".to_string(), "", "test-source", SopScope::Workspace)
+                .is_none()
+        );
+        assert!(parse_sop_content(
+            "empty2".to_string(),
+            "---\n---\n",
+            "test-source",
+            SopScope::Workspace
+        )
+        .is_none());
+    }
+
+    /// `all_sops_for_workspace` must never fall back to the process-global set
+    /// when gateway mode is on but the workspace/credential cannot be
+    /// resolved — falling back would leak whatever happens to be in the
+    /// process's own `.intutic/sops` (which belongs to no particular tenant on
+    /// a shared gateway) into a workspace's enforcement. Verified against the
+    /// REAL global gateway config (not a stub), the same way `gateway.rs`'s own
+    /// tests exercise `requires_vk_only()` — this crosses module boundaries on
+    /// purpose, because the leak this guards against is exactly a cross-module
+    /// invariant (gateway.rs's mode flag, honoured by sops.rs's resolver).
+    #[tokio::test]
+    async fn all_sops_for_workspace_returns_empty_not_process_global_when_unresolved() {
+        // Force gateway mode on for this test's duration. `init_gateway_config`
+        // is set-once process-wide (like `egress_policy`'s), so this can only
+        // be asserted once per test binary — acceptable here since it is the
+        // one place in this file that needs it, and every other sops.rs test
+        // runs with gateway mode at its default (off), which is what makes the
+        // "outside gateway mode, always the process-global set" half of
+        // `all_sops_for_workspace`'s contract (exercised implicitly by every
+        // *_for_role test above, all of which call the process-global path)
+        // safe to leave unperturbed.
+        crate::gateway::init_gateway_config(crate::gateway::GatewayConfig {
+            require_vk: true,
+            ..Default::default()
+        });
+        assert!(
+            crate::gateway::requires_vk_only(),
+            "test precondition: gateway mode must be on"
+        );
+
+        let client = reqwest::Client::new();
+        let credential = crate::credential::RequestCredential::classify("vk_x");
+        let vk = credential.virtual_key();
+        // No control-plane URL, no workspace, no token — every combination of
+        // "cannot resolve" must return empty, never the process-global set.
+        assert!(all_sops_for_workspace(&client, None, None, None, None)
+            .await
+            .is_empty());
+        assert!(
+            all_sops_for_workspace(&client, Some("http://127.0.0.1:1"), None, vk, None)
+                .await
+                .is_empty()
+        );
+        assert!(all_sops_for_workspace(
+            &client,
+            Some("http://127.0.0.1:1"),
+            Some("unknown"),
+            vk,
+            None
+        )
+        .await
+        .is_empty());
+        assert!(all_sops_for_workspace(
+            &client,
+            Some("http://127.0.0.1:1"),
+            Some("ws_1"),
+            None,
+            None
+        )
+        .await
+        .is_empty());
+    }
+
+    #[test]
+    fn unscoped_sops_apply_to_everyone() {
+        let s = sop("general", &[]);
+        assert!(s.applies_to("reviewer"));
+        assert!(s.applies_to(""), "including a node that reported no role");
+    }
+
+    #[test]
+    fn scoped_sops_only_reach_their_role() {
+        let s = sop("deploy", &["deployer"]);
+        assert!(s.applies_to("deployer"));
+        assert!(s.applies_to("DEPLOYER"), "role match is case-insensitive");
+        assert!(!s.applies_to("reviewer"));
+    }
+
+    #[test]
+    fn a_roleless_node_gets_only_unscoped_policy() {
+        // It has not said enough about itself to be handed role-specific
+        // rules, and guessing would show the wrong policy to the wrong node.
+        assert!(!sop("deploy", &["deployer"]).applies_to(""));
+    }
+
+    #[test]
+    fn front_matter_is_split_from_body() {
+        let fm = parse_front_matter("---\nroles: reviewer, Deployer\n---\n## Policy\n- x");
+        let roles = fm.roles;
+        let body = fm.body;
+        assert_eq!(roles, vec!["reviewer", "deployer"]);
+        assert_eq!(body, "## Policy\n- x");
+    }
+
+    #[test]
+    fn a_file_without_front_matter_is_all_body() {
+        let fm = parse_front_matter("## Policy\n- x");
+        let roles = fm.roles;
+        let body = fm.body;
+        assert!(roles.is_empty());
+        assert_eq!(body, "## Policy\n- x");
+    }
+
+    #[test]
+    fn malformed_front_matter_keeps_the_policy() {
+        // An unterminated fence is a typo. Dropping the file would silently
+        // disarm a rule its author believes is active.
+        let fm = parse_front_matter("---\nroles: reviewer\n## Policy");
+        let roles = fm.roles;
+        let body = fm.body;
+        assert!(roles.is_empty());
+        assert!(body.contains("## Policy"));
+    }
+
+    #[test]
+    fn bracketed_yaml_list_form_is_accepted() {
+        let fm = parse_front_matter("---\nroles: [reviewer, deployer]\n---\nbody");
+        let roles = fm.roles;
+        assert_eq!(roles, vec!["reviewer", "deployer"]);
+    }
+
+    #[test]
+    fn render_selects_by_role() {
+        let sops = vec![sop("general", &[]), sop("deploy", &["deployer"])];
+        let out = render(&sops, "deployer").unwrap();
+        assert!(out.contains("## general"));
+        assert!(out.contains("## deploy"));
+        assert!(out.contains("for role 'deployer'"));
+
+        let out = render(&sops, "reviewer").unwrap();
+        assert!(out.contains("## general"));
+        assert!(
+            !out.contains("## deploy"),
+            "deploy policy is not this node's"
+        );
+    }
+
+    #[test]
+    fn render_returns_none_when_nothing_applies() {
+        // No policy means no injected text at all, not an empty header.
+        assert!(render(&[sop("deploy", &["deployer"])], "reviewer").is_none());
+        assert!(render(&[], "anything").is_none());
+    }
+
+    #[test]
+    fn oversized_sop_sets_are_bounded_and_say_so() {
+        let big: Vec<Sop> = (0..40)
+            .map(|i| Sop {
+                risk_tier: None,
+                scope: SopScope::Workspace,
+                title: format!("sop-{i:02}"),
+                body: "x".repeat(500),
+                roles: vec![],
+                deny_tools: vec![],
+                allow_harnesses: vec![],
+                plan_steps: Vec::new(),
+                scope_paths: Vec::new(),
+                allow_commands: Vec::new(),
+                review_before: Vec::new(),
+                requires_before: Vec::new(),
+                forbid_after: Vec::new(),
+                mode: SopMode::default(),
+                max_calls: Vec::new(),
+                forbid_with: Vec::new(),
+                sql_guard: None,
+                sql_allow_dsns: Vec::new(),
+                hook_rules: Vec::new(),
+                decide_rules: Vec::new(),
+                ..Default::default()
+            })
+            .collect();
+        let out = render(&big, "any").unwrap();
+        assert!(out.len() <= MAX_INJECTED_BYTES + 200, "stays near the cap");
+        assert!(
+            out.contains("omitted to bound context size"),
+            "truncation must be stated, not silent"
+        );
+    }
+
+    #[test]
+    fn ordering_is_stable_across_reads() {
+        // The injected block is prepended to every request; reshuffling it
+        // would break upstream prompt caching for no benefit.
+        let dir = std::env::temp_dir().join(format!("intutic-sops-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["zebra", "alpha", "middle"] {
+            std::fs::write(dir.join(format!("{name}.md")), format!("- {name}")).unwrap();
+        }
+        let a = read_dir_sops(&dir);
+        let b = read_dir_sops(&dir);
+        assert_eq!(a, b);
+        assert_eq!(
+            a.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "middle", "zebra"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_an_error() {
+        assert!(read_dir_sops(Path::new("/nonexistent/intutic/sops")).is_empty());
+    }
+
+    /// `intutic connect` writes `.intutic/sops/<set>/*.md` into each harness's
+    /// rules file, and the README tells people to put SOPs there. A proxy that
+    /// read only the flat files enforced none of them, so the same SOP was
+    /// in force at one layer and absent at the other.
+    #[test]
+    fn one_folder_down_is_read_beside_the_flat_files() {
+        let dir = std::env::temp_dir().join(format!("intutic-sops-nested-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("safety").join("deeper")).unwrap();
+        std::fs::write(dir.join("flat.md"), "---\ndeny_tools: FlatTool\n---\n").unwrap();
+        std::fs::write(
+            dir.join("safety").join("rules.md"),
+            "---\ndeny_tools: NestedTool\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("safety").join("notes.txt"), "not a SOP").unwrap();
+        // Two levels down is not a rule set; the layout is one folder deep.
+        std::fs::write(dir.join("safety").join("deeper").join("x.md"), "- too deep").unwrap();
+
+        let sops = read_dir_sops(&dir);
+        assert_eq!(
+            sops.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["flat", "safety/rules"]
+        );
+        assert_eq!(sops[1].deny_tools, vec!["NestedTool"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `intutic sops pull` writes drafts and invalidated SOPs too, marked
+    /// `intutic_enforced: false`. Loading them would enforce, on this machine,
+    /// a SOP the control plane does not.
+    #[test]
+    fn a_pulled_sop_the_control_plane_does_not_enforce_is_not_loaded() {
+        let dir =
+            std::env::temp_dir().join(format!("intutic-sops-unenforced-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("draft.md"),
+            "---\ntitle: Draft\nintutic_id: sop_d\nintutic_enforced: false\ndeny_tools: Write\n---\nDraft.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("live.md"),
+            "---\nintutic_id: sop_v\nintutic_enforced: true\ndeny_tools: Bash\n---\nLive.\n",
+        )
+        .unwrap();
+        // Only `false` switches a file off.
+        std::fs::write(
+            dir.join("typo.md"),
+            "---\nintutic_enforced: flase\ndeny_tools: Edit\n---\n",
+        )
+        .unwrap();
+
+        let sops = read_dir_sops(&dir);
+        assert_eq!(
+            sops.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["live", "typo"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The README's first SOP is what people copy. It once listed its commands
+    /// under a "Denied Commands" heading that no gate reads, so the sample
+    /// enforced nothing it showed. Parse the sample as it stands in the README
+    /// and check the refusals it promises.
+    #[test]
+    fn the_readme_sample_sop_refuses_what_it_shows() {
+        use crate::plugins::hook_rules::{CallInput, HookRuleSet};
+        use crate::plugins::sql_guard::evaluate;
+        use serde_json::json;
+
+        let readme = include_str!("../../../README.md");
+        let section = &readme[readme
+            .find("## 📝 Write Your First SOP")
+            .expect("README has the first-SOP section")..];
+        let open = "```markdown\n";
+        let start = section.find(open).expect("the section has a sample") + open.len();
+        let sample = &section[start..start + section[start..].find("\n```").unwrap()];
+
+        let sop = parse_sop_content("safety".into(), sample, "README.md", SopScope::Workspace)
+            .expect("the sample parses to a SOP");
+        let sops = std::slice::from_ref(&sop);
+        let refused = |tool: &str, cmd: &str| {
+            let args = json!({ "command": cmd });
+            let by_rule = HookRuleSet::from_sops(sops, "")
+                .decide(tool, CallInput::Parsed(&args))
+                .refuse
+                .is_some();
+            let policy = sql_guard_from(sops, "", false);
+            let by_sql = evaluate(policy.as_slice(), tool, &args)
+                .iter()
+                .any(|v| v.refuses());
+            by_rule || by_sql
+        };
+
+        for cmd in [
+            "git push --force origin main",
+            "rm -rf build",
+            "psql -h db.internal -d app -c \"DROP TABLE users\"",
+            "psql -h db.internal -d app -c \"TRUNCATE events\"",
+        ] {
+            assert!(
+                refused("Bash", cmd),
+                "the README sample must refuse `{cmd}`"
+            );
+        }
+        for cmd in [
+            "git push origin main",
+            "ls build",
+            "psql -h db.internal -d app -c \"SELECT 1\"",
+        ] {
+            assert!(
+                !refused("Bash", cmd),
+                "the README sample must not refuse `{cmd}`"
+            );
+        }
+    }
+
+    /// A Kubernetes ConfigMap volume (how the bundled manifests deliver
+    /// `INTUTIC_SOPS_DIR`) links each top-level file into `..data/`, a
+    /// timestamped `..<date>/` folder. Reading those folders would load every
+    /// SOP a second and third time.
+    #[test]
+    fn folders_named_with_a_leading_dot_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("intutic-sops-dotdir-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("..2026_10_15_00_00_00.1")).unwrap();
+        std::fs::create_dir_all(dir.join("..data")).unwrap();
+        std::fs::write(dir.join("policy.md"), "- rule").unwrap();
+        std::fs::write(
+            dir.join("..2026_10_15_00_00_00.1").join("policy.md"),
+            "- rule",
+        )
+        .unwrap();
+        std::fs::write(dir.join("..data").join("policy.md"), "- rule").unwrap();
+
+        let sops = read_dir_sops(&dir);
+        assert_eq!(
+            sops.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["policy"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Pins down `render`'s permutation-invariance and truncation-naming
+/// properties, plus the single most important correctness
+/// property of the whole pinning change: truncating the rendered advisory
+/// text must never affect enforcement.
+#[cfg(test)]
+mod render_determinism_tests {
+    use super::*;
+
+    fn sop_with_body(title: &str, body: &str) -> Sop {
+        Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: title.into(),
+            body: body.into(),
+            roles: Vec::new(),
+            deny_tools: Vec::new(),
+            allow_harnesses: Vec::new(),
+            plan_steps: Vec::new(),
+            scope_paths: Vec::new(),
+            allow_commands: Vec::new(),
+            review_before: Vec::new(),
+            requires_before: Vec::new(),
+            forbid_after: Vec::new(),
+            mode: SopMode::default(),
+            max_calls: Vec::new(),
+            forbid_with: Vec::new(),
+            sql_guard: None,
+            sql_allow_dsns: Vec::new(),
+            hook_rules: Vec::new(),
+            decide_rules: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identical_input_renders_byte_identical_output_twice() {
+        let sops = vec![
+            sop_with_body("zebra", "- rule z"),
+            sop_with_body("alpha", "- rule a"),
+            sop_with_body("middle", "- rule m"),
+        ];
+        let first = render(&sops, "any").unwrap();
+        let second = render(&sops, "any").unwrap();
+        assert_eq!(first, second, "render must be a pure function of its input");
+    }
+
+    #[test]
+    fn shuffled_or_reversed_input_order_renders_the_same_bytes() {
+        let ordered = vec![
+            sop_with_body("alpha", "- rule a"),
+            sop_with_body("middle", "- rule m"),
+            sop_with_body("zebra", "- rule z"),
+        ];
+        let mut reversed = ordered.clone();
+        reversed.reverse();
+        let mut shuffled = ordered.clone();
+        shuffled.swap(0, 2);
+        shuffled.swap(1, 2);
+
+        let out_ordered = render(&ordered, "any").unwrap();
+        let out_reversed = render(&reversed, "any").unwrap();
+        let out_shuffled = render(&shuffled, "any").unwrap();
+        assert_eq!(
+            out_ordered, out_reversed,
+            "reversing the input slice must not change the rendered bytes"
+        );
+        assert_eq!(
+            out_ordered, out_shuffled,
+            "shuffling the input slice must not change the rendered bytes"
+        );
+    }
+
+    /// One section alone exceeds the byte budget; the note must NAME it, not
+    /// just count it, and a later, smaller SOP must still render — pinning the
+    /// greedy-skip (`continue`, not `break`) behaviour a design review
+    /// explicitly kept. See the doc comment on `render`.
+    #[test]
+    fn oversized_section_is_named_in_the_omission_note_and_later_sops_still_render() {
+        let sops = vec![
+            sop_with_body("aaa-huge", &"x".repeat(MAX_INJECTED_BYTES + 100)),
+            sop_with_body("zzz-small", "- a small, easily-fit rule"),
+        ];
+        let out = render(&sops, "any").unwrap();
+        assert!(
+            out.contains("aaa-huge"),
+            "the omitted SOP's title must be named in the note, not just counted: {out}"
+        );
+        assert!(
+            out.contains("## zzz-small"),
+            "a later, smaller SOP must still render despite an earlier oversized one: {out}"
+        );
+    }
+
+    /// The single most important correctness property of this whole change:
+    /// truncation of the RENDERED advisory text must never touch enforcement.
+    /// `governance_fields_from` collects `deny_tools` (and everything else it
+    /// exposes) from the full applicable slice with no byte budget of its
+    /// own — a completely separate output from `render`'s text block. This
+    /// builds a slice where the oversized SOP is guaranteed to be omitted
+    /// from the rendered block, and asserts its `deny_tools` entry is still
+    /// present in `governance_fields_from`'s output regardless.
+    #[test]
+    fn truncated_sop_still_contributes_its_deny_tools_to_governance_fields_from() {
+        let mut huge = sop_with_body("aaa-huge", &"x".repeat(MAX_INJECTED_BYTES + 100));
+        huge.deny_tools = vec!["rm".to_string()];
+        let small = sop_with_body("zzz-small", "- fits easily");
+        let sops = vec![huge, small];
+
+        // Precondition: the huge SOP really is omitted from the rendered text.
+        let rendered = render(&sops, "any").unwrap();
+        assert!(
+            !rendered.contains("## aaa-huge"),
+            "test precondition: the huge SOP's body must NOT be in the rendered block"
+        );
+
+        // The enforcement path must see it anyway.
+        let gov = governance_fields_from(&sops, "any");
+        assert_eq!(
+            gov.denied_tools,
+            vec!["rm".to_string()],
+            "deny_tools must survive rendered-block truncation — enforcement is not \
+             gated by the advisory text's byte budget"
+        );
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use crate::protocol::Protocol;
+
+    const BLOCK: &str = "[Intutic Governance] rules";
+
+    #[test]
+    fn anthropic_string_system_is_prepended_not_replaced() {
+        let mut b = serde_json::json!({"system": "You are helpful."});
+        assert!(inject_into_body(&mut b, &Protocol::Anthropic, BLOCK));
+        let s = b["system"].as_str().unwrap();
+        assert!(s.starts_with(BLOCK));
+        assert!(
+            s.contains("You are helpful."),
+            "the caller's own prompt must survive"
+        );
+    }
+
+    #[test]
+    fn anthropic_block_array_keeps_its_structure() {
+        // Coercing this to a string would discard cache_control markers and
+        // silently disable the caller's prompt caching.
+        let mut b = serde_json::json!({
+            "system": [{"type": "text", "text": "Original", "cache_control": {"type": "ephemeral"}}]
+        });
+        assert!(inject_into_body(&mut b, &Protocol::Anthropic, BLOCK));
+        let arr = b["system"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["text"], BLOCK);
+        assert_eq!(arr[1]["text"], "Original");
+        assert_eq!(
+            arr[1]["cache_control"]["type"], "ephemeral",
+            "cache markers must be preserved"
+        );
+    }
+
+    #[test]
+    fn anthropic_without_a_system_field_gains_one() {
+        let mut b = serde_json::json!({"messages": []});
+        assert!(inject_into_body(&mut b, &Protocol::Anthropic, BLOCK));
+        assert_eq!(b["system"], BLOCK);
+    }
+
+    #[test]
+    fn openai_gets_a_leading_system_message() {
+        let mut b = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(inject_into_body(
+            &mut b,
+            &Protocol::OpenAIChatCompletions,
+            BLOCK
+        ));
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0]["role"], "system");
+        assert_eq!(m[0]["content"], BLOCK);
+        assert_eq!(m[1]["content"], "hi", "the user turn is untouched");
+    }
+
+    #[test]
+    fn openai_without_messages_is_left_alone() {
+        // Nothing sensible to do, and inventing a messages array would send a
+        // request the caller never wrote.
+        let mut b = serde_json::json!({"model": "gpt-4"});
+        assert!(!inject_into_body(
+            &mut b,
+            &Protocol::OpenAIChatCompletions,
+            BLOCK
+        ));
+        assert!(b.get("messages").is_none());
+    }
+
+    #[test]
+    fn responses_api_uses_instructions() {
+        let mut b = serde_json::json!({"instructions": "Be terse."});
+        assert!(inject_into_body(&mut b, &Protocol::OpenAIResponses, BLOCK));
+        let s = b["instructions"].as_str().unwrap();
+        assert!(s.starts_with(BLOCK));
+        assert!(s.contains("Be terse."));
+    }
+
+    #[test]
+    fn gemini_prepends_a_system_instruction_part() {
+        let mut b = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "Original"}]}
+        });
+        assert!(inject_into_body(&mut b, &Protocol::Gemini, BLOCK));
+        let parts = b["systemInstruction"]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], BLOCK);
+        assert_eq!(parts[1]["text"], "Original");
+    }
+
+    #[test]
+    fn gemini_without_a_system_instruction_gains_one() {
+        let mut b = serde_json::json!({"contents": []});
+        assert!(inject_into_body(&mut b, &Protocol::Gemini, BLOCK));
+        assert_eq!(b["systemInstruction"]["parts"][0]["text"], BLOCK);
+    }
+
+    #[test]
+    fn a_non_object_body_is_refused() {
+        let mut b = serde_json::json!(["not", "an", "object"]);
+        assert!(!inject_into_body(&mut b, &Protocol::Anthropic, BLOCK));
+    }
+}
+
+#[cfg(test)]
+mod unknown_protocol_test {
+    use super::*;
+    use crate::protocol::Protocol;
+
+    #[test]
+    fn unknown_protocol_bodies_are_left_untouched() {
+        let original = serde_json::json!({"something": "unfamiliar"});
+        let mut b = original.clone();
+        assert!(!inject_into_body(&mut b, &Protocol::Unknown, "block"));
+        assert_eq!(b, original, "an unparsed body must not be mutated");
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    /// The proxy's working directory is not reliably the workspace root:
+    /// `intutic start` inherits whatever directory the user was in. Resolution
+    /// therefore has to walk up, or SOPs silently never load for anyone who
+    /// starts the proxy from a subdirectory.
+    #[test]
+    fn sops_are_found_from_a_subdirectory() {
+        let root = std::env::temp_dir().join(format!("intutic-walk-{}", std::process::id()));
+        let sops = root.join(".intutic").join("sops");
+        let deep = root.join("packages").join("thing").join("src");
+        std::fs::create_dir_all(&sops).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(sops.join("p.md"), "- rule").unwrap();
+
+        // The cwd is passed in rather than set, so this drives the real
+        // resolver without mutating global state other tests share.
+        assert_eq!(
+            resolve_sops_dir_from(None, &deep),
+            SopsSource::Walk(sops.clone())
+        );
+        assert_eq!(read_dir_sops(&sops).len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn no_workspace_anywhere_resolves_to_nothing() {
+        let orphan = std::env::temp_dir().join(format!("intutic-none-{}", std::process::id()));
+        std::fs::create_dir_all(&orphan).unwrap();
+        let source = resolve_sops_dir_from(None, &orphan);
+        if let Some(d) = source.dir() {
+            assert!(
+                !d.starts_with(&orphan),
+                "nothing under the orphan directory should have matched"
+            );
+        }
+        std::fs::remove_dir_all(&orphan).ok();
+    }
+
+    /// Capture what a closure logs.
+    ///
+    /// Asserting on the emitted event rather than on a string the code merely
+    /// computes — a warning that is built and never handed to `tracing` is
+    /// exactly the silence this change exists to end. The subscriber is
+    /// thread-local, so parallel tests do not see each other's output.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// In a cluster the binary runs with `cwd` `/home/intutic`, nothing above it
+    /// holds `.intutic/sops`, and so every SOP-derived control resolves to
+    /// nothing. That is survivable; being silent about it is not — it is why the
+    /// condition went unnoticed. The warning has to name what it disabled and
+    /// where it looked, or it is no better than the silence.
+    /// The warning is emitted by `all_sops`, not merely emittable.
+    ///
+    /// Every other test in this module calls `report_resolution` directly, so
+    /// they stay green if `all_sops` stops calling it — and the operator loses
+    /// the only runtime signal that every SOP-derived detector is disabled.
+    /// Measured: replacing that one call with a no-op left 463 of 463 lib tests
+    /// passing and produced no compiler warning.
+    ///
+    /// Source-pinned because the call is guarded by a cache-miss branch and
+    /// sits behind a process-wide `OnceLock`, so a behavioural test would have
+    /// to defeat the cache to observe it — and would then be pinning the cache
+    /// rather than the reporting. `guide/sops.md` tells operators that the
+    /// absence of this warning means SOPs were found; this is what makes that
+    /// sentence true.
+    #[test]
+    fn all_sops_reports_what_it_resolved() {
+        let src = include_str!("sops.rs");
+        let body = src
+            .split_once("fn all_sops")
+            .expect("all_sops was renamed; this pin is stale")
+            .1;
+        // Bounded to the function body, so a call from anywhere else in the
+        // file cannot satisfy it.
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        assert!(
+            body.contains("report_resolution("),
+            "all_sops no longer reports how it resolved policy, so an empty SOP set \
+             is silent again and every SOP-derived detector disables without a word"
+        );
+    }
+
+    /// Build a SOP the way `read_dir_sops` does — through the real front-matter
+    /// parser — so a change to the grammar breaks these tests instead of letting
+    /// them pass against a hand-built struct the loader would never produce.
+    fn sop_from_raw(title: &str, raw: &str) -> Sop {
+        let fm = parse_front_matter(raw);
+        Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: title.into(),
+            body: fm.body,
+            roles: fm.roles,
+            deny_tools: fm.deny_tools,
+            allow_harnesses: fm.allow_harnesses,
+            plan_steps: fm.plan_steps,
+            scope_paths: fm.scope_paths,
+            allow_commands: fm.allow_commands,
+            review_before: fm.review_before,
+            requires_before: fm.requires_before,
+            forbid_after: fm.forbid_after,
+            mode: SopMode::default(),
+            max_calls: fm.max_calls,
+            forbid_with: fm.forbid_with,
+            sql_guard: fm.sql_guard,
+            sql_allow_dsns: fm.sql_allow_dsns,
+            hook_rules: fm.hook_rules,
+            decide_rules: fm.decide_rules,
+            ..Default::default()
+        }
+    }
+
+    /// A served hook-rule guardrail parses into one rule per `hook_rule:`
+    /// line, is enforceable on its own (so no inert-SOP warning and no "empty
+    /// entry" drop), and is told apart from SOPs that also declare other keys.
+    #[test]
+    fn hook_rule_lines_parse_from_front_matter() {
+        let raw = concat!(
+            "---\n",
+            r#"hook_rule: {"id":"guardrail.pgr_a","tools":["Bash"],"argContains":["terraform apply"],"argNotContains":["-target="],"reason":"Plan first, policy: \"x, y\""}"#,
+            "\n",
+            r#"hook_rule: {"id":"guardrail.pgr_b","tools":["Read"],"argContains":[".env"],"argNotContains":[],"reason":"r"}"#,
+            "\nmode: shadow\n---\n# Guardrail\n",
+        );
+        let s = sop_from_raw("GUARDRAIL:pgr_a hook_rule: Bash", raw);
+        assert_eq!(
+            s.hook_rules.len(),
+            2,
+            "one rule per line, never split on commas"
+        );
+        let crate::plugins::hook_rules::HookRuleDecl::Rule(r) = &s.hook_rules[0] else {
+            panic!("{:?}", s.hook_rules[0]);
+        };
+        assert_eq!(r.id, "guardrail.pgr_a");
+        assert_eq!(r.arg_not_contains, vec!["-target=".to_string()]);
+        assert_eq!(r.reason, "Plan first, policy: \"x, y\"");
+        assert_eq!(parse_front_matter(raw).mode, SopMode::Shadow);
+        assert!(is_enforceable(&s));
+        assert!(s.only_hook_rules());
+
+        let one = concat!(
+            "---\n",
+            r#"hook_rule: {"id":"x","tools":["Bash"]}"#,
+            "\n---\n"
+        );
+        let mixed = sop_from_raw(
+            "mixed",
+            &format!("---\ndeny_tools: WebFetch\n{}", &one[4..]),
+        );
+        assert_eq!(mixed.deny_tools, vec!["WebFetch".to_string()]);
+        assert_eq!(mixed.hook_rules.len(), 1);
+        assert!(!mixed.only_hook_rules());
+
+        // Only hook rules and no prose: still a SOP, not dropped as empty.
+        assert!(parse_sop_content("t".into(), one, "test", SopScope::Workspace).is_some());
+        // An unreadable line is kept — it must refuse, not vanish.
+        let broken = sop_from_raw("broken", "---\nhook_rule: {not json\n---\n");
+        assert!(matches!(
+            broken.hook_rules.as_slice(),
+            [crate::plugins::hook_rules::HookRuleDecl::Unreadable { .. }]
+        ));
+    }
+
+    #[test]
+    fn ordering_rules_parse_from_front_matter() {
+        let s = sop_from_raw(
+            "ship",
+            "---\n\
+             requires_before: action:run_tests -> action:deploy, action:lint -> action:merge\n\
+             forbid_after: action:secret_read -> action:http_post\n\
+             ---\n# body\n",
+        );
+        assert_eq!(
+            s.requires_before,
+            vec![
+                (
+                    "action:run_tests".to_string(),
+                    "action:deploy".to_string(),
+                    false
+                ),
+                ("action:lint".to_string(), "action:merge".to_string(), false),
+            ],
+        );
+        assert_eq!(
+            s.forbid_after,
+            vec![(
+                "action:secret_read".to_string(),
+                "action:http_post".to_string(),
+                false
+            )],
+        );
+    }
+
+    /// `max_calls:` and `forbid_with:` had no front-matter parse test at all —
+    /// every assertion built the `Sop` struct directly, so `parse_count_bound`
+    /// and `parse_cooccurrence` were never driven through `parse_front_matter`.
+    ///
+    /// These two tests pin the comma asymmetry that makes them different, and
+    /// they fail in opposite directions under the same one-character mutation:
+    /// flip either `split_on_comma` flag and exactly one of them breaks.
+    #[test]
+    fn max_calls_parses_from_front_matter_and_splits_on_commas() {
+        let s = sop_from_raw(
+            "ship",
+            "---\nmax_calls: action:deploy <= 1, Bash <= 20\n---\n# body\n",
+        );
+        assert_eq!(
+            s.max_calls,
+            vec![("action:deploy".to_string(), 1), ("Bash".to_string(), 20)],
+            "a comma separates two ceilings, so this line is two rules"
+        );
+    }
+
+    #[test]
+    fn forbid_with_parses_from_front_matter_and_does_not_split_on_commas() {
+        let s = sop_from_raw(
+            "ship",
+            "---\nforbid_with: secrets(), action:http_post\n---\n# body\n",
+        );
+        assert_eq!(
+            s.forbid_with,
+            vec![("secrets()".to_string(), "action:http_post".to_string())],
+            "here the comma separates the two SIDES of one rule, not two rules"
+        );
+    }
+
+    /// The taints are `secrets()` and `pii()`, which also covers custom `phi`
+    /// patterns. `phi()` is refused with the reason (logged at load) rather than loading as a
+    /// rule nothing else (guardrail IR, control-plane replay) understands.
+    #[test]
+    fn forbid_with_refuses_a_phi_taint() {
+        let err = parse_cooccurrence("phi(), action:http_post").expect_err("phi() is not a taint");
+        assert!(err.contains("`pii()`"), "{err}");
+        assert!(parse_cooccurrence("pii(), action:http_post").is_ok());
+    }
+
+    // ── sql_guard / sql_allow_dsns ──────────────────────────────────────
+
+    #[test]
+    fn sql_guard_parses_and_is_off_by_default() {
+        let s = sop_from_raw(
+            "db",
+            "---\nsql_guard: warn\nsql_allow_dsns: postgres://localhost/*, sqlite:*\n---\n# body\n",
+        );
+        assert_eq!(s.sql_guard, Some(SqlGuardSeverity::Warn));
+        assert_eq!(s.sql_allow_dsns, vec!["postgres://localhost/*", "sqlite:*"]);
+        assert!(is_enforceable(&s));
+
+        let plain = sop_from_raw("db", "---\ndeny_tools: WebFetch\n---\n# body\n");
+        assert_eq!(plain.sql_guard, None, "no key, no rule");
+        assert!(sql_guard_from(&[plain], "", false).is_none());
+    }
+
+    /// Writing an allowlist is asking for the rule; a misspelt severity must
+    /// not be what turns it off.
+    #[test]
+    fn sql_guard_fails_toward_refuse() {
+        let s = sop_from_raw("db", "---\nsql_allow_dsns: postgres://localhost/*\n---\n");
+        assert_eq!(s.sql_guard, Some(SqlGuardSeverity::Refuse));
+        let fm = parse_front_matter("---\nsql_guard: refsue\n---\n");
+        assert_eq!(fm.sql_guard, Some(SqlGuardSeverity::Refuse));
+        assert_eq!(fm.rule_errors.len(), 1, "{:?}", fm.rule_errors);
+        // A declaration-only SOP is still a SOP.
+        assert!(parse_sop_content(
+            "t".into(),
+            "---\nsql_guard: refuse\n---\n",
+            "src",
+            SopScope::Workspace
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn sql_guard_resolution_takes_strictest_and_never_lets_org_widen() {
+        let ws = Sop {
+            sql_guard: Some(SqlGuardSeverity::Warn),
+            sql_allow_dsns: vec!["postgres://*".into()],
+            ..Sop::default()
+        };
+        let org = Sop {
+            scope: SopScope::Org,
+            sql_guard: Some(SqlGuardSeverity::Refuse),
+            sql_allow_dsns: vec!["postgres://localhost/*".into()],
+            ..Sop::default()
+        };
+        let other_role = Sop {
+            sql_guard: Some(SqlGuardSeverity::Refuse),
+            sql_allow_dsns: vec!["mysql://*".into()],
+            roles: vec!["dba".into()],
+            ..Sop::default()
+        };
+        let p = sql_guard_from(&[ws, org, other_role], "coder", false).unwrap();
+        assert_eq!(p.severity, SqlGuardSeverity::Refuse);
+        assert_eq!(p.allow, vec!["postgres://*"]);
+        assert_eq!(p.org_allow, vec!["postgres://localhost/*"]);
+        use crate::plugins::sql_guard::Target;
+        assert!(p.permits(&Target::Known("postgres://localhost/app".into())));
+        assert!(!p.permits(&Target::Known("postgres://db.prod/app".into())));
+        assert!(
+            !p.permits(&Target::Known("mysql://db/app".into())),
+            "another role's allowlist leaked"
+        );
+    }
+
+    /// Shadow SOPs stay out of the enforcing set, so their allowlist cannot
+    /// widen it; resolved separately they come back marked shadow.
+    #[test]
+    fn shadow_sql_guard_is_resolved_apart_from_the_enforcing_one() {
+        let enforcing = Sop {
+            sql_guard: Some(SqlGuardSeverity::Refuse),
+            sql_allow_dsns: vec!["sqlite:*".into()],
+            ..Sop::default()
+        };
+        let shadow = Sop {
+            mode: SopMode::Shadow,
+            sql_guard: Some(SqlGuardSeverity::Refuse),
+            sql_allow_dsns: vec!["postgres://*".into()],
+            ..Sop::default()
+        };
+        let (enf, shd) = split_by_mode(&[enforcing, shadow]);
+        let gov = governance_fields_from(&enf, "");
+        assert_eq!(gov.sql_guard.as_ref().unwrap().allow, vec!["sqlite:*"]);
+        let sp = sql_guard_from(&shd, "", true).unwrap();
+        assert!(sp.shadow && !sp.refuses());
+    }
+
+    /// The asymmetry above has a sharp edge: because `forbid_with:` does not
+    /// split on commas, a second rule written on the same line is swallowed
+    /// into the first rule's token.
+    ///
+    /// `secrets(), action:http_post, pii(), action:http_post` used to parse as
+    /// ONE rule whose token was the literal string
+    /// `"action:http_post, pii(), action:http_post"` — which matches no tool
+    /// name and no action token, so it could never fire. It loaded, warned
+    /// nothing, and enforced nothing. Given the asymmetry, writing two taint
+    /// rules on one line is the single most likely authoring mistake for this
+    /// key, and it was the one mistake nothing caught.
+    #[test]
+    fn two_taint_rules_on_one_line_are_rejected_rather_than_silently_inert() {
+        let s = sop_from_raw(
+            "ship",
+            "---\nforbid_with: secrets(), action:http_post, pii(), action:http_post\n---\n# body\n",
+        );
+        assert!(
+            s.forbid_with.is_empty(),
+            "a second rule on the same line was folded into the first rule's \
+             token, producing a rule that can never match: {:?}",
+            s.forbid_with
+        );
+    }
+
+    /// `parse_ordering` and `parse_count_bound` both refuse a token carrying
+    /// whitespace, because an operator thinks in commands (`rm -rf`) while every
+    /// rule is about tools and `action:` tokens. `parse_cooccurrence` was
+    /// written without the same guard — two of three siblings had it.
+    #[test]
+    fn forbid_with_rejects_a_shell_command_token() {
+        let s = sop_from_raw("ship", "---\nforbid_with: secrets(), rm -rf\n---\n# body\n");
+        assert!(
+            s.forbid_with.is_empty(),
+            "a shell command can never match: {:?}",
+            s.forbid_with
+        );
+    }
+
+    /// Both keys read left-to-right as sequence order.
+    ///
+    /// `requires_before: A -> B` is "A must precede B"; `forbid_after: A -> B` is
+    /// "B must not follow A". If the arrow meant one thing in one key and the
+    /// reverse in the other, nobody could remember which — and an ordering rule
+    /// pointed backwards does not error, it silently never matches.
+    #[test]
+    fn the_arrow_means_sequence_order_in_both_keys() {
+        let s = sop_from_raw(
+            "x",
+            "---\nrequires_before: A -> B\nforbid_after: C -> D\n---\nbody\n",
+        );
+        // requires: A comes first, B is the thing being guarded.
+        assert_eq!(s.requires_before[0], ("A".into(), "B".into(), false));
+        // forbid: C comes first, D is the thing that must not follow.
+        assert_eq!(s.forbid_after[0], ("C".into(), "D".into(), false));
+    }
+
+    /// A rule naming a shell command is refused, loudly.
+    ///
+    /// This is the single most likely authoring mistake. The rules are about
+    /// `action:deploy`, but the thing an operator has in mind is `git push` —
+    /// and a command never matches, because no harness emits a tool by that name
+    /// and `classify` synthesises only the `action:` tokens. Such a rule
+    /// would compile, load, sit in front matter looking correct, and never fire.
+    ///
+    /// Rejecting at parse is the only moment anyone finds out.
+    #[test]
+    fn a_rule_naming_a_shell_command_is_rejected() {
+        let err = parse_ordering("git push -> action:deploy").expect_err("must be refused");
+        assert!(err.contains("shell command"), "{err}");
+        assert!(
+            err.contains("action:"),
+            "the message must name the vocabulary: {err}"
+        );
+
+        // And the correct form is accepted.
+        assert!(parse_ordering("action:run_tests -> action:deploy").is_ok());
+        // Raw tool names are fine — succession over tools is legitimate.
+        assert!(parse_ordering("Read -> Write").is_ok());
+    }
+
+    #[test]
+    fn a_malformed_rule_is_reported_not_silently_dropped() {
+        // No arrow at all, and an empty side.
+        assert!(parse_ordering("action:deploy").is_err());
+        assert!(parse_ordering("-> action:deploy").is_err());
+        assert!(parse_ordering("action:deploy ->").is_err());
+
+        // The SOP still loads: one bad rule must not disarm the good ones beside
+        // it. The bad rule lands in rule_errors, which the loader logs.
+        let fm = parse_front_matter(
+            "---\nrequires_before: action:run_tests -> action:deploy, nonsense\n---\nbody\n",
+        );
+        assert_eq!(fm.requires_before.len(), 1, "the valid rule survives");
+        assert_eq!(fm.rule_errors.len(), 1, "the invalid one is recorded");
+    }
+
+    /// A file whose ONLY content is ordering rules must load.
+    ///
+    /// `read_dir_sops` skips a file with no body and no directives. Adding a new
+    /// directive without adding it to that emptiness check means a policy whose
+    /// entire content is `forbid_after:` is dropped on load, and the rule that
+    /// reads it never fires — with nothing to notice, because the file is on
+    /// disk and looks fine. That exact bug is documented at the check itself.
+    #[test]
+    fn a_sop_declaring_only_ordering_rules_is_not_dropped() {
+        // Same tempdir convention as the other loader tests in this file.
+        let dir = std::env::temp_dir().join(format!("intutic-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("ordering.md"),
+            "---\nforbid_after: action:secret_read -> action:http_post\n---\n",
+        )
+        .expect("write");
+        let sops = read_dir_sops(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sops.len(), 1, "a rules-only SOP must load");
+        assert_eq!(sops[0].forbid_after.len(), 1);
+    }
+
+    fn enforcing_sop(title: &str) -> Sop {
+        sop_from_raw(title, "---\nreview_before: action:deploy\n---\n# body\n")
+    }
+
+    /// The SOP the Kubernetes manifests actually ship must be enforceable.
+    ///
+    /// `infra/kubernetes/base/proxy/sops/` is projected into the proxy pod as a
+    /// ConfigMap volume, and it is the only policy that pod will ever see. A
+    /// one-character typo in its front matter would load clean and enforce
+    /// nothing — the exact case the warning above exists for — so the shipped
+    /// artifact is pinned here rather than left to a boot log nobody re-reads.
+    ///
+    /// Read at RUNTIME, not with `include_str!`, and gated on the manifest
+    /// directory existing.
+    ///
+    /// `infra/` is enterprise-only — it is not in the open-core sync set — so a
+    /// compile-time include reaches outside the crate and breaks the public
+    /// build outright. It did: `cargo test` in the open-core repo failed with
+    /// "couldn't read .../infra/kubernetes/base/proxy/sops/...". The pin is
+    /// about an artifact that exists in exactly one of the two repositories, so
+    /// it has to ask whether that artifact is there.
+    ///
+    /// Gated on the DIRECTORY, never on the file. Skipping when the directory is
+    /// absent is honest — open core ships no cluster manifest, so there is
+    /// nothing to protect. Skipping when the *file* is absent would not be: that
+    /// is precisely the rename this test exists to catch, and it would pass in
+    /// silence.
+    #[test]
+    fn the_shipped_cluster_sop_declares_something_enforceable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../infra/kubernetes/base/proxy/sops");
+        if !dir.is_dir() {
+            // Open core. No manifest, nothing to pin.
+            return;
+        }
+        let path = dir.join("ship-steps-need-a-human.md");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{} exists but {} could not be read ({e}) — the ConfigMap generator \
+                 reads this exact path, so the proxy pod would mount no policy at all",
+                dir.display(),
+                path.display()
+            )
+        });
+        let sop = sop_from_raw("ship-steps-need-a-human", &raw);
+        assert!(
+            is_enforceable(&sop),
+            "the SOP mounted into the cluster proxy declares nothing the proxy can act on, \
+             so every SOP-derived control is inert there despite policy being present"
+        );
+        // Specifically the declaration the file is named for. `is_enforceable`
+        // alone would still pass if review_before were misspelled and some other
+        // key happened to be present.
+        assert!(
+            !sop.review_before.is_empty(),
+            "ship-steps-need-a-human must declare review_before, or it holds nothing"
+        );
+    }
+
+    /// Policy present, nothing enforceable — the one-character failure.
+    #[test]
+    fn a_sop_that_declares_nothing_enforceable_warns_rather_than_loading_clean() {
+        // `review_befor:` instead of `review_before:`. Unknown keys are ignored
+        // by design, for forward compatibility, so this parses and loads. Before
+        // this warning existed it produced a green "Loaded role-scoped SOPs
+        // count=1" and enforced nothing at all.
+        let sop = sop_from_raw(
+            "Ship steps need a human",
+            "---\nreview_befor: action:deploy\n---\n# Ship steps need a human\n",
+        );
+        assert!(!is_enforceable(&sop), "the fixture must be the inert case");
+
+        let logged = capture_logs(|| {
+            report_resolution(
+                &SopsSource::Env(PathBuf::from("/etc/intutic-sops")),
+                Path::new("/home/intutic"),
+                std::slice::from_ref(&sop),
+            )
+        });
+        assert!(
+            logged.contains("WARN"),
+            "an inert SOP set must warn: {logged}"
+        );
+        assert!(
+            logged.contains("Ship steps need a human"),
+            "the warning must name the file an operator has to go and fix: {logged}"
+        );
+    }
+
+    /// A mixed set is normal and must not raise an alarm — but the advisory ones
+    /// are still named, or a misspelling in one file hides behind the others.
+    #[test]
+    fn a_mixed_sop_set_names_the_advisory_ones_without_warning() {
+        let inert = sop_from_raw("Reference only", "---\ntitle: notes\n---\n# prose\n");
+        let logged = capture_logs(|| {
+            report_resolution(
+                &SopsSource::Env(PathBuf::from("/etc/intutic-sops")),
+                Path::new("/home/intutic"),
+                &[enforcing_sop("enforced"), inert],
+            )
+        });
+        assert!(
+            !logged.contains("WARN"),
+            "a mixed set is not a fault: {logged}"
+        );
+        assert!(
+            logged.contains("Reference only"),
+            "name the advisory ones: {logged}"
+        );
+    }
+
+    #[test]
+    fn an_empty_sop_set_warns_and_names_what_it_disabled() {
+        let cwd = Path::new("/home/intutic");
+        let logged = capture_logs(|| report_resolution(&SopsSource::NotFound, cwd, &[]));
+
+        assert!(
+            logged.contains("WARN"),
+            "an inert policy path must be a warning, not an info line: {logged}"
+        );
+        for detector in ["deny_tools", "plan_steps", "scope_paths", "review_before"] {
+            assert!(
+                logged.contains(detector),
+                "the warning must name the {detector} detector it disabled: {logged}"
+            );
+        }
+        assert!(
+            logged.contains(".intutic/sops"),
+            "the warning must name the directory it looked for: {logged}"
+        );
+        assert!(
+            logged.contains("/home/intutic"),
+            "the warning must name the cwd it searched from: {logged}"
+        );
+        assert!(
+            logged.contains(SOPS_DIR_ENV),
+            "the warning must name the override that fixes it: {logged}"
+        );
+    }
+
+    /// A directory that resolved and parsed is not a fault, and must not warn —
+    /// a warning on every boot is one nobody reads on the boot that matters.
+    #[test]
+    fn a_populated_sop_set_reports_which_source_won_without_warning() {
+        let logged = capture_logs(|| {
+            // Enforceable on purpose: a set that declares nothing now warns, and
+            // this test is about the source line rather than about that.
+            report_resolution(
+                &SopsSource::Env(PathBuf::from("/etc/intutic/sops")),
+                Path::new("/home/intutic"),
+                &[enforcing_sop("a"), enforcing_sop("b"), enforcing_sop("c")],
+            )
+        });
+        assert!(
+            !logged.contains("WARN"),
+            "loading SOPs is not a fault: {logged}"
+        );
+        assert!(
+            logged.contains(SOPS_DIR_ENV),
+            "the load line must say which source won: {logged}"
+        );
+        assert!(logged.contains("/etc/intutic/sops"), "{logged}");
+    }
+
+    /// Loading a SOP's `on: response` decide rules names them once, as rules
+    /// the gateway judges responses by, and not the tool-call rules beside
+    /// them. Nothing calls them unenforced.
+    #[test]
+    fn a_response_decide_rule_is_named_at_load() {
+        let q = r#""questions":{"a":{"type":"yes_no","ask":"Does the response leak customer data?"}},"when":"a""#;
+        let raw = format!(
+            "---\ndecide: {{\"id\":\"leak\",\"on\":\"response\",{q}}}\ndecide: {{\"id\":\"tone\",\"on\":\"response\",{q}}}\n\
+             decide: {{\"id\":\"export\",\"on\":\"tool_call\",\"tools\":[\"Bash\"],{q}}}\n---\nbody"
+        );
+        let logged = capture_logs(|| {
+            let sop =
+                parse_sop_content("data".into(), &raw, "data.md", SopScope::Workspace).unwrap();
+            assert_eq!(sop.decide_rules.len(), 3);
+        });
+        assert!(!logged.contains("not enforced"), "{logged}");
+        let lines: Vec<&str> = logged
+            .lines()
+            .filter(|l| l.contains("judge each complete response at the gateway"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one line per SOP: {logged}");
+        assert!(
+            lines[0].contains("INFO") && lines[0].contains("data.md"),
+            "{logged}"
+        );
+        assert!(lines[0].contains("leak, tone"), "{logged}");
+        assert!(!lines[0].contains("export"), "{logged}");
+
+        // A SOP without one says nothing about it.
+        let quiet = capture_logs(|| {
+            parse_sop_content(
+                "ops".into(),
+                "---\ndeny_tools: rm\n---\nbody",
+                "ops.md",
+                SopScope::Workspace,
+            );
+        });
+        assert!(!quiet.contains("judge each complete response"), "{quiet}");
+    }
+
+    /// The whole point of the override: on a host whose cwd ancestry carries no
+    /// answer, policy arrives on a mounted volume. It has to beat the walk even
+    /// when the walk would have found something, or a stray `.intutic/sops`
+    /// under the container's home directory would quietly outrank the mount.
+    #[test]
+    fn the_env_override_wins_over_the_cwd_walk() {
+        let root = std::env::temp_dir().join(format!("intutic-sopsrc-{}", std::process::id()));
+        let walked = root.join("workspace").join(".intutic").join("sops");
+        let mounted = root.join("mnt").join("policy");
+        let deep = root.join("workspace").join("packages").join("thing");
+        std::fs::create_dir_all(&walked).unwrap();
+        std::fs::create_dir_all(&mounted).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+
+        assert_eq!(
+            resolve_sops_dir_from(None, &deep),
+            SopsSource::Walk(walked.clone()),
+            "with no override the walk must still resolve"
+        );
+        assert_eq!(
+            resolve_sops_dir_from(Some(mounted.to_str().unwrap()), &deep),
+            SopsSource::Env(mounted.clone()),
+            "the override must win even where the walk would have succeeded"
+        );
+
+        // A blank value is how a Kubernetes env block spells "unset". Honouring
+        // it would point the proxy at "" and take the fallback away too.
+        assert_eq!(
+            resolve_sops_dir_from(Some("   "), &deep),
+            SopsSource::Walk(walked.clone()),
+            "a blank override is not an override"
+        );
+
+        // A set-but-wrong path does NOT fall back to the walk: an operator who
+        // mounted a volume needs to hear that it is missing.
+        let missing = root.join("mnt").join("absent");
+        assert_eq!(
+            resolve_sops_dir_from(Some(missing.to_str().unwrap()), &deep),
+            SopsSource::EnvNotADirectory(missing),
+            "a set-but-wrong override must be reported, not silently replaced"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod deny_tests {
+    use super::*;
+
+    fn with_denies(roles: &[&str], denies: &[&str]) -> Sop {
+        Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: "policy".into(),
+            body: "- prose".into(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            deny_tools: denies.iter().map(|d| d.to_string()).collect(),
+            allow_harnesses: Vec::new(),
+            plan_steps: Vec::new(),
+            scope_paths: Vec::new(),
+            allow_commands: Vec::new(),
+            review_before: Vec::new(),
+            requires_before: Vec::new(),
+            forbid_after: Vec::new(),
+            mode: SopMode::default(),
+            max_calls: Vec::new(),
+            forbid_with: Vec::new(),
+            sql_guard: None,
+            sql_allow_dsns: Vec::new(),
+            hook_rules: Vec::new(),
+            decide_rules: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deny_tools_parse_from_front_matter() {
+        let fm = parse_front_matter("---\nroles: deployer\ndeny_tools: Bash, rm\n---\n- prose");
+        let roles = fm.roles;
+        let deny = fm.deny_tools;
+        let body = fm.body;
+        assert_eq!(roles, vec!["deployer"]);
+        assert_eq!(deny, vec!["Bash", "rm"]);
+        assert_eq!(body, "- prose");
+    }
+
+    #[test]
+    fn tool_names_keep_their_case() {
+        // Harnesses ship tools called `Bash` and `Write`. Lowercasing the
+        // denylist the way roles are lowercased would stop it matching.
+        let fm = parse_front_matter("---\ndeny_tools: Bash, WebFetch\n---\nx");
+        let deny = fm.deny_tools;
+        assert_eq!(deny, vec!["Bash", "WebFetch"]);
+    }
+
+    #[test]
+    fn denies_are_collected_per_role_and_deduped() {
+        let sops = vec![
+            with_denies(&[], &["rm"]),
+            with_denies(&["deployer"], &["kubectl", "rm"]),
+            with_denies(&["reviewer"], &["git-push"]),
+        ];
+        assert_eq!(collect_denies(&sops, "deployer"), vec!["kubectl", "rm"]);
+        assert_eq!(collect_denies(&sops, "reviewer"), vec!["git-push", "rm"]);
+        // A node with no role still inherits the unscoped bans.
+        assert_eq!(collect_denies(&sops, ""), vec!["rm"]);
+    }
+
+    #[test]
+    fn no_policy_means_nothing_is_denied() {
+        // The critical default. Open core has no policy service, so an empty
+        // policy must mean "no restrictions" — treating it as "deny everything
+        // unlisted" would block every tool call for every user who never wrote
+        // one.
+        assert!(collect_denies(&[], "deployer").is_empty());
+        assert!(collect_denies(&[with_denies(&[], &[])], "deployer").is_empty());
+    }
+
+    #[test]
+    fn a_deny_only_sop_is_still_loaded() {
+        // A file that is nothing but a denylist has no prose body, and must
+        // not be discarded for it.
+        let fm = parse_front_matter("---\ndeny_tools: rm\n---\n");
+        let deny = fm.deny_tools;
+        let body = fm.body;
+        assert!(body.is_empty());
+        assert_eq!(deny, vec!["rm"]);
+    }
+}
+
+#[cfg(test)]
+mod harness_policy_tests {
+    use super::*;
+
+    #[test]
+    fn allow_harnesses_parse_and_lowercase() {
+        let fm = parse_front_matter(
+            "---\nroles: reviewer\nallow_harnesses: Claude-Code, cursor\n---\nx",
+        );
+        let roles = fm.roles;
+        let harnesses = fm.allow_harnesses;
+        assert_eq!(roles, vec!["reviewer"]);
+        assert_eq!(harnesses, vec!["claude-code", "cursor"]);
+    }
+
+    #[test]
+    fn harnesses_are_collected_per_role() {
+        let sops = vec![
+            Sop {
+                risk_tier: None,
+                scope: SopScope::Workspace,
+                title: "a".into(),
+                body: "x".into(),
+                roles: vec!["reviewer".into()],
+                deny_tools: vec![],
+                allow_harnesses: vec!["claude-code".into()],
+                plan_steps: Vec::new(),
+                scope_paths: Vec::new(),
+                allow_commands: Vec::new(),
+                review_before: Vec::new(),
+                requires_before: Vec::new(),
+                forbid_after: Vec::new(),
+                mode: SopMode::default(),
+                max_calls: Vec::new(),
+                forbid_with: Vec::new(),
+                sql_guard: None,
+                sql_allow_dsns: Vec::new(),
+                hook_rules: Vec::new(),
+                decide_rules: Vec::new(),
+                ..Default::default()
+            },
+            Sop {
+                risk_tier: None,
+                scope: SopScope::Workspace,
+                title: "b".into(),
+                body: "x".into(),
+                roles: vec!["deployer".into()],
+                deny_tools: vec![],
+                allow_harnesses: vec!["cursor".into()],
+                plan_steps: Vec::new(),
+                scope_paths: Vec::new(),
+                allow_commands: Vec::new(),
+                review_before: Vec::new(),
+                requires_before: Vec::new(),
+                forbid_after: Vec::new(),
+                mode: SopMode::default(),
+                max_calls: Vec::new(),
+                forbid_with: Vec::new(),
+                sql_guard: None,
+                sql_allow_dsns: Vec::new(),
+                hook_rules: Vec::new(),
+                decide_rules: Vec::new(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(collect_harnesses(&sops, "reviewer"), vec!["claude-code"]);
+        assert_eq!(collect_harnesses(&sops, "deployer"), vec!["cursor"]);
+        // A role no SOP restricts stays unrestricted.
+        assert!(collect_harnesses(&sops, "planner").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plan_step_tests {
+    use super::*;
+
+    #[test]
+    fn plan_steps_parse_and_keep_their_case() {
+        // Case is preserved in storage so a finding names the step the way its
+        // author wrote it; the detector compares case-insensitively.
+        let fm = parse_front_matter(
+            "---\nroles: deployer\nplan_steps: Read, Edit, action:run_tests, action:deploy\n---\n## Policy",
+        );
+        let plan = fm.plan_steps;
+        let body = fm.body;
+        assert_eq!(
+            plan,
+            vec!["Read", "Edit", "action:run_tests", "action:deploy"]
+        );
+        assert_eq!(body, "## Policy");
+    }
+
+    #[test]
+    fn an_sop_with_no_plan_declares_none() {
+        let fm = parse_front_matter("---\nroles: reviewer\n---\nx");
+        let plan = fm.plan_steps;
+        assert!(
+            plan.is_empty(),
+            "absent must mean absent, never 'allow nothing'"
+        );
+    }
+
+    /// Ordering is preserved on purpose. The set comparison does not need it,
+    /// but an order-aware check later would, and a collector that sorted would
+    /// have destroyed the information before anyone could use it.
+    #[test]
+    fn collection_preserves_declared_order() {
+        let sops = vec![
+            Sop {
+                risk_tier: None,
+                scope: SopScope::Workspace,
+                title: "deploy".into(),
+                body: "x".into(),
+                roles: vec!["deployer".into()],
+                deny_tools: vec![],
+                allow_harnesses: vec![],
+                plan_steps: vec!["Read".into(), "Edit".into(), "action:deploy".into()],
+                scope_paths: Vec::new(),
+                allow_commands: Vec::new(),
+                review_before: Vec::new(),
+                requires_before: Vec::new(),
+                forbid_after: Vec::new(),
+                mode: SopMode::default(),
+                max_calls: Vec::new(),
+                forbid_with: Vec::new(),
+                sql_guard: None,
+                sql_allow_dsns: Vec::new(),
+                hook_rules: Vec::new(),
+                decide_rules: Vec::new(),
+                ..Default::default()
+            },
+            Sop {
+                risk_tier: None,
+                scope: SopScope::Workspace,
+                title: "review".into(),
+                body: "x".into(),
+                roles: vec!["reviewer".into()],
+                deny_tools: vec![],
+                allow_harnesses: vec![],
+                plan_steps: vec!["Grep".into()],
+                scope_paths: Vec::new(),
+                allow_commands: Vec::new(),
+                review_before: Vec::new(),
+                requires_before: Vec::new(),
+                forbid_after: Vec::new(),
+                mode: SopMode::default(),
+                max_calls: Vec::new(),
+                forbid_with: Vec::new(),
+                sql_guard: None,
+                sql_allow_dsns: Vec::new(),
+                hook_rules: Vec::new(),
+                decide_rules: Vec::new(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            collect_plan_steps(&sops, "deployer"),
+            vec!["Read", "Edit", "action:deploy"]
+        );
+        assert_eq!(collect_plan_steps(&sops, "reviewer"), vec!["Grep"]);
+    }
+
+    /// A node that declared no role gets only unscoped SOPs — same rule as
+    /// every other collector here, and worth pinning because a plan leaking
+    /// across roles would flag a reviewer for not deploying.
+    #[test]
+    fn a_plan_does_not_leak_across_roles() {
+        let sops = vec![Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: "deploy".into(),
+            body: "x".into(),
+            roles: vec!["deployer".into()],
+            deny_tools: vec![],
+            allow_harnesses: vec![],
+            plan_steps: vec!["action:deploy".into()],
+            scope_paths: Vec::new(),
+            allow_commands: Vec::new(),
+            review_before: Vec::new(),
+            requires_before: Vec::new(),
+            forbid_after: Vec::new(),
+            mode: SopMode::default(),
+            max_calls: Vec::new(),
+            forbid_with: Vec::new(),
+            sql_guard: None,
+            sql_allow_dsns: Vec::new(),
+            hook_rules: Vec::new(),
+            decide_rules: Vec::new(),
+            ..Default::default()
+        }];
+        assert!(collect_plan_steps(&sops, "reviewer").is_empty());
+        assert!(collect_plan_steps(&sops, "").is_empty());
+    }
+
+    /// An SOP whose only content is a plan must survive the empty-body guard.
+    /// It is the natural way to write one, and dropping it would make the
+    /// feature silently do nothing.
+    #[test]
+    fn a_plan_only_sop_is_not_discarded() {
+        let dir = std::env::temp_dir().join(format!("intutic-plan-sop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("plan.md"),
+            "---\nroles: deployer\nplan_steps: Read, action:deploy\n---\n",
+        )
+        .unwrap();
+
+        let sops = read_dir_sops(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(sops.len(), 1, "a body-less SOP carrying a plan must load");
+        assert_eq!(sops[0].plan_steps, vec!["Read", "action:deploy"]);
+    }
+}
+
+#[cfg(test)]
+mod scope_and_review_tests {
+    use super::*;
+
+    #[test]
+    fn scope_paths_parse_and_keep_their_case() {
+        // Case is preserved because filesystems outside macOS care about it and
+        // a reviewer should see the scope as written; comparison lowercases.
+        let fm = parse_front_matter(
+            "---\nroles: deployer\nscope_paths: packages/proxy, Infra/K8s\n---\n## Policy",
+        );
+        assert_eq!(fm.scope_paths, vec!["packages/proxy", "Infra/K8s"]);
+        assert_eq!(fm.body, "## Policy");
+    }
+
+    #[test]
+    fn review_before_parses_action_tokens_and_tool_names() {
+        let fm =
+            parse_front_matter("---\nroles: deployer\nreview_before: action:deploy, Bash\n---\nx");
+        assert_eq!(fm.review_before, vec!["action:deploy", "Bash"]);
+    }
+
+    #[test]
+    fn an_sop_declaring_neither_has_both_empty() {
+        let fm = parse_front_matter("---\nroles: reviewer\n---\nx");
+        assert!(
+            fm.scope_paths.is_empty(),
+            "absent must mean absent, never 'deny everything'"
+        );
+        assert!(
+            fm.review_before.is_empty(),
+            "nothing is held until someone asks for it"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_fence_is_body_not_a_silently_empty_policy() {
+        // A typo must not disarm a rule its author believes is active.
+        let fm = parse_front_matter("---\nscope_paths: packages/proxy\n## Policy");
+        assert!(fm.scope_paths.is_empty());
+        assert!(fm.body.contains("## Policy"));
+    }
+
+    #[test]
+    fn scopes_do_not_leak_across_roles() {
+        let sops = vec![Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: "deploy".into(),
+            body: "x".into(),
+            roles: vec!["deployer".into()],
+            deny_tools: vec![],
+            allow_harnesses: vec![],
+            plan_steps: vec![],
+            scope_paths: vec!["infra".into()],
+            review_before: vec!["action:deploy".into()],
+            requires_before: Vec::new(),
+            forbid_after: Vec::new(),
+            mode: SopMode::default(),
+            max_calls: Vec::new(),
+            forbid_with: Vec::new(),
+            sql_guard: None,
+            sql_allow_dsns: Vec::new(),
+            hook_rules: Vec::new(),
+            decide_rules: Vec::new(),
+            ..Default::default()
+        }];
+        assert!(collect_scope_paths(&sops, "reviewer").is_empty());
+        assert!(collect_review_before(&sops, "reviewer").is_empty());
+        assert_eq!(collect_scope_paths(&sops, "deployer"), vec!["infra"]);
+    }
+
+    #[test]
+    fn scopes_from_several_sops_are_merged_and_deduped() {
+        let mk = |scope: &str| Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: scope.into(),
+            body: "x".into(),
+            roles: vec![],
+            deny_tools: vec![],
+            allow_harnesses: vec![],
+            plan_steps: vec![],
+            scope_paths: vec![scope.to_string()],
+            review_before: vec![],
+            requires_before: Vec::new(),
+            forbid_after: Vec::new(),
+            mode: SopMode::default(),
+            max_calls: Vec::new(),
+            forbid_with: Vec::new(),
+            sql_guard: None,
+            sql_allow_dsns: Vec::new(),
+            hook_rules: Vec::new(),
+            decide_rules: Vec::new(),
+            ..Default::default()
+        };
+        let sops = vec![mk("packages/proxy"), mk("infra"), mk("packages/proxy")];
+        assert_eq!(
+            collect_scope_paths(&sops, "anyone"),
+            vec!["infra", "packages/proxy"]
+        );
+    }
+
+    /// An SOP whose only content is a scope must survive the empty-body guard.
+    /// It is the natural way to write one, and dropping it would make the check
+    /// silently do nothing.
+    #[test]
+    fn a_scope_only_sop_is_not_discarded() {
+        let dir = std::env::temp_dir().join(format!("intutic-scope-sop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("scope.md"),
+            "---\nroles: deployer\nscope_paths: infra\n---\n",
+        )
+        .unwrap();
+        let sops = read_dir_sops(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(sops.len(), 1, "a body-less SOP carrying a scope must load");
+        assert_eq!(sops[0].scope_paths, vec!["infra"]);
+    }
+
+    #[test]
+    fn a_review_before_only_sop_is_not_discarded() {
+        let dir = std::env::temp_dir().join(format!("intutic-rev-sop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("hold.md"),
+            "---\nreview_before: action:deploy\n---\n",
+        )
+        .unwrap();
+        let sops = read_dir_sops(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(sops.len(), 1, "a body-less SOP carrying a hold must load");
+        assert_eq!(sops[0].review_before, vec!["action:deploy"]);
+    }
+}
+
+#[cfg(test)]
+mod cross_language_fixture_tests {
+    use super::*;
+
+    /// Both gates must read the same directive the same way.
+    ///
+    /// `review_before:` is parsed twice — here in Rust for the proxy, and again
+    /// in TypeScript by the sync daemon for the pre-execution hook. There is no
+    /// shared parser and no shared schema, so nothing but agreement holds them
+    /// together. Two parsers for one directive is exactly how a rule ends up
+    /// enforced at one gate and silently ignored at the other.
+    ///
+    /// This reads the same fixture file the daemon's test reads. Awkward
+    /// whitespace and quoting are deliberate: those are what the two would
+    /// disagree about first.
+    #[test]
+    fn the_shared_fixture_parses_as_both_gates_expect() {
+        let raw = include_str!("../tests/fixtures/review-before-sop.md");
+        let fm = parse_front_matter(raw);
+
+        assert_eq!(
+            fm.review_before,
+            vec!["action:deploy", "action:publish", "Bash"]
+        );
+        assert_eq!(fm.scope_paths, vec!["packages/proxy", "infra/"]);
+        assert_eq!(fm.roles, vec!["deployer"]);
+        assert!(fm.body.starts_with("## Deploy policy"));
+    }
+}
+
+#[cfg(feature = "control-plane")]
+#[cfg(test)]
+mod sop_status_snapshot_tests {
+    use super::*;
+
+    fn mk(title: &str, body: &str) -> Sop {
+        Sop {
+            risk_tier: None,
+            scope: SopScope::Workspace,
+            title: title.into(),
+            body: body.into(),
+            roles: Vec::new(),
+            deny_tools: Vec::new(),
+            allow_harnesses: Vec::new(),
+            plan_steps: Vec::new(),
+            scope_paths: Vec::new(),
+            allow_commands: Vec::new(),
+            review_before: Vec::new(),
+            requires_before: Vec::new(),
+            forbid_after: Vec::new(),
+            mode: SopMode::default(),
+            max_calls: Vec::new(),
+            forbid_with: Vec::new(),
+            sql_guard: None,
+            sql_allow_dsns: Vec::new(),
+            hook_rules: Vec::new(),
+            decide_rules: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fingerprint_sop_set_is_deterministic_and_order_independent() {
+        let a = vec![mk("A", "rule A"), mk("B", "rule B")];
+        let b = vec![mk("B", "rule B"), mk("A", "rule A")];
+        assert_eq!(
+            fingerprint_sop_set("ws_1", &a),
+            fingerprint_sop_set("ws_1", &b)
+        );
+    }
+
+    #[test]
+    fn fingerprint_sop_set_changes_with_body_and_with_workspace_id() {
+        let base = vec![mk("A", "rule A")];
+        let different_body = vec![mk("A", "a different rule entirely")];
+        assert_ne!(
+            fingerprint_sop_set("ws_1", &base),
+            fingerprint_sop_set("ws_1", &different_body),
+            "changing a SOP's body must change the fingerprint"
+        );
+        assert_ne!(
+            fingerprint_sop_set("ws_1", &base),
+            fingerprint_sop_set("ws_2", &base),
+            "the same SOP content under a different workspace_id must fingerprint differently"
+        );
+    }
+
+    // CACHE and workspace_cache() are process-global statics shared across
+    // every test in this binary, with no reset API -- same class of problem
+    // heartbeat.rs's own tests document (search
+    // `_scenarios_run_sequentially_to_avoid_a_cross_test_race`). Consolidated
+    // into one #[test] using distinctive test-only workspace-id keys, and
+    // asserting INCREMENTAL effects (a count/hash delta after inserting one
+    // more entry) rather than exact totals, since other tests in this same
+    // binary may hold fresh cache entries under their own keys when this
+    // runs.
+    #[test]
+    fn sop_status_snapshot_scenarios_run_sequentially_to_avoid_a_cross_test_race() {
+        const WS_A: &str = "__test_sop_status_snapshot_ws_a__";
+        const WS_STALE: &str = "__test_sop_status_snapshot_ws_stale__";
+
+        // 1. A fresh per-workspace entry is included in the aggregate.
+        let before = sop_status_snapshot();
+        let before_count = before.as_ref().map(|s| s.sop_count).unwrap_or(0);
+        {
+            let mut cache = workspace_cache().lock().unwrap_or_else(|p| p.into_inner());
+            cache.insert(
+                WS_A.to_string(),
+                WorkspaceCached {
+                    sops: vec![mk("A", "rule A"), mk("B", "rule B")],
+                    read_at: Instant::now(),
+                    version: None,
+                },
+            );
+        }
+        let after_fresh = sop_status_snapshot().expect("at least one fresh entry exists now");
+        assert_eq!(
+            after_fresh.sop_count,
+            before_count + 2,
+            "the aggregate count must increase by exactly the number of SOPs just inserted"
+        );
+
+        // 2. A STALE per-workspace entry (past CACHE_TTL) is excluded.
+        {
+            let mut cache = workspace_cache().lock().unwrap_or_else(|p| p.into_inner());
+            cache.insert(
+                WS_STALE.to_string(),
+                WorkspaceCached {
+                    sops: vec![mk("C", "rule C")],
+                    read_at: Instant::now() - CACHE_TTL - Duration::from_secs(1),
+                    version: None,
+                },
+            );
+        }
+        let after_stale =
+            sop_status_snapshot().expect("still at least the fresh entry from step 1");
+        assert_eq!(
+            after_stale.sop_count, after_fresh.sop_count,
+            "a stale (past-TTL) entry must not be counted"
+        );
+
+        // 3. The process-global cache path is additive too.
+        {
+            let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = Some(Cached {
+                sops: vec![mk("D", "rule D")],
+                read_at: Instant::now(),
+            });
+        }
+        let after_global = sop_status_snapshot().expect("global cache entry now present");
+        assert_eq!(
+            after_global.sop_count,
+            after_fresh.sop_count + 1,
+            "the process-global cache's SOPs must additively contribute to the aggregate"
+        );
+
+        // Cleanup: leave the shared statics as this test found the
+        // workspace-scoped entries (the global CACHE slot is left as-is,
+        // matching this file's existing tests that touch it).
+        let mut cache = workspace_cache().lock().unwrap_or_else(|p| p.into_inner());
+        cache.remove(WS_A);
+        cache.remove(WS_STALE);
+    }
+}
+
+/// Migration 139 -- org-level SOP scope, ceiling-by-intersection for the
+/// three allowlist-shaped fields (`allow_harnesses`, `scope_paths`,
+/// `plan_steps`). See `SopScope`'s own doc comment for why these three, and
+/// only these three, need intersection rather than the plain union every
+/// other declarative field already gets for free.
+#[cfg(test)]
+mod org_ceiling_tests {
+    use super::*;
+
+    fn sop(scope: SopScope, roles: &[&str]) -> Sop {
+        Sop {
+            scope,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    // ── allow_harnesses ──────────────────────────────────────────────
+
+    #[test]
+    fn org_ceiling_narrows_harnesses_by_intersection() {
+        let ws = Sop {
+            allow_harnesses: vec!["claude-code".into(), "cursor".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = Sop {
+            allow_harnesses: vec!["claude-code".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(collect_harnesses(&[ws, org], "anyone"), vec!["claude-code"]);
+    }
+
+    #[test]
+    fn an_org_sop_declaring_no_harnesses_imposes_no_ceiling() {
+        // An org SOP that exists but says nothing about allow_harnesses must
+        // not zero out every workspace SOP's declaration -- an empty org set
+        // means "no ceiling", not "ceiling of nothing".
+        let ws = Sop {
+            allow_harnesses: vec!["claude-code".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = sop(SopScope::Org, &[]); // declares nothing
+        assert_eq!(collect_harnesses(&[ws, org], "anyone"), vec!["claude-code"]);
+    }
+
+    #[test]
+    fn an_org_ceiling_applies_to_a_workspace_that_declared_nothing() {
+        // An undeclared workspace list is unrestricted; the org ceiling is
+        // what restricts it. Reading "nothing to narrow" as "no ceiling"
+        // silently widened this case to every harness.
+        let org = Sop {
+            allow_harnesses: vec!["claude-code".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(collect_harnesses(&[org], "anyone"), vec!["claude-code"]);
+    }
+
+    #[test]
+    fn a_disjoint_harness_narrowing_denies_rather_than_widening() {
+        let ws = Sop {
+            allow_harnesses: vec!["cursor".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = Sop {
+            allow_harnesses: vec!["claude-code".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(
+            collect_harnesses(&[ws, org], "anyone"),
+            vec![NARROWED_TO_NOTHING.to_string()],
+            "an intersection of nothing must be a list of nothing-permitted, never the empty list that means unrestricted"
+        );
+    }
+
+    #[test]
+    fn harnesses_still_union_within_a_single_scope() {
+        let ws_a = Sop {
+            allow_harnesses: vec!["claude-code".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let ws_b = Sop {
+            allow_harnesses: vec!["cursor".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        assert_eq!(
+            collect_harnesses(&[ws_a, ws_b], "anyone"),
+            vec!["claude-code", "cursor"]
+        );
+    }
+
+    // ── scope_paths ──────────────────────────────────────────────────
+
+    #[test]
+    fn org_ceiling_narrows_scope_paths_by_containment_not_string_equality() {
+        // packages/proxy/... IS inside packages/proxy -- containment, not
+        // byte-equality, must be what decides survival.
+        let ws = Sop {
+            scope_paths: vec!["infra/k8s".into(), "docs".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = Sop {
+            scope_paths: vec!["infra".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(
+            collect_scope_paths(&[ws, org], "anyone"),
+            vec!["infra/k8s"],
+            "infra/k8s is legitimately narrower than the org's infra ceiling and must survive; docs is outside it and must not"
+        );
+    }
+
+    #[test]
+    fn an_org_sop_declaring_no_scope_paths_imposes_no_ceiling() {
+        let ws = Sop {
+            scope_paths: vec!["packages/proxy".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = sop(SopScope::Org, &[]);
+        assert_eq!(
+            collect_scope_paths(&[ws, org], "anyone"),
+            vec!["packages/proxy"]
+        );
+    }
+
+    #[test]
+    fn an_org_scope_ceiling_applies_to_a_workspace_that_declared_nothing() {
+        let org = Sop {
+            scope_paths: vec!["infra".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(collect_scope_paths(&[org], "anyone"), vec!["infra"]);
+    }
+
+    #[test]
+    fn a_workspace_scope_outside_the_org_ceiling_leaves_nothing_in_scope() {
+        // Previously asserted `.is_empty()` — which the detector reads as
+        // unrestricted, i.e. the ceiling widened the scope to everything.
+        let ws = Sop {
+            scope_paths: vec!["docs".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = Sop {
+            scope_paths: vec!["infra".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(
+            collect_scope_paths(&[ws, org], "anyone"),
+            vec![NARROWED_TO_NOTHING.to_string()]
+        );
+    }
+
+    // ── plan_steps ───────────────────────────────────────────────────
+
+    #[test]
+    fn org_ceiling_narrows_plan_steps_case_insensitively_but_keeps_workspace_order_and_case() {
+        let ws = Sop {
+            plan_steps: vec!["Read".into(), "Edit".into(), "action:deploy".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        // Org declares a different case than the workspace -- membership
+        // must still match, and the surviving text must keep the
+        // workspace's own casing and order.
+        let org = Sop {
+            plan_steps: vec!["read".into(), "ACTION:DEPLOY".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(
+            collect_plan_steps(&[ws, org], "anyone"),
+            vec!["Read", "action:deploy"]
+        );
+    }
+
+    #[test]
+    fn an_org_sop_declaring_no_plan_steps_imposes_no_ceiling() {
+        let ws = Sop {
+            plan_steps: vec!["Read".into(), "Edit".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = sop(SopScope::Org, &[]);
+        assert_eq!(
+            collect_plan_steps(&[ws, org], "anyone"),
+            vec!["Read", "Edit"]
+        );
+    }
+
+    #[test]
+    fn an_org_plan_ceiling_applies_to_a_workspace_that_declared_nothing() {
+        let org = Sop {
+            plan_steps: vec!["Read".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(collect_plan_steps(&[org], "anyone"), vec!["Read"]);
+    }
+
+    #[test]
+    fn a_disjoint_plan_narrowing_leaves_nothing_on_plan() {
+        let ws = Sop {
+            plan_steps: vec!["Edit".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = Sop {
+            plan_steps: vec!["Read".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(
+            collect_plan_steps(&[ws, org], "anyone"),
+            vec![NARROWED_TO_NOTHING.to_string()]
+        );
+    }
+
+    // ── The other 7 fields are untouched by scope: plain union already
+    //    covers both scopes at once (governance_fields_from iterates the
+    //    combined slice without filtering by scope). Pinned here so a
+    //    future change to those collectors that accidentally starts
+    //    filtering by scope gets caught immediately. ──
+
+    #[test]
+    fn deny_tools_unions_across_workspace_and_org_scope_with_no_special_handling() {
+        let ws = Sop {
+            deny_tools: vec!["rm".into()],
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = Sop {
+            deny_tools: vec!["curl".into()],
+            ..sop(SopScope::Org, &[])
+        };
+        assert_eq!(collect_denies(&[ws, org], "anyone"), vec!["curl", "rm"]);
+    }
+
+    #[test]
+    fn risk_tier_takes_the_max_across_workspace_and_org_scope() {
+        let ws = Sop {
+            risk_tier: Some(RiskLevel::Low),
+            ..sop(SopScope::Workspace, &[])
+        };
+        let org = Sop {
+            risk_tier: Some(RiskLevel::Critical),
+            ..sop(SopScope::Org, &[])
+        };
+        let gov = governance_fields_from(&[ws, org], "anyone");
+        assert_eq!(gov.risk_tier, Some(RiskLevel::Critical));
+    }
+}
+
+/// A workspace's cached SOP set is served within `CACHE_TTL`
+/// only while the workspace's policy version has not moved. Deterministic
+/// without a server: an unreachable control plane makes a forced refetch
+/// return the fail-closed empty set, so "the cache was bypassed" is
+/// observable as "nothing came back".
+#[cfg(feature = "control-plane")]
+#[cfg(test)]
+mod workspace_cache_version_tests {
+    use super::*;
+
+    fn seeded(ws: &str, version: Option<u64>) {
+        let mut cache = workspace_cache().lock().unwrap_or_else(|p| p.into_inner());
+        cache.insert(
+            ws.to_string(),
+            WorkspaceCached {
+                sops: vec![Sop {
+                    title: "cached".into(),
+                    ..Default::default()
+                }],
+                read_at: Instant::now(),
+                version,
+            },
+        );
+    }
+
+    fn vk_x() -> crate::credential::VirtualKey {
+        crate::credential::RequestCredential::classify("vk_x")
+            .virtual_key()
+            .cloned()
+            .expect("a virtual key")
+    }
+
+    #[tokio::test]
+    async fn a_moved_policy_version_bypasses_a_fresh_cache_entry() {
+        const WS: &str = "__test_version_moved_ws__";
+        let client = reqwest::Client::new();
+        seeded(WS, Some(1));
+        // Same version: served from the cache, no fetch attempted.
+        let same = fetch_workspace_sops(&client, "http://127.0.0.1:1", WS, &vk_x(), Some(1)).await;
+        assert_eq!(
+            same.len(),
+            1,
+            "an unmoved version must serve the cached set"
+        );
+        // No version readable on this request: the TTL alone governs — still served.
+        let unknown = fetch_workspace_sops(&client, "http://127.0.0.1:1", WS, &vk_x(), None).await;
+        assert_eq!(
+            unknown.len(),
+            1,
+            "an unreadable version must not force a refetch"
+        );
+        // Moved version: refetched now; the unreachable control plane fails closed to empty.
+        let moved = fetch_workspace_sops(&client, "http://127.0.0.1:1", WS, &vk_x(), Some(2)).await;
+        assert!(
+            moved.is_empty(),
+            "a moved version must bypass the fresh cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_entry_fetched_without_a_version_keeps_ttl_behaviour() {
+        const WS: &str = "__test_version_absent_ws__";
+        let client = reqwest::Client::new();
+        seeded(WS, None);
+        let served =
+            fetch_workspace_sops(&client, "http://127.0.0.1:1", WS, &vk_x(), Some(7)).await;
+        assert_eq!(
+            served.len(),
+            1,
+            "with no version recorded at fetch time only the TTL applies"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lld75_key_tests {
+    //! The front-matter keys 3.0 added (§1.4): defaults, strongest-wins,
+    //! unknown values enforcing, the two top-level-only keys, and lanes.
+    use super::*;
+    use crate::plugins::anomaly::actions::LaneClass;
+
+    fn fm(front: &str) -> FrontMatter {
+        parse_front_matter(&format!("---\n{front}\n---\nbody"))
+    }
+
+    #[test]
+    fn a_sop_with_none_of_the_new_keys_is_unchanged() {
+        let f = fm("deny_tools: Bash");
+        assert_eq!(f.scope_paths_mode, CheckMode::Advise);
+        assert_eq!(f.plan_steps_mode, CheckMode::Advise);
+        assert_eq!(f.plan_approval, None);
+        assert!(f.closed_lanes.is_empty() && f.open_actions.is_empty());
+        assert_eq!(f.on_reask_exhausted, OnReaskExhausted::Block);
+        assert_eq!(f.context_isolation, CheckMode::Advise);
+        assert!(f.node_kinds.is_empty() && f.node_kind_allow.is_empty());
+        assert!(f.rule_errors.is_empty());
+    }
+
+    #[test]
+    fn the_strongest_value_wins_and_an_unknown_one_enforces() {
+        let f = fm("scope_paths_mode: advise\n  scope_paths_mode: enforce\nplan_steps_mode: \"enforce\"\nplan_approval: required\nplan_approval: strict\non_reask_exhausted: pause\ncontext_isolation: enforce");
+        assert_eq!(f.scope_paths_mode, CheckMode::Enforce);
+        assert_eq!(f.plan_steps_mode, CheckMode::Enforce);
+        assert_eq!(f.plan_approval, Some(PlanApproval::Strict));
+        assert_eq!(f.on_reask_exhausted, OnReaskExhausted::Pause);
+        assert_eq!(f.context_isolation, CheckMode::Enforce);
+        assert!(f.rule_errors.is_empty(), "{:?}", f.rule_errors);
+
+        let typo = fm("scope_paths_mode: enfroce\nplan_approval: requird\non_reask_exhausted: pasue\ncontext_isolation: maybe");
+        assert_eq!(typo.scope_paths_mode, CheckMode::Enforce);
+        assert_eq!(typo.plan_approval, Some(PlanApproval::Strict));
+        assert_eq!(typo.on_reask_exhausted, OnReaskExhausted::Pause);
+        assert_eq!(typo.context_isolation, CheckMode::Enforce);
+        assert_eq!(typo.rule_errors.len(), 4, "{:?}", typo.rule_errors);
+    }
+
+    #[test]
+    fn lists_drop_unknown_entries_and_weakening_keys_are_top_level_only() {
+        let f = fm("closed_lanes: irreversible, reversible_contained\nopen_actions: action:publish, Bash\nnode_kind: worker, robot\nnode_kind_allow: spawn, fly\nmeta:\n  open_actions: action:destroy\n  node_kind_allow: model");
+        assert_eq!(f.closed_lanes, vec![LaneClass::Irreversible]);
+        assert_eq!(f.open_actions, vec!["action:publish"]);
+        assert_eq!(f.node_kinds, vec!["worker"]);
+        assert_eq!(f.node_kind_allow, vec!["spawn"]);
+        assert_eq!(f.rule_errors.len(), 4, "{:?}", f.rule_errors);
+    }
+
+    #[test]
+    fn a_misplaced_qualifier_is_an_error_and_still_refuses() {
+        let f = fm("requires_before: action:run_tests[ok] -> action:deploy, action:deploy[ok] -> action:release, action:run_tests -> action:publish[ok]");
+        assert_eq!(
+            f.requires_before,
+            vec![
+                ("action:run_tests[ok]".into(), "action:deploy".into(), false),
+                // Left literal: nothing emits it, so release is always refused.
+                ("action:deploy[ok]".into(), "action:release".into(), false),
+                // Right stripped: the gated call is still named.
+                ("action:run_tests".into(), "action:publish".into(), false),
+            ]
+        );
+        assert_eq!(f.rule_errors.len(), 2, "{:?}", f.rule_errors);
+        assert!(f.rule_errors[0].contains("[ok] qualifies only action:run_tests"));
+
+        let fa = fm("forbid_after: action:secret_read[ok] -> action:http_post");
+        assert_eq!(
+            fa.forbid_after,
+            vec![(
+                "action:secret_read".into(),
+                "action:http_post".into(),
+                false
+            )]
+        );
+        assert_eq!(fa.rule_errors.len(), 1);
+    }
+
+    #[test]
+    fn the_new_enforcing_keys_make_a_sop_enforceable() {
+        for front in [
+            "closed_lanes: irreversible",
+            "plan_approval: required",
+            "node_kind: code",
+        ] {
+            let sop = parse_sop_content(
+                "t".into(),
+                &format!("---\n{front}\n---\n"),
+                "test",
+                SopScope::Workspace,
+            )
+            .unwrap_or_else(|| panic!("{front} alone is a SOP"));
+            assert!(is_enforceable(&sop), "{front}");
+        }
+        for key in ["closed_lanes", "plan_approval", "node_kind"] {
+            assert!(ENFORCING_FIELDS.contains(key), "{key}");
+        }
+    }
+
+    fn lane_sop(front: &str, roles: &[&str]) -> Sop {
+        let mut sop = parse_sop_content(
+            "lanes".into(),
+            &format!("---\n{front}\n---\n"),
+            "test",
+            SopScope::Workspace,
+        )
+        .expect("a sop");
+        sop.roles = roles.iter().map(|r| r.to_string()).collect();
+        sop
+    }
+
+    #[test]
+    fn lane_holds_follow_classes_risk_tier_open_actions_and_the_workspace() {
+        let irreversible = lane_sop(
+            "closed_lanes: irreversible\nopen_actions: action:publish",
+            &[],
+        );
+        assert_eq!(
+            collect_lane_holds(std::slice::from_ref(&irreversible), "", &[]),
+            vec!["action:destroy", "action:force_push", "action:payment"]
+        );
+        let typo = fm("closed_lanes: irreversable, irreversible\nopen_actions: action:publsh");
+        assert_eq!(
+            typo.rule_errors,
+            vec![
+                "closed_lanes: \"irreversable\" is not a lane (irreversible, reversible_wide)",
+                "open_actions: \"action:publsh\" is not an action token"
+            ]
+        );
+        // risk_tier HIGH widens a SOP that closes a lane to reversible_wide.
+        let high = lane_sop("closed_lanes: irreversible\nrisk_tier: HIGH", &["deployer"]);
+        let held = collect_lane_holds(std::slice::from_ref(&high), "deployer", &[]);
+        assert!(held.contains(&"action:deploy".to_string()), "{held:?}");
+        assert!(held.contains(&"action:publish".to_string()), "{held:?}");
+        assert!(collect_lane_holds(&[high], "reviewer", &[]).is_empty());
+        // risk_tier alone closes nothing.
+        assert!(collect_lane_holds(
+            &[lane_sop("risk_tier: CRITICAL\ndeny_tools: x", &[])],
+            "",
+            &[]
+        )
+        .is_empty());
+        // The workspace's lanes are not reopened by an SOP's open_actions.
+        let ws = collect_lane_holds(&[irreversible], "", &[LaneClass::Irreversible]);
+        assert!(ws.contains(&"action:publish".to_string()), "{ws:?}");
+    }
+
+    #[test]
+    fn governance_merges_lane_holds_into_review_before_and_reads_the_modes() {
+        let sop = lane_sop(
+            "closed_lanes: irreversible\nreview_before: action:deploy\nscope_paths: src\nscope_paths_mode: enforce\non_reask_exhausted: pause\nnode_kind: worker",
+            &[],
+        );
+        let gov = governance_fields_with_lanes(std::slice::from_ref(&sop), "", &[]);
+        assert_eq!(
+            gov.review_before,
+            vec![
+                "action:deploy",
+                "action:destroy",
+                "action:force_push",
+                "action:payment",
+                "action:publish"
+            ]
+        );
+        assert!(gov.scope_paths_enforce && gov.on_reask_pause);
+        assert!(!gov.plan_steps_enforce && !gov.context_isolation_enforce);
+        assert_eq!(gov.node_kinds, vec!["worker"]);
+        // Without lanes, governance_fields_from is today's answer.
+        let plain = lane_sop("review_before: action:deploy", &[]);
+        assert_eq!(
+            governance_fields_from(&[plain], "").review_before,
+            vec!["action:deploy"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod lld75_sops_vectors {
+    //! 3.0's shared vectors that need the front-matter parser:
+    //! `lane-vectors.json` (`laneHoldTokens`, `frontMatter`) and
+    //! `scope-plan-vectors.json` (`collectScopePaths`, `collectPlanSteps`).
+    use super::*;
+    use crate::plugins::anomaly::actions::LaneClass;
+    use serde_json::Value;
+
+    fn strings(v: &Value) -> Vec<String> {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn lane_holds_follow_the_vectors() {
+        let Some(v) = crate::plugins::anomaly::outcome::lld75_fixture("lane-vectors.json") else {
+            return;
+        };
+        for c in v["laneHoldTokens"].as_array().unwrap() {
+            let sops: Vec<Sop> = c["sops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| Sop {
+                    closed_lanes: strings(&s["closedLanes"])
+                        .iter()
+                        .filter_map(|l| LaneClass::parse_closable(l))
+                        .collect(),
+                    open_actions: strings(&s["openActions"]),
+                    risk_tier: s["riskTier"]
+                        .as_str()
+                        .and_then(|r| parse_risk_tier(&format!("risk_tier: {r}"))),
+                    ..Default::default()
+                })
+                .collect();
+            let ws: Vec<LaneClass> = strings(&c["workspaceLanes"])
+                .iter()
+                .filter_map(|l| LaneClass::parse_closable(l))
+                .collect();
+            assert_eq!(
+                collect_lane_holds(&sops, "", &ws),
+                strings(&c["tokens"]),
+                "{}",
+                c["name"]
+            );
+        }
+        for c in v["frontMatter"].as_array().unwrap() {
+            let raw = format!("---{}---\nbody", c["front"].as_str().unwrap());
+            let fm = parse_front_matter(&raw);
+            let sop =
+                parse_sop_content("t".into(), &raw, "test", SopScope::Workspace).expect("a sop");
+            assert_eq!(
+                collect_lane_holds(&[sop], "", &[]),
+                strings(&c["tokens"]),
+                "{}",
+                c["name"]
+            );
+            assert_eq!(fm.rule_errors, strings(&c["errors"]), "{}", c["name"]);
+        }
+    }
+
+    fn sops_of(c: &Value, field: &str) -> Vec<Sop> {
+        c["sops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let mut sop = Sop {
+                    scope: SopScope::from_wire(s["scope"].as_str()),
+                    roles: strings(&s["roles"]),
+                    ..Default::default()
+                };
+                if field == "scopePaths" {
+                    sop.scope_paths = strings(&s[field]);
+                } else {
+                    sop.plan_steps = strings(&s[field]);
+                }
+                sop
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scope_and_plan_collection_follow_the_vectors() {
+        let Some(v) = crate::plugins::anomaly::outcome::lld75_fixture("scope-plan-vectors.json")
+        else {
+            return;
+        };
+        for c in v["collectScopePaths"].as_array().unwrap() {
+            assert_eq!(
+                collect_scope_paths(&sops_of(c, "scopePaths"), c["role"].as_str().unwrap()),
+                strings(&c["paths"]),
+                "{}",
+                c["name"]
+            );
+        }
+        for c in v["collectPlanSteps"].as_array().unwrap() {
+            assert_eq!(
+                collect_plan_steps(&sops_of(c, "planSteps"), c["role"].as_str().unwrap()),
+                strings(&c["steps"]),
+                "{}",
+                c["name"]
+            );
+        }
+    }
+}

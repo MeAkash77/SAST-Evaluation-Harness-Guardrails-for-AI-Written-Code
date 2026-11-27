@@ -1,0 +1,325 @@
+# clawde SDKs (TypeScript & Python) <Badge type="tip" text="Open-Core" />
+
+Programmatic TypeScript and Python client SDKs for intercepting, wrapping, and enforcing governance policies on AI coding scripts.
+
+Every export, with its signature, options and defaults, is in the API reference generated from the source: [`@intutic/clawde`](/reference/sdk/clawde/) and [`intutic_clawde`](/reference/sdk/python/intutic_clawde/).
+
+## Installation
+
+### TypeScript SDK
+Install the open-core client SDK directly into your agent scripts or tooling harnesses:
+
+```bash
+npm install @intutic/clawde
+```
+
+### Python SDK
+Install the open-core Python SDK equivalent:
+
+```bash
+pip install intutic-clawde
+```
+
+**Requires Python 3.10 or newer.** The floor was 3.9 through 1.6.3. It moved
+because the patched releases of `requests` and `urllib3` — which carry fixes for
+CVE-2026-25645, CVE-2026-44431 and CVE-2026-44432 — themselves require 3.10, so
+supporting 3.9 would have meant pinning known-vulnerable transports. Python 3.9
+reached end of life in October 2025.
+
+The `autogen` and `smolagents` extras require Python 3.11: both pull in Pillow,
+and the patched Pillow (13.0.0) needs 3.11. There is no `crewai` extra, because
+every crewai release pins a vulnerable `uv`. Install crewai alongside the SDK:
+`pip install intutic-clawde crewai`.
+
+---
+
+## Architecture & Primitives
+
+`ClawdeClient` is a data-plane client for the local Intutic proxy. `chat()` sends an OpenAI-format request to the proxy's `/v1/chat/completions` route, which governs it and forwards it to the provider.
+
+```
+[Agent Script] ──> [ClawdeClient] ──> [Local Proxy (port 4000)] ──> [LLM API]
+```
+
+The proxy address is `baseUrl` (`base_url` in Python), then `INTUTIC_BASE_URL`, then `http://localhost:4000`. Each attempt times out after 30 seconds. A transport failure, a timeout or a 5xx answer is retried twice; `timeout` and `retries` change both. A governance refusal and any other 4xx answer are not retried, because the same request would get the same answer.
+
+For pre-execution checks on the tools an agent runs, rather than on its model calls, use the [Tool Gate SDK](/reference/gate-sdk).
+
+### 1. Context Resolution
+`resolveContext()` (`resolve_context()`) builds the context field by field: git branch, Jira ticket, PagerDuty incident, CI pipeline, working directory, workspace and session each come from `~/.intutic/config.json` when that file carries them, and otherwise from `GIT_BRANCH`, `GITHUB_RUN_ID` / `BUILDKITE_BUILD_ID` / `CIRCLE_BUILD_NUM`, `PD_INCIDENT_ID`, the current directory, `INTUTIC_WORKSPACE_ID` and `INTUTIC_SESSION_ID`. The file `intutic init` writes carries none of these fields, so on a machine where it has run the environment variables still apply. The Jira ticket has no environment variable. Pass `autoContext: false` (`auto_context=False`) to make it return an empty object.
+
+`chat()` sends no context headers: the proxy does not read them. What it sends is a session, and the control plane attaches git context to the session.
+
+### 1a. Git context and cost attribution
+Cost per branch, per commit and per pull request is attributed through the session a call is filed under: the control plane copies that session's repository, branch and HEAD commit onto each call it records. On the first `chat()`, the client picks the session it sends as `x-session-id` on every call:
+
+- A session id `resolveContext()` returns (`INTUTIC_SESSION_ID`, as `intutic exec` sets it) is the session that started the process, so its calls go under it unchanged.
+- Otherwise, when the working directory is a git repository and the key is an Intutic virtual key (`vk_…`), the client registers a session (`POST /api/v1/sessions`, harness `clawde_sdk`) carrying the `origin` remote as `host/path` (credentials, port and `.git` removed before it is sent), the branch and the HEAD commit. On a detached HEAD, as CI checks out a pull request, the branch comes from `GITHUB_HEAD_REF`, then from the branch `resolveContext()` returns. It always confirms the key with `GET /api/v1/auth/me` first, even when `INTUTIC_WORKSPACE_ID` or the sync daemon names a workspace, and registers the session in the workspace the key belongs to. The repository is sent only to a control plane that accepted the key, and a provider key is never sent there at all.
+
+The control plane is `controlPlaneUrl` (`control_plane_url`), then `INTUTIC_CONTROL_PLANE_URL`; this release has no default control plane. With neither set, the client registers no session and sends none, and its calls are filed under **No git context**. Registration is best effort: if the control plane cannot be reached or refuses, the call goes ahead without a session and is filed under **No git context**, and the client does not try again. The session holds the repository, branch and commit as they were at the first call. Pass `autoContext: false` (`auto_context=False`) to register nothing and send no session. See [Cost per branch and commit](/guide/budgets#cost-per-branch-and-commit) for how the figures are built.
+
+The TypeScript client sends the agent-graph headers the proxy uses for [graph guardrails](/guide/graph-guardrails) (`X-Intutic-Graph-Id`, `X-Intutic-Node-Id`, `X-Intutic-Parent-Session`, `X-Intutic-Depth`). They are inherited from `INTUTIC_GRAPH_ID`, `INTUTIC_NODE_ID` and `INTUTIC_DEPTH`, so an agent started by another agent is recorded as its child; pass `graphIdentity` to set them yourself.
+
+### 2. Budget Check
+`checkBudget(model, estimatedTokens)` (`check_budget(model, estimated_tokens)`) calls the control plane's `GET /api/v1/budget` and returns `{ allowed, remaining_usd, reason? }`. `allowed` is `remaining_usd > 0` for the whole workspace: the control plane has no per-call estimate, so `model` and `estimatedTokens` only key a 30-second cache. The control-plane address is `controlPlaneUrl` (`control_plane_url`), then `INTUTIC_CONTROL_PLANE_URL`; this release has no default control plane. With no control plane to reach, it throws `ClawdeConnectionError`.
+
+### 3. Circuit Breaker
+`circuitBreaker(toolName, options)` (`circuit_breaker(tool_name, ...)`) returns a runner: call it with a function and that function runs immediately, behind the breaker.
+
+- `requireBudget` (`require_budget`), default `false`: the breaker runs `checkBudget` first and throws `ClawdeVerdictError('kill', ...)` if the workspace has no budget left. This is a workspace-level check, not a per-call cost ceiling: nothing reports what a call will cost before it is made.
+- `failOpen` (`fail_open`), default `false`: when `true`, a budget check that cannot be made (the control plane is unreachable) is skipped, and an error from the function, a governance refusal included, is swallowed and the runner returns `null` (`None`). A budget check that answers with no budget left refuses the call either way. When `false`, a `ClawdeBlockedError` from `chat()` propagates unchanged.
+- `maxCostUsd` (`max_cost_usd`) is deprecated: any value turns the budget check on, exactly like `requireBudget`, and the amount is ignored. Python emits a `DeprecationWarning`. `sensitivityTier` (TypeScript only) is deprecated and ignored. Both will be removed in the next major version.
+
+### 4. Anthropic Requests (TypeScript only)
+`provider: 'anthropic'` converts the OpenAI-style `chat()` parameters to an Anthropic Messages body, sends it to the proxy's `/v1/messages` route with the key in `x-api-key`, and converts the reply back to the OpenAI shape. `normalizeRequest()` and `normalizeResponse()` are exported for direct use.
+
+### 5. Verdicts and Errors
+A response that comes back carries `verdict: 'allow'`: the proxy let the request through. Every governance refusal the proxy can give has a stable code. `chat()` recognises each one, fires the matching [event](#events), and throws `ClawdeBlockedError` without retrying:
+
+| Status | Code | `verdict` | Meaning |
+|---|---|---|---|
+| 403 | `policy_denied` | `kill` | A policy, anomaly detector or custom WASM rule blocked the request |
+| 403 | `model_not_allowed` | `kill` | The model is not on the approved-models list |
+| 403 | `LOOP_RUN_TERMINATED` | `kill` | The loop run this request belongs to has stopped |
+| 403 | `LOOP_RUN_PENDING_REVIEW` | `hold` | The loop run is paused until a reviewer approves or rejects it |
+| 403 | `NODE_KIND_DENIED` | `kill` | The request breaks its graph node's kind: a `code` node made a model call, or a child of a `worker` or `gate` node did (`node_kind:`, `x-intutic-node-kind`) |
+| 403 | `policy_held` | `hold` | A Rego or WASM rule held the request for approval; the error names the hold id |
+| 409 | `policy_reask` | `reask` | Revise the approach and try again; repeated attempts escalate to `policy_denied` |
+| 403 | `GOVERNANCE_UNAVAILABLE` | `kill` | A governance check could not complete. Either a custom WASM or Rego rule reached no verdict (its deadline, its instruction budget, an error, or a result that is not a verdict): refused whatever the proxy's fail setting, and refused again if the same request is retried, the message naming the rule. Or, with the proxy failing closed, the workspace's PII detector setting could not be read |
+| 429 | `BUDGET_EXCEEDED` | `kill` | A hard spend budget covering the request (the workspace's, the virtual key's or its member's) does not cover its estimated cost; `error.budget` names it and `Retry-After` says when it resets |
+| 429 | `OVERAGE_HARD_CAP_EXCEEDED` | `kill` | The plan's daily spend cap is reached and the workspace has it set to block |
+| 429 | `RATE_LIMITED` | `kill` | The virtual key's requests-per-minute or tokens-per-minute limit is reached; `Retry-After` says when the next minute starts |
+| 402, or 200 | `COST_GATE_EXCEEDED` | `kill` | The request's estimated cost is over the workspace threshold: 402 on a stream, a 200 answer otherwise |
+| 400 | `dlp_policy_violation` | `kill` | The request contains content the DLP policy blocks |
+| 200 | `TOOL_DENIED` | `kill` | The model called a tool an SOP denies to this agent role; the call was withheld |
+| 200 | `SSO_GROUP` | `kill` | The model called a tool the workspace's SSO group policy does not clear for this member; the call was withheld |
+| 200 | `SQL_GUARD` | `kill` | The model called a shell tool to run destructive SQL against a database the SQL allowlist does not admit; the call was withheld |
+| 200 | `PREREQUISITE_UNMET` | `kill` | The model called a tool a `requires_before` gates and its prerequisite is not met: for `A -> B`, A has not run in the session; for `action:run_tests[ok] -> …`, no test run, the last one failed, its result could not be read, or files changed after it. The call was withheld and the session carries on: do the first step, then retry |
+| 200 | `OUT_OF_SCOPE` | `kill` | The model called a file-changing tool on a path outside `scope_paths` under `scope_paths_mode: enforce`; the call was withheld |
+| 200 | `COMMAND_NOT_ALLOWED` | `kill` | The model called a shell tool with a command outside `allow_commands`, or one that could not be read as plain commands; the call was withheld |
+| 200 | `RESPONSE_UNPARSEABLE` | `kill` | The model's response did not parse while a tool policy was in force, so it was withheld; retrying may succeed |
+| 200 | `OUTPUT_DLP` | `kill` | The model's response held sensitive content that could not be redacted safely, so it was withheld |
+
+`verdict` says what happened to this request, not to the session: `kill` refuses this request or tool call, and for codes such as `PREREQUISITE_UNMET`, `OUT_OF_SCOPE` and `COMMAND_NOT_ALLOWED` the session carries on. Decide what to do next from `code` and the refusal's `scope`, the way a gRPC client treats `FAILED_PRECONDITION`: fix the state it names, then retry.
+
+`ClawdeBlockedError` extends `ClawdeVerdictError` and carries `verdict`, `code`, `status`, `ruleId` (`rule_id`), `retryAfterSeconds` (`retry_after_seconds`) and the proxy's reason as its message. `retryAfterSeconds` is set when the proxy sent `Retry-After` — on `RATE_LIMITED` and `BUDGET_EXCEEDED` — and is how long to wait before the same request can succeed; `chat()` does not wait and retry on its own. The circuit breaker's budget check throws a plain `ClawdeVerdictError`.
+
+**Refusals sent as an error.** A status other than 200 comes with a JSON body, `{"error": {"type": "<code>", "message": "<reason>"}}`. `chat()` matches the status and the code together, so a provider's own 429 or a 403 for a key used against the wrong workspace is not mistaken for a refusal. These carry no `ruleId`.
+
+**Refusals sent as an answer.** The rows with status 200 happen after the model ran: the proxy found something in its reply it will not deliver, such as a tool call an SOP denies, and replaces the reply with an assistant turn that says why. A chat client shows that turn, and an agent reads it as its own previous turn and does not retry the call. Each of these names itself so an SDK does not take it for the model's answer:
+
+- Non-streaming, in two response headers: `x-intutic-refusal: <code>` and `x-intutic-refusal-rule: <rule id>`, for example `TOOL_DENIED` and `deny_tools.Bash`, or `SSO_GROUP` and `sso_group.high_risk.Bash`.
+- Streaming, in an SSE comment line just before the refusal text, because the headers went out before the refusal happened: `: intutic-refusal {"code": "TOOL_DENIED", "rule": "deny_tools.Bash", "message": "…"}`. Every SSE parser skips comment lines, so clients that do not look for it are unaffected.
+
+**Where to retry.** A refusal can say what it concerns, so an agent can retry outside it: an error body carries `error.scope` and `error.evidence`, and the stream marker's JSON carries `scope` and `evidence`. `scope` holds any of `paths`, `tools`, `step`, `detector` and `rule` (for `OUT_OF_SCOPE`, the paths outside the scope; for `PREREQUISITE_UNMET`, the gated tool and the `step` it needs first); `evidence` is a list of `{kind, detail}`. Each list holds at most 8 items and each string at most 256 characters, with control characters removed. An OPAQUE workspace sends neither: only the code.
+
+`chat()` reads both. It does not stream, so for a stream you read yourself, pass each line (or the whole body) to `streamRefusal()` (`stream_refusal()`), which returns the refusal or `null` (`None`). `PROXY_REFUSALS`, `REFUSAL_HEADER`, `REFUSAL_RULE_HEADER` and `STREAM_REFUSAL_MARKER` are exported alongside it.
+
+Every other failure throws `ClawdeConnectionError` with the status and response body in its message: an unreachable proxy, a timeout, a 5xx after the retries run out, or a 4xx that is not a refusal, such as a key the proxy does not accept. A 5xx the proxy already [retried upstream](/guide/intelligent-routing#retries-and-fallbacks) (it carries `x-intutic-upstream-attempts`) throws at once rather than being retried again from the client.
+
+**Upstream retries.** When the proxy needed more than one provider call for an answer, the response carries `upstream`: `{ attempts, fallbackFrom? }` (`{"attempts", "fallback_from"}` in Python), read from the `x-intutic-upstream-attempts` and `x-intutic-upstream-fallback-from` headers. `fallbackFrom` names the model whose retries ran out when a fallback target answered; the response's `model` names the one that did. Absent on the ordinary single-call response. `UPSTREAM_ATTEMPTS_HEADER` and `UPSTREAM_FALLBACK_HEADER` are exported.
+
+`budgetRemainingUsd` and `budgetPctUsed` are deprecated and never set; the proxy does not report budget on responses. Use `checkBudget()` instead.
+
+### 6. Decide questions
+`decide(state, questions, opts)` (`decide(state, questions, when=..., ...)` in Python, from `intutic_clawde`) asks a self-hosted model a few narrow yes/no or pick-one questions about a piece of text, written as a [decide rule](/guide/decide)'s `questions`, and returns each answer's probability and its three-valued reading; with a `when` it also returns the outcome the rule would reach. The engine comes from `~/.intutic/decide/engine.json` and the `INTUTIC_DECIDE_*` variables unless the options name one, and its host must pass the self-hosted guard: a hosted decision API is refused before anything is sent. Questions a decide rule would refuse throw `TypeError` (`ValueError`); an engine that is not configured, is refused or cannot answer in time throws `DecideEngineError`, whose `code` says which. It needs no proxy and no control plane. See [In your own agent: `decide()`](/guide/decide#in-your-own-agent-decide).
+
+---
+
+## Code Examples
+
+### TypeScript Example
+
+```typescript
+import { ClawdeBlockedError, ClawdeClient, ClawdeConnectionError, ClawdeVerdictError } from '@intutic/clawde'
+import type { ChatResponse } from '@intutic/clawde'
+
+const client = new ClawdeClient({
+  apiKey: process.env.INTUTIC_API_KEY!,
+  baseUrl: 'http://127.0.0.1:4000',
+  provider: 'anthropic',
+})
+
+// A runner that wraps one action; calling it runs the action now
+const runDeployCheck = client.circuitBreaker<ChatResponse>('deploy_check', {
+  requireBudget: true, // needs a control plane
+  failOpen: false,
+})
+
+try {
+  const response = await runDeployCheck(() =>
+    client.chat({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: 'Run the deploy checklist' }],
+    }),
+  )
+  console.log(response.choices[0]?.message.content)
+} catch (err) {
+  if (err instanceof ClawdeBlockedError) console.error(`Refused (${err.verdict}, ${err.code}): ${err.message}`)
+  else if (err instanceof ClawdeVerdictError) console.error(`Circuit breaker tripped: ${err.message}`)
+  else if (err instanceof ClawdeConnectionError) console.error(`Request failed: ${err.message}`)
+  else throw err
+}
+```
+
+### Python Example
+
+```python
+import os
+
+from intutic_clawde import ClawdeBlockedError, ClawdeClient, ClawdeConnectionError, ClawdeVerdictError
+
+client = ClawdeClient(api_key=os.environ["INTUTIC_API_KEY"])
+
+def run_deploy():
+    return client.chat(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "compile build"}],
+    )
+
+try:
+    # Calling the runner runs run_deploy now, behind the breaker
+    res = client.circuit_breaker("deploy_production_tool", require_budget=True)(run_deploy)
+    print(res["choices"][0]["message"]["content"])
+except ClawdeBlockedError as e:
+    print(f"Refused ({e.verdict}, {e.code}): {e}")
+except ClawdeVerdictError as e:
+    print(f"Circuit breaker tripped: {e}")
+except ClawdeConnectionError as e:
+    print(f"Request failed: {e}")
+```
+
+---
+
+## Control-Plane Management (`ControlPlaneClient`)
+
+Everything above (`ClawdeClient`) is a **data-plane** client: it wraps the local proxy for chat calls. `ControlPlaneClient` is a separate, optional class for the **operator** APIs the [CLI](/reference/cli) exposes: org and workspace setup, gateways, settings and provider credentials, the MCP registry, notification rules, SIEM destinations, usage, the AI inventory, compliance evidence, policy guardrails, held decisions and loop runs, incidents, findings, traces, trace integrity, WASM rules and SOPs. Both SDKs have the same methods, camelCase in TypeScript and snake_case in Python, so the same work can run from code (infra-as-code, a secrets-manager sync job, a nightly compliance export, provisioning a workspace per tenant in your own product built on Intutic).
+
+It talks to the **control plane** — the one you name with `baseUrl` (`base_url`), else `INTUTIC_CONTROL_PLANE_URL` — not the proxy: a different origin from `ClawdeClient`'s `baseUrl`, so it takes its own. There is no default: without either, the constructor throws (Python raises `ValueError`). Every method is a direct HTTP call with no hosted-vs-self-hosted branching, so it works unmodified against either. It needs a control plane to talk to: an open-core deployment with no control plane configured simply won't have anything to call.
+
+Auth: the same `apiKey` you already pass to `ClawdeClient` — a `vk_...` virtual key or a login JWT. Each call needs the role the CLI command needs: approving an MCP server, writing a SIEM destination or collecting evidence takes OWNER or ADMIN, workspace-wide usage and the whole machine inventory take OWNER, ADMIN or EM, and a DEVELOPER sees only their own usage and machines.
+
+### TypeScript
+
+```typescript
+import { ControlPlaneClient, verifyEvidenceArchive } from '@intutic/clawde';
+
+const cp = new ControlPlaneClient({
+  apiKey: process.env.INTUTIC_API_KEY!,
+  baseUrl: process.env.INTUTIC_CONTROL_PLANE_URL, // required: without it (or the variable), the constructor throws
+});
+
+const { servers, pendingCount } = await cp.listMcpServers();
+await cp.approveMcpServer(servers[0].serverId);
+const usage = await cp.getMemberUsage({ period: 'daily' });
+
+// Seal this month's evidence, then check the archive offline
+const { runId } = await cp.collectEvidence({ periodStart: '2026-10-01' });
+const archive = JSON.parse(new TextDecoder().decode(await cp.downloadEvidence(runId)));
+const check = verifyEvidenceArchive(archive, await cp.getSigningKeys());
+if (!check.verified) throw new Error(`evidence not verified: ${check.signature}`);
+```
+
+### Python
+
+```python
+import json
+import os
+
+from intutic_clawde import ControlPlaneClient, verify_evidence_archive
+
+# base_url, else INTUTIC_CONTROL_PLANE_URL; with neither, ValueError (there is no default)
+cp = ControlPlaneClient(api_key=os.environ["INTUTIC_API_KEY"], base_url=os.environ.get("INTUTIC_CONTROL_PLANE_URL"))
+
+registry = cp.list_mcp_servers()
+cp.approve_mcp_server(registry["servers"][0]["serverId"])
+usage = cp.get_member_usage(period="daily")
+
+run = cp.collect_evidence(period_start="2026-10-01")
+archive = json.loads(cp.download_evidence(run["runId"]))
+check = verify_evidence_archive(archive, cp.get_signing_keys())
+assert check["verified"], check["signature"]
+```
+
+### Arguments and answers
+
+A method takes the ids it acts on as positional arguments, then its optional settings: one options object in TypeScript (`getMemberUsage({ period: 'daily' })`), the same names in snake_case as keyword arguments in Python (`get_member_usage(period="daily")`). A request body with several fields, such as a notification rule, a SIEM destination or an authored guardrail, is passed whole, with the keys the route takes (`createNotificationRule({ eventType, channel, channelConfig })`, `create_notification_rule({"eventType": ..., ...})`).
+
+Answers are the route's JSON, typed: TypeScript interfaces, Python `TypedDict`s, both with the route's own key names. A list that is the whole answer comes back as the list (`listNotificationRules()` returns the rules); an answer with more than rows comes back whole (`listMcpServers()` also returns the default policy and the pending count). `download…` methods return the file's bytes (`Uint8Array`, `bytes`): a coverage report (`json`, `md`, `csv` or `pdf`), an inventory CSV, an evidence archive.
+
+A call that fails throws (raises) `ClawdeConnectionError` with the method, path, status and the control plane's answer in its message. A 403 that names the roles allowed reads as that sentence, as the CLI prints it: `Control plane POST /api/v1/mcp/servers/mcp_1/status refused (403): Requires the OWNER or ADMIN role`. The integrity chain walks (`getIntegrityChain`, `getIntegrityConfigChain`) return the walk whether or not it found a break.
+
+`verifyEvidenceArchive(archive, jwks)` (`verify_evidence_archive`) checks an evidence archive offline, as the CLI's evidence check does: the manifest's section hashes, the whole-archive hash, then the Ed25519 signature against the published key its `keyId` names. `verified` is true only when the hashes match and a published key accepts the signature; an unsigned archive, or one whose key is not published, is reported but not verified. Pass `null` (`None`) for `jwks` when the keys cannot be had.
+
+`verifyIntegrityRoot(root, jwks)` (`verify_integrity_root`) checks a sealed trace root's signature offline, as the CLI's integrity check does: it rebuilds the bytes the control plane signed from the root's own fields, under the preimage version the root records, and checks the Ed25519 signature against the published key its `signing_key_id` names. Pass the `root` of `getIntegrityRoot()`. It answers `valid`, or `invalid` when that key rejects the signature, which is the only answer that says the root changed. `unsigned` means no signing key was configured when the root was sealed; `unverifiable` means the key is not published, or the root names an algorithm or preimage version this SDK cannot check; `keys_unavailable` means `jwks` was `null` (`None`). `recomputeIntegrityRoot()` checks the other half, whether the stored traces still hash to the root.
+
+```typescript
+import { verifyIntegrityRoot } from '@intutic/clawde';
+
+const { root } = await cp.getIntegrityRoot(rootId);
+const signature = verifyIntegrityRoot(root, await cp.getSigningKeys()); // 'valid' | 'invalid' | …
+const { verdict } = await cp.recomputeIntegrityRoot(rootId);            // 'match' | 'mismatch' | 'missing_traces'
+```
+
+In Python both signature checks need the `cryptography` package: `pip install 'intutic-clawde[compliance]'`.
+
+### What's covered
+
+Every method, with the route it calls, is in the API reference generated from the source: [`ControlPlaneClient`](/reference/sdk/clawde/classes/ControlPlaneClient) in TypeScript and [`ControlPlaneClient`](/reference/sdk/python/intutic_clawde/#controlplaneclient) in Python. The areas are identity and org setup, gateways, settings and provider credentials, the MCP server registry, notifications, SIEM export, task-management connections (Jira, Linear, PagerDuty), usage, the AI inventory, compliance, gate liveness and the GitHub webhook, policy guardrails, held decisions and loop runs, incidents, findings and traces, trace integrity, WASM rules, SOPs, the SOP Optimizer's approval mode, and keys, cost and routing. The CLI command for each operation is in the [CLI reference](/reference/cli).
+
+Cloud providers take several fields. AWS Bedrock takes `awsRegion` with either `awsAccessKeyId` and `awsSecretAccessKey` or a Bedrock `apiKey`; Google Vertex AI takes `projectId`, `serviceAccountJson` and an optional `location`; Azure OpenAI takes `endpoint` and `apiKey`:
+
+```typescript
+await cp.setProviderCredential('bedrock', { awsRegion: 'us-east-1', apiKey: process.env.BEDROCK_API_KEY! });
+await cp.setProviderCredential('vertex_ai', {
+  projectId: 'my-project',
+  location: 'global',
+  serviceAccountJson: fs.readFileSync('sa.json', 'utf8'),
+});
+await cp.setProviderCredential('azure_openai', { endpoint: 'https://my-resource.openai.azure.com', apiKey: process.env.AZURE_OPENAI_API_KEY! });
+```
+
+A chat call then names the model with the provider's prefix — `bedrock/anthropic.claude-opus-4-7`, `vertex/gemini-2.5-pro`, `azure/<deployment>` — through `ClawdeClient` unchanged. See [AWS Bedrock](/integrations/aws-bedrock), [Google Vertex AI](/integrations/google-vertex-ai) and [Azure OpenAI](/integrations/azure-openai).
+
+`listProviderModels` (`list_provider_models`) returns `{ provider, models, checkedAt }`: the model ids the stored key can reach, as the provider listed them when the key was last checked. Both are `null` until a check has recorded a list, and stay `null` for Azure OpenAI, AWS Bedrock and Google Vertex AI, which have none.
+
+`getGatewayStatus` (`get_gateway_status`) reports `appliedConfigVersion`, the config version the gateway said it runs in its last heartbeat (`null` when it is unreachable or has not reported one), beside `desiredConfigVersion`, the version the latest config change produced. `getGatewayConfig` (`get_gateway_config`) returns the flags set on the gateway and that version, readable by any member of the gateway's org.
+
+`updateWorkspaceSettings({ key: value })` (`update_workspace_settings({...})`) is the route the CLI's workspace-settings command calls: only the keys given change, and the control plane applies the same checks. An unknown key or a bad value is refused with a 400 that names it, a setting the plan does not include with a 403 `Upgrade required`, and a member below OWNER or ADMIN with a 403. Each refusal throws (raises) `ClawdeConnectionError` with the server's answer in its message. See [Workspace settings](/reference/workspace-settings) for every key, its type and what it does.
+
+`getOptimizerSettings` (`get_optimizer_settings`) and `updateOptimizerSettings` (`update_optimizer_settings`) read and set the [SOP Optimizer](/guide/metaclaw#what-auto-apply-applies)'s approval mode, as the CLI's optimizer command does: `{ workspaceId, mode, autoThreshold }`, where `auto` lets a manually triggered optimizer run apply a `STRENGTHEN` proposal scoring at least `autoThreshold` (0 to 1) without review. `updateOptimizerSettings({ mode, autoThreshold })` (`update_optimizer_settings(mode, auto_threshold=...)`) needs the OWNER or ADMIN role; the route sets an omitted threshold to 0.85, so pass the current one to keep it.
+
+
+`signupOrg` is unauthenticated and needs `acceptTerms: true` (`accept_terms=True`): the caller is 18 or older and agrees to the Terms and the Privacy Policy. A self-hosted control plane always refuses it, and the hosted one only accepts it with `INTUTIC_PUBLIC_ORG_SIGNUP=true`, so create orgs with `startDomainVerification`, `checkDomainVerification` and `createOrg`: publish the returned TXT record, poll until `status` is `verified`, then create the org with that `verificationId`.
+
+`listIncidents` filters by `status`, `severity`, `type` (an [incident type](/guide/concepts#incident-types); the control plane refuses one it does not know), `page` and `limit`, and returns the page ranked by review priority with `meta` (the total and the review budget). A page of 20 incidents or more arrives TOON-encoded and is decoded before it is returned, with each cell cut at 120 characters: `getIncident` returns a long description whole. `listTraces` takes `since` as an ISO 8601 time or a duration such as `24h`; a page of 20 traces or more arrives TOON-encoded and is decoded before it is returned, with any cell longer than 120 characters cut short as the control plane sent it. `getRuleCandidateSource` refuses a source that does not hash to the `sourceSha256` served with it.
+
+`listApiKeys` (`list_api_keys`), `createApiKey` (`create_api_key`), `updateApiKey` (`update_api_key`) and `revokeApiKey` (`revoke_api_key`) manage API keys and their [scopes](/reference/api#api-key-scopes), as the CLI's key commands do. `createApiKey(label, { scopes, expiresInDays, allowedModels, isServiceAccount })` (`create_api_key(label, scopes=..., expires_in_days=..., allowed_models=..., is_service_account=...)`) returns the plaintext `key` once; it is never stored. `updateApiKey(keyId, { scopes, budgets, rateLimit })` (`update_api_key(key_id, scopes=..., budgets=..., rate_limit=...)`) needs the OWNER or ADMIN role and changes only what it is given. An unknown scope is refused with a 400 naming the valid ones.
+
+Not covered, on purpose: session establishment (supply `apiKey` directly; `ClawdeClient` registers its own session), budgets (`intutic budget`; `checkBudget()` above reads the workspace's), and commands that act on the machine they run on: `init`, `setup`, `status`, `doctor`, `daemon` (and `install-daemon`), `gates install`, `env`, `disconnect`, `exec`, `start`, `chaos`, `rollback`, `enforce`, `rules`, `skill`, `traces` with no credentials (it reads this machine's proxy trace log), and `policy compile` (without `--candidate`), `test`, `install` and `list-local`.<!-- ENTERPRISE_ONLY_START --> With a control plane the list also takes in `login`/`logout`, `enterprise install`, `connect`, `sync-context`, `decisions-log-refresh`, `judge`, `sops status`, `guardrails pull` and `policy snapshot`.<!-- ENTERPRISE_ONLY_END -->
+
+---
+
+## Events
+
+Register callbacks for the refusal verdicts: `kill`, `reask` and `hold`. `chat()` calls them before it throws `ClawdeBlockedError`, with `{ verdict, code, status, message }`, plus `ruleId` (`rule_id` in Python) when the proxy names the rule that decided and `retryAfterSeconds` (`retry_after_seconds`) when it sent `Retry-After`.
+
+`hijack`, `enhance` and `bypass` are still accepted so existing code keeps working, but they never fire: the proxy applies those verdicts inside the response and does not report them to the client. They will be removed in the next major version.
+
+### TypeScript
+```typescript
+client.on('reask', (event) => {
+  console.warn(`Asked to revise (${event.code}): ${event.message}`)
+})
+
+client.on('kill', (event) => {
+  console.error(`Blocked by policy (${event.code}): ${event.message}`)
+})
+```
+
+### Python
+```python
+client.on("reask", lambda event: print(f"Asked to revise ({event['code']}): {event['message']}"))
+client.on("kill", lambda event: print(f"Blocked by policy ({event['code']}): {event['message']}"))
+```

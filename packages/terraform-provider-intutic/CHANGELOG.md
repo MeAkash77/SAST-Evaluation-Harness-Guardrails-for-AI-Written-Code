@@ -1,0 +1,117 @@
+## 0.7.1 (October 19, 2026)
+
+BUG FIXES:
+
+* resource/intutic_workspace_settings: `loop_review` is managed field by field, as `featureFlags` is. The control plane merges it field by field since 3.0, so when the workspace stored a field the configuration did not name (set elsewhere, or removed from the configuration), every plan showed a change that no apply could clear. A configuration now manages only the `loop_review` fields it names, and sends only those that changed.
+
+## 0.7.0 (October 19, 2026)
+
+FEATURES:
+
+* resource/intutic_guardrail: `kind = "decide"`, a rule that asks a self-hosted model a few narrow `yes_no` or `choice` questions about a tool call (`on = "tool_call"`, with `tools`) or a response (`on = "response"`), and combines the answers with `when`: true refuses, false allows, unknown escalates (`escalate`: `ask`, `review` or `refuse`). New attributes `rule_id` (the IR's `id`), `on`, `questions` and `band` (JSON, written with `jsonencode`), `when`, `escalate`, `rollout` (`shadow` or `enforce`) and `context`; `title` and `tools` take a decide rule's values too. The plan checks the rule exactly as every gate, SDK and the gateway do, with the same first failure and reason text: the shape, then `tools` against `on`, `context`, the question count, each band, the `when` grammar, the names and options `when` uses, that every question is used, and that no question asks about approval. The provider runs the shared decide vectors, so its validation and rule hash agree with the TypeScript, Python and Rust ports.
+* resource/intutic_guardrail: `requires_before` accepts `first = "action:run_tests[ok]"`: the `then` action needs a passing test run in the session, not just any run. A later file change makes the pass stale.
+* resource/intutic_guardrail: the action tokens `action:migrate`, `action:prod_write`, `action:destroy`, `action:force_push` and `action:payment` are accepted wherever an action token is.
+* resource/intutic_workspace_settings: `settings` accepts the keys `closedLanes`, `revertLane`, `decideAutoPromote`, `decideLogUploadEnabled` and `decideLogUploadArgs`.
+* resource/intutic_notification_rule: `event_type` accepts `decide.drift`, `decide.canary_failed` and `decide.promotion_ready`.
+* resource/intutic_provider_credential: `provider_id` accepts the decision-model providers `typesafe` and `fastino`, which take `apiKey`.
+
+## 0.6.0 (October 16, 2026)
+
+BREAKING CHANGES:
+
+* provider: there is no default `endpoint`. Only the open core is released, so the provider no longer falls back to a hosted control plane: set `endpoint` or `INTUTIC_CONTROL_PLANE_URL`. Without either, it reports "Missing control-plane endpoint" (with the missing-key error, when both are absent).
+
+ENHANCEMENTS:
+
+* Resource and data-source descriptions no longer name plans.
+
+## 0.5.0 (October 15, 2026)
+
+BREAKING CHANGES:
+
+* resource/intutic_notification_rule: `event_type` no longer accepts `incident.escalated`, `sop.status_changed`, `session.ended` or `calibration.threshold_breach`. Nothing emitted them, so a rule on one never fired; the API refuses them and the control plane's migration deletes existing rules on them. Remove such rules from your configuration before upgrading.
+
+FEATURES:
+
+* **New Resource:** `intutic_sop_optimizer_settings`: the SOP Optimizer's Approval mode (`mode`, `manual` or `auto`, and `auto_threshold`), through `GET` and `PUT /api/v1/dream-cycle/settings`. It brings back under Terraform the auto-apply switch that 0.3.0 removed with `featureFlags.ff_metaclaw_auto_apply`. An omitted `auto_threshold` keeps the workspace's current one; destroying the resource sets the mode back to `manual`.
+* **New Resource:** `intutic_task_connection`: a Jira Cloud, Linear or PagerDuty connection (`task_provider`, `base_url`, `project_key`, `account_email` for Jira, and a sensitive `api_token`), through `/api/v1/task-management/connections`. The API tests the token with the provider before saving and never returns it, so it is kept in state as configured. The API has no update: changing any argument replaces the connection, and the first apply after an import replaces it with the configured token. A Jira connection without `account_email`, or `account_email` on another provider, fails at plan time.
+
+ENHANCEMENTS:
+
+* resource/intutic_notification_rule: accepts the event types `plan.rejected` and `plan.closed`, which the control plane sent and no rule could name.
+
+BUG FIXES:
+
+* resource/intutic_virtual_key: an OWNER or ADMIN other than the member whose credentials created a key keeps it in state and revokes it on destroy. The refresh read only the calling member's keys, so it dropped such a key from state and destroy never revoked it; it now also finds the key among the workspace's live keys (`GET /api/v1/budget/keys`), and the control plane lets an OWNER or ADMIN revoke any live key in the workspace.
+
+## 0.4.0 (October 14, 2026)
+
+BREAKING CHANGES:
+
+* resource/intutic_policy: removed, along with the control plane's policies API (`/api/v1/policies`). No gate or proxy ever enforced a policy's per-tool fields. Write per-tool rules as `intutic_guardrail` with `kind = "hook_rule"` (`tools`, `arg_contains`, `arg_not_contains`), which the harness gates enforce once the guardrail is promoted through review, and set the intervention mode with the `interventionMode` key of `intutic_workspace_settings`. Before upgrading, delete every `intutic_policy` block from your configuration and run `terraform state rm` on each one: this version no longer knows the resource type, so a configuration or state that still holds one fails to plan.
+
+ENHANCEMENTS:
+
+* resource/intutic_notification_rule: accepts the event types `billing.dunning.downgraded` (the third failed payment moved the account to the free plan) and `billing.dunning.restored` (the overdue payment was made and the plan is back).
+* resource/intutic_workspace_settings: the `interventionMode` key is the only source of the workspace's intervention mode; a workspace that has not set it uses `TRANSPARENT`. Before, a workspace without the setting took the mode of its lowest-priority active policy.
+
+BUG FIXES:
+
+* resource/intutic_sop: `risk_tier`, `complexity_tier`, `version_counter` and `content_hash` read as null when the API sends none. A SOP written without tiers (the SOP health check writes none) imported with `risk_tier = ""` and `complexity_tier = ""`, and a SOP without a version counter was updated with `version_counter = 0`, which the API refuses; an update now sends no counter when there is none.
+
+## 0.3.0 (October 14, 2026)
+
+BREAKING CHANGES:
+
+* resource/intutic_workspace_settings: `featureFlags.ff_metaclaw_auto_apply` is no longer accepted; the plan fails validation naming it, and the API refuses it. The control plane removed the flag and carried each workspace's value over to the SOP Optimizer's Approval mode, which is now the only switch for its auto-apply. Remove the flag from your configuration before upgrading.
+ENHANCEMENTS:
+
+* resource/intutic_virtual_key: `scopes` is validated against the control plane's scope registry (`*`, `gateway:use`, and `<area>:read` / `<area>:write` for each REST area) at plan time, and its description says what each kind grants. The control plane now enforces scopes: a request with a key needs both its owner's role and a scope covering the route, and LLM traffic through the proxy needs `gateway:use`. A key with the default `["*"]` is unaffected. A configuration naming a scope outside the registry, which the API used to store and ignore, now fails at plan time.
+
+DEPRECATIONS:
+
+* resource/intutic_policy: deprecated. The policies API is deprecated as of control-plane 2.5.1 and sunsets on 2026-12-01; its responses carry `Deprecation` and `Sunset` headers, and `terraform plan` warns on every `intutic_policy`. Write per-tool rules as `intutic_guardrail` with `kind = "hook_rule"` (`tools`, `arg_contains`, `arg_not_contains`), which the harness gates enforce once the guardrail is promoted through review, and set the intervention mode with the `interventionMode` key of `intutic_workspace_settings`. `intutic policy convert <id>` turns an active `KILL` or `REASK` policy into a `hook_rule` guardrail in `SHADOW`.
+* resource/intutic_policy: `target_tool_pattern`, `enforcement_action`, `conditions` and `risk_category` are deprecated. No gate or proxy reads them, so a policy blocks no tool call; the resource description no longer says the proxy acts on matching calls.
+* resource/intutic_policy: `priority` and `intervention_mode` are deprecated. A policy's only effect is that the active one with the lowest `priority` sets the workspace's intervention mode. The `interventionMode` workspace setting replaces this and wins once set; a workspace that has not set it falls back to the policy until control-plane 2.6.0. The control plane copies each workspace's current mode into the setting, so nothing changes on upgrade.
+
+ENHANCEMENTS:
+
+* resource/intutic_policy: `target_tool_pattern` and `enforcement_action` are optional, defaulting to `*` and `BYPASS` (the API still requires both; neither has any effect). Removing either from a configuration plans an update to the default; convert a `KILL` or `REASK` policy first, since conversion reads them.
+* resource/intutic_workspace_settings: accepts the `interventionMode` key (`TRANSPARENT`, `OPAQUE` or `SILENT_LOG`), the workspace's intervention mode.
+
+ENHANCEMENTS:
+
+* resource/intutic_workspace_settings: accepts `storeToolArguments`, the opt-in for keeping tool-call argument values (redacted) in the replay contexts the proxy samples onto traces. Off by default.
+
+BUG FIXES:
+
+* resource/intutic_notification_rule: `filter_severity` is validated against the severities events carry (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`), in any case. Lowercase values, as the example used to show, were stored as written and matched no event, so the rule never fired; the control plane now stores them uppercase and has uppercased existing rules. A configured list that differs from the stored one only in case plans no change. A value that is not a severity now fails at plan time.
+* resource/intutic_mcp_server_decision: an imported decision whose configuration leaves `disabled_tools` unset plans clean. Import used to record the server's tool switches as managed, so the first plan showed an in-place update removing them. `disabled_tools` now always shows the tools switched off on the server; unset still leaves the switches alone. Destroy re-enables the tools the configuration switched off, as before, but not tools switched off before an import.
+* resource/intutic_workspace_budget: importing an id other than the provider key's workspace fails with "Wrong workspace", as `intutic_workspace_settings` does. It used to succeed and manage the key's workspace under the wrong id.
+* resource/intutic_workspace_settings, resource/intutic_workspace_budget: applying both in one run no longer fails with "Provider produced inconsistent result after apply". The control plane wrote the two changes to the same settings record at once and kept only one; it now applies them one after the other.
+* provider: an API refusal shows its explanation. A 403 names the roles the route allows in `detail`, which the provider did not read, so a missing role showed as a bare `Forbidden`.
+
+NOTES:
+
+* resource/intutic_member_budget: the example and import command use a real member id shape, `mbr_…`; they showed `mem_…`, which no member has.
+
+NOTES:
+
+* resource/intutic_sop: editing a SOP past `DRAFT` no longer retires the version you edited. The API keeps that version enforcing until the new `DRAFT` version is promoted to `VALIDATED`; the resource tracks the new version as before. The schema is unchanged.
+
+## 0.2.0 (October 13, 2026)
+
+BREAKING CHANGES:
+
+* resource/intutic_notification_rule: `event_type` no longer accepts `ssl.enforcement.violation`, `context_gap.auto_injected` or `adapter.write_back.failed`. Nothing ever sent these events, so a rule on one could never deliver; the API refuses new rules on them and the control plane deletes existing ones. Remove such rules from your configuration before upgrading, or the plan fails validation.
+
+NOTES:
+
+* resource/intutic_policy: the `intervention_mode` description says what each mode does: `TRANSPARENT` names the rule, `OPAQUE` refuses the same calls with a generic sentence while audit records keep the rule, and `SILENT_LOG` applies to the local hook gates only. The schema is unchanged.
+
+## 0.1.0 (October 11, 2026)
+
+FEATURES:
+
+* **New Resources:** `intutic_sop`, `intutic_policy`, `intutic_guardrail`, `intutic_workspace_settings`, `intutic_virtual_key`, `intutic_gateway`, `intutic_notification_rule`, `intutic_siem_destination`, `intutic_wasm_rule`, `intutic_provider_credential`, `intutic_mcp_server_decision`, `intutic_workspace_budget`, `intutic_member_budget`
+* **New Data Sources:** `intutic_workspace`, `intutic_members`

@@ -1,0 +1,113 @@
+packages:
+  - 'packages/*'
+  - 'services/*'
+  - 'tools/*'
+  - 'apps/*'
+allowBuilds:
+  # workflow (gate-js devDep) CLI transitive; its native-binding postinstall is
+  # not needed to import the package's dist JS in tests — build denied.
+  '@swc/core': false
+  argon2: true
+  # same chain (workflow -> @workflow/world-vercel -> cbor-x); denied likewise.
+  cbor-extract: false
+  esbuild: true
+  protobufjs: true
+
+# 24h cooldown before a newly-published package version is installable —
+# was only pnpm 11.6.0's inherited default until now, so a pnpm major bump
+# or a differently-provisioned runner could silently alter or remove the
+# guard every exclude entry below assumes is active. Declared explicitly so
+# it survives pnpm upgrades and stays visible to reviewers.
+minimumReleaseAge: 1440
+
+minimumReleaseAgeExclude:
+  # eve@0.71.0 (published 2026-10-03; first verified at 0.39.1) is the exact
+  # version @intutic/gate/eve's shipped-d.ts verification was performed
+  # against — a devDependency of packages/gate-js only, never a runtime
+  # dependency. (The AI SDK family it peers on — ai 7.0.127,
+  # @ai-sdk/workflow 2.0.58, @ai-sdk/harness 1.0.138, workflow 5.0.1 — is
+  # older than the 24h window and needs no entry; the old ai@7.0.68 /
+  # harness@1.0.75 / workflow@1.0.69 / gateway / openai entries went with it.)
+  - eve@0.71.0
+  # @truefoundry/trueforge-core@0.1.4 is the exact version @intutic/gate/trueforge's
+  # shipped-d.ts verification (embedded TrueForge, Phase 1) was performed
+  # against — a devDependency of packages/gate-js only, never a runtime
+  # dependency.
+  - '@truefoundry/trueforge-core@0.1.4'
+
+# Transitive-only advisories: nothing in this workspace declares these directly,
+# so forcing resolution is the only way to take the fix. Pinned to the minimum
+# patched version rather than latest, to keep the change as small as the CVE
+# requires. Note these live here and not under a "pnpm" key in package.json —
+# pnpm 11 silently ignores that field.
+#
+# vite: vitepress 1.6.4 (the latest stable) asks for vite ^5.4.14, and no 5.x
+# release carries the 2026-10-20 launch-editor fixes, so every copy below 6.4.4
+# moves to the patched 6.x (override below). Checked 2026-10-21: the docs build
+# on 6.4.4 (6.4.5 since 2026-10-30) renders the same 157 pages as on 5.4.21 (identical once content
+# hashes, Vue scope ids and MathJax ids are masked), and `vitepress dev` serves.
+#
+# (Resolved 2026-07-28: @modelcontextprotocol/sdk moved to ^1.30.0 once it
+# cleared the 24h release-age window, taking @hono/node-server to 2.x and
+# closing GHSA-frvp-7c67-39w9 without any guard exclusion.)
+overrides:
+  brace-expansion: '^5.0.12' # CVE-2026-13149, CVE-2026-14257, + the 2026-08 bypass of the 14257 mitigation; GHSA-6j4f-fj2g-mc7p, GHSA-qhr7-859c-m2p7, GHSA-q2hr-2g5m-vwhr
+  fast-uri: '^3.1.9' # 2026-10-26 advisories (fixed in 3.1.9); earlier: CVE-2026-16221, CVE-2026-13676, + host confusion via backslash authority introducer; CVE-2026-75899/75931/75975/76172 (SSRF via repeated hostname / malformed IPv6, host confusion via IDN + percent-encoded scheme)
+  js-yaml: '^4.3.2' # CVE-2026-59869, CVE-2026-59870 (quadratic !!omap resolution, unfixed in 4.3.0); CVE-2026-84375 (maxTotalMergeKeys did not bound CPU on empty merge sources)
+  # Scoped, not a blanket `nanoid` override: @intutic/control-plane and
+  # @intutic/id depend on nanoid v3 directly (CJS, not vulnerable — the GHSA
+  # range is >=4.0.0 <5.1.16) and nanoid v4+ is ESM-only, which breaks their
+  # CJS build if forced. Only @workflow/core (a transitive of gate-js's
+  # `workflow` devDependency, dev-only, added in A3) pulls a vulnerable v5.1.6.
+  '@workflow/core>nanoid': '^5.1.16' # GHSA-28wg-ghj8-5hjv (non-secure generator can loop indefinitely on a negative size)
+  protobufjs: '^7.6.5' # CVE-2026-59877
+  # Raises the 4.x copies that dependencies of dependencies ask for (gate-js's dev-only @ai-sdk and
+  # workflow trees ask for 4.1 and 4.5). Everything we depend on directly is already on ^4.6.6.
+  'zod@>=4.0.0 <4.6.6': '^4.6.6' # GHSA-mrhx-c7xc-m3w5 (memory exhaustion on oversized constrained collections), fixed in 4.6.6
+  body-parser: '^2.4.0' # 2026-10-26 high-severity advisory (fixed in 2.4.0) — via express 5 (@modelcontextprotocol/sdk, @a2a-js/sdk)
+  '@vitest/mocker': '^4.1.12' # 2026-10-26 advisories (fixed in 4.1.12) — via vitest, dev-only
+  undici: '^7.30.1' # 2026-10-26 advisories (fixed in 7.30.1: one high, two moderate); earlier, 5 GHSAs newly surfaced by @anthropic-ai/sdk's devDep pulling in `workflow`'s undici transitive at scan time: cross-user cache/cookie/response-desync issues + a parse-time crash; GHSA-rfgv-xxqx-mfg5, GHSA-w293-vg96-wgc3 + 8 lower-severity (fixed in 7.29.1)
+  uuid: '^11.1.1' # CVE-2026-41907
+  # @modelcontextprotocol/sdk pins hono ^4.11.4 and resolves it to a version
+  # below the fix. 4.12.31 satisfies that range, so this needs no SDK bump.
+  hono: '^4.13.16' # 2026-11 advisories fixed in 4.13.16: GHSA-46wx-v44x-9hh2, GHSA-4m76-xfj5-7975, GHSA-3gg2-335m-rxc6, GHSA-h7mg-cq63-vhpq, GHSA-4h7h-rv7c-7m2v; earlier: CVE-2026-59895/6/7, + ReDoS in CORS middleware via Access-Control-Request-Headers; CVE-2026-84363/84364/84365 (query parser past the fragment, unbounded dot-notation nesting in parseBody, toSSG incomplete fix); + the 2026-10-20 advisories fixed in 4.13.11
+  # Via @modelcontextprotocol/sdk, which asks for 2.x and resolved 2.1.5.
+  # @daytona/sdk 0.204 (via @truefoundry/trueforge-core, gate-js devDependency, dev-only) asks for ^0.221.0;
+  # 0.223.x is the same 2.x line with the fix. The shipped proxy is already on 0.301.
+  '@daytona/sdk>@opentelemetry/instrumentation-http': '^0.223.2' # GHSA-3v2p-hm54-8qcq
+  '@hono/node-server': '^2.1.6' # GHSA-qv5m-9pm6-hqp3 (unhandled ECONNRESET), GHSA-jpvv-r467-5p4w (backslash parsed as a path separator)
+  qs: '^6.16.0' # CVE-2026-82417 (DoS via attacker-controlled isBuffer), CVE-2026-82562 (array-limit bypass via bracket-key comma parsing)
+  devalue: '^5.9.2' # CVE-2026-81176 (DoS via malformed input)
+  '@grpc/grpc-js': '^1.14.5' # GHSA-m9gg-hp2v-232j, GHSA-f596-whhp-79r4 — via @opentelemetry/sdk-node's OTLP gRPC exporters and @a2a-js/sdk
+  # Optional dependency of @openai/agents-core (gate-js devDependency, dev-only).
+  '@modelcontextprotocol/client': '^2.2.0' # GHSA-6qxp-vccf-f47h
+  ip-address: '^10.7.4' # 2026-10-26 advisory (fixed in 10.7.4); earlier: GHSA-2vr4-cq9g-pvrc, GHSA-rpw4-54j3-4h4q, GHSA-h3mg-xc3c-68pw, GHSA-j6r3-76f7-8jcv — via express-rate-limit (@modelcontextprotocol/sdk)
+  proxy-addr: '^2.0.8' # GHSA-jqcg-44mw-7w3h — via express 5 (@modelcontextprotocol/sdk, @a2a-js/sdk)
+  shell-quote: '^1.11.0' # GHSA-pqg4-j6r4-53mv — via @daytona/sdk (gate-js devDependency, dev-only)
+  source-map-js: '^1.2.2' # GHSA-68fv-2mgg-jv7q — via postcss and the Vue SFC compiler (build tooling)
+  # Direct dependencies too (packages/mcp-proxy, apps/docs), bumped there. The
+  # overrides catch the copies other packages resolve on their own:
+  # @truefoundry/trueforge-core (gate-js devDependency) keeps the SDK at 1.30.0,
+  # and vitepress keeps its own vue (and so @vue/server-renderer) at 3.5.38.
+  '@modelcontextprotocol/sdk': '^1.31.0' # GHSA-6qxp-vccf-f47h
+  vue: '^3.5.42' # GHSA-g2v6-rqmx-r4w6 (@vue/server-renderer, pinned exactly by vue)
+  # `workflow` (gate-js devDependency, dev-only) depends on @workflow/nest,
+  # which declares @swc/cli as a required peer, so pnpm auto-installs it.
+  # Nothing here uses the NestJS integration (gate-js imports only `workflow`'s
+  # main entry) and @workflow/nest never imports @swc/cli. It is the only path
+  # to piscina (GHSA-67c8-pqhq-4rmx) and, through @xhmikosr/bin-wrapper -> got
+  # -> cacheable-request, to http-cache-semantics (GHSA-ch52-4w7c-c8xp, which
+  # has no patched release). Removing the peer removes both.
+  '@workflow/nest>@swc/cli': '-'
+  # gcp-metadata 8.1.4 (OpenTelemetry's GCP resource detector in mcp-proxy) pins gaxios to exactly
+  # 7.1.3, which depends on rimraf 5 > glob 10 > minimatch 9, the only production path to glob.
+  # gaxios 7.1.5 is the same major with no rimraf (Node >= 18 like 7.1.3).
+  'gaxios@7.1.3': '7.1.5' # GHSA-3g3m-2fjr-6pw4 (glob), GHSA-g3hv-75wg-m249 (minimatch), through rimraf
+  # Via axios (apps/docs, gate-js), which accepts ^1.16.0.
+  follow-redirects: '^1.16.2' # GHSA-mrwp-f3q8-3g9p (cross-realm sensitiveHeaders dropped); earlier: 2026-10-20 advisories, fixed in 1.16.1
+  # Via typedoc (SDK reference generation, dev-only), which accepts ^14.3.0.
+  markdown-it: '^14.3.3' # 2026-10-20 advisories, fixed in 14.3.3
+  # vitest's and vitepress's vite, to the patched 6.x (see the note above);
+  # GHSA-r825-w8mm-5pxw, GHSA-587h-7wmj-h5pm, GHSA-698v-4r3x-3vcv; 6.4.5 for
+  # GHSA-8g5g-mxqh-grgj (server.fs.deny bypassed with queries; the dev server only).
+  'vite@<6.4.5': '^6.4.5'

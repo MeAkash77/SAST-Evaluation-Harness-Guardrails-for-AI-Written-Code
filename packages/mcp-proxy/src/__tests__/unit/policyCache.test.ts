@@ -1,0 +1,208 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import * as http from 'node:http'
+import * as net from 'node:net'
+import { Redis } from 'ioredis'
+
+/** Type-only view of the module under test; the value import is dynamic (see below). */
+type PolicyCacheModule = typeof import('../../daemon/policyCache.js')
+
+describe('policyCache Unit Tests', () => {
+  let mockServer: http.Server
+  let port: number
+  let requestCount = 0
+  let latestWorkspaceId: string | null = null
+
+  let resolvePolicy: PolicyCacheModule['resolvePolicy']
+  let invalidatePolicy: PolicyCacheModule['invalidatePolicy']
+  let getCacheStats: PolicyCacheModule['getCacheStats']
+
+  beforeAll(async () => {
+    mockServer = http.createServer((req, res) => {
+      requestCount++
+      const url = new URL(req.url ?? '', `http://${req.headers.host}`)
+      latestWorkspaceId = url.searchParams.get('workspaceId')
+
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+
+      // `ws_curation_test` gets a response WITH the three MCP curation
+      // fields, to prove they parse through. Every other workspace gets the
+      // exact shape `GET /api/v1/policy/resolve` served before the M1 fix —
+      // the regression case: a workspace with no MCP curation configured (or
+      // an older control plane that predates the field) must still get
+      // well-typed empty defaults rather than `undefined` fields, so a
+      // caller can compare against them without extra guards.
+      const body: Record<string, unknown> = {
+        workspaceId: latestWorkspaceId,
+        sopRules: [
+          {
+            id: 'rule_1',
+            toolPattern: 'Bash',
+            action: 'block',
+            reason: 'No destructive commands allowed',
+          },
+        ],
+        mcpInjectionPatterns: [],
+        interventionMode: 'BLOCK',
+      }
+      if (latestWorkspaceId === 'ws_curation_test') {
+        body['allowedTools'] = ['read_file']
+        body['toolDescriptionOverrides'] = { read_file: 'Reads a file' }
+        body['allowedServers'] = ['filesystem']
+      }
+      // `ws_no_mode_test` gets a response WITHOUT interventionMode, to pin
+      // the parser's fallback for an older control plane that omits it.
+      if (latestWorkspaceId === 'ws_no_mode_test') {
+        delete body['interventionMode']
+      }
+      // `ws_pii_unreadable_test`: the control plane could not read the
+      // workspace's piiDetectors setting.
+      if (latestWorkspaceId === 'ws_pii_unreadable_test') {
+        body['piiDetectors'] = null
+      }
+      if (latestWorkspaceId === 'ws_pii_set_test') {
+        body['piiDetectors'] = { 'pii.email': 'redact' }
+      }
+      if (latestWorkspaceId === 'ws_wasm_rules_test') {
+        body['wasmRules'] = [{ ruleId: 'wasm_1', name: 'no-prod', sha256: 'a'.repeat(64), priority: 10, mode: 'ENFORCE' }]
+      }
+      res.end(JSON.stringify(body))
+    })
+
+    await new Promise<void>((resolve) => {
+      mockServer.listen(0, '127.0.0.1', () => {
+        const addr = mockServer.address() as net.AddressInfo | null
+        port = addr?.port ?? 3001
+        process.env['CONTROL_PLANE_URL'] = `http://127.0.0.1:${port}`
+        resolve()
+      })
+    })
+
+    // Import after process.env is set to ensure it uses the mock URL
+    const mod: PolicyCacheModule = await import('../../daemon/policyCache.js')
+    resolvePolicy = mod.resolvePolicy
+    invalidatePolicy = mod.invalidatePolicy
+    getCacheStats = mod.getCacheStats
+
+    // Clean up any stale cache from prior runs in Valkey
+    invalidatePolicy('ws_test_cache_miss')
+    requestCount = 0
+    latestWorkspaceId = null
+  })
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()))
+  })
+
+  it('fetches policy from control plane on cache miss', async () => {
+    const wsId = 'ws_test_cache_miss'
+    const policy = await resolvePolicy(wsId)
+    expect(policy).not.toBeNull()
+    expect(policy?.workspaceId).toBe(wsId)
+    expect(policy?.sopRules).toHaveLength(1)
+    // ResolvedPolicy.sopRules is Record<string, unknown>[], so rule fields are
+    // reached by index and land as `unknown` — which toBe() compares fine.
+    expect(policy?.sopRules[0]?.['id']).toBe('rule_1')
+    expect(requestCount).toBe(1)
+    expect(latestWorkspaceId).toBe(wsId)
+    // M1 regression case: a response that omits the three MCP curation
+    // fields must normalize to empty defaults, not `undefined` — a stale
+    // control plane or cache entry must never read as "curation absent" one
+    // layer up in packages/mcp-proxy/src/policy.ts's absorbCuration.
+    expect(policy?.allowedTools).toEqual([])
+    expect(policy?.toolDescriptionOverrides).toEqual({})
+    expect(policy?.allowedServers).toEqual([])
+  })
+
+  it('serves policy from memory on cache hit', async () => {
+    const wsId = 'ws_test_cache_miss' // reuse the same wsId
+    const policy = await resolvePolicy(wsId)
+    expect(policy).not.toBeNull()
+    expect(requestCount).toBe(1) // Request count remains 1 due to cache hit
+  })
+
+  it('invalidates policy correctly', async () => {
+    const wsId = 'ws_test_cache_miss'
+    invalidatePolicy(wsId)
+
+    const policy = await resolvePolicy(wsId)
+    expect(policy).not.toBeNull()
+    expect(requestCount).toBe(2) // Request count increments to 2 on new fetch
+  })
+
+  it("carries piiDetectors as the control plane sent it, null included, for PolicyClient to read", async () => {
+    for (const ws of ['ws_pii_unreadable_test', 'ws_pii_set_test']) invalidatePolicy(ws)
+    expect((await resolvePolicy('ws_pii_unreadable_test'))?.piiDetectors).toBeNull()
+    expect((await resolvePolicy('ws_pii_set_test'))?.piiDetectors).toEqual({ 'pii.email': 'redact' })
+    expect((await resolvePolicy('ws_test_cache_miss'))?.piiDetectors, 'absent stays absent').toBeUndefined()
+  })
+
+  it("carries the workspace's custom rule descriptors as sent, for PolicyClient to read", async () => {
+    invalidatePolicy('ws_wasm_rules_test')
+    expect((await resolvePolicy('ws_wasm_rules_test'))?.wasmRules).toEqual([
+      { ruleId: 'wasm_1', name: 'no-prod', sha256: 'a'.repeat(64), priority: 10, mode: 'ENFORCE' },
+    ])
+    expect((await resolvePolicy('ws_test_cache_miss'))?.wasmRules, 'absent stays absent').toBeUndefined()
+  })
+
+  it('tracks cache entries stats correctly', () => {
+    const stats = getCacheStats()
+    expect(stats.entries).toBeGreaterThanOrEqual(1)
+  })
+
+  it('refetches a fresh entry when the workspace config version moved', async () => {
+    const ws = 'ws_version_bump_test'
+    const key = `v2:sync:config_version:${ws}`
+    const valkey = new Redis(process.env['VALKEY_URL'] ?? process.env['REDIS_URL'] ?? 'redis://localhost:6379', { lazyConnect: true, maxRetriesPerRequest: 1 })
+    try {
+      await valkey.connect()
+    } catch {
+      valkey.disconnect()
+      return // no Valkey in this environment; the TTL path is covered above
+    }
+    try {
+      await valkey.set(key, '1')
+      invalidatePolicy(ws)
+      const before = requestCount
+      const first = await resolvePolicy(ws)
+      expect(first?.configVersion).toBe(1)
+      expect(requestCount).toBe(before + 1)
+
+      // Same version: a fresh hit, no fetch.
+      await resolvePolicy(ws)
+      expect(requestCount).toBe(before + 1)
+
+      // A promote/retire bumped it: the next hit refetches within the TTL.
+      await valkey.incr(key)
+      const refreshed = await resolvePolicy(ws)
+      expect(requestCount).toBe(before + 2)
+      expect(refreshed?.configVersion).toBe(2)
+    } finally {
+      await valkey.del(key)
+      valkey.disconnect()
+    }
+  })
+
+  // Placed last, on its own workspaceId, so it does not perturb the exact
+  // requestCount assertions the cache-hit/invalidation tests above depend on.
+  it('parses MCP curation fields (allowedTools/toolDescriptionOverrides/allowedServers) when the control plane sends them', async () => {
+    invalidatePolicy('ws_curation_test')
+    const policy = await resolvePolicy('ws_curation_test')
+    expect(policy).not.toBeNull()
+    expect(policy?.allowedTools).toEqual(['read_file'])
+    expect(policy?.toolDescriptionOverrides).toEqual({ read_file: 'Reads a file' })
+    expect(policy?.allowedServers).toEqual(['filesystem'])
+  })
+
+  it("defaults a missing interventionMode to 'TRANSPARENT', a real intervention mode", async () => {
+    // The old fallback was 'BYPASS' — not an intervention mode at all
+    // (TRANSPARENT|OPAQUE|SILENT_LOG). A daemon whose Valkey entry had
+    // just been invalidated could re-read this fabricated mode from a
+    // mode-less response and enforce a state no other component defines.
+    // 'TRANSPARENT' matches the resolve route's own fallback and the
+    // snapshot-seed path in this module.
+    invalidatePolicy('ws_no_mode_test')
+    const policy = await resolvePolicy('ws_no_mode_test')
+    expect(policy).not.toBeNull()
+    expect(policy?.interventionMode).toBe('TRANSPARENT')
+  })
+})

@@ -1,0 +1,91 @@
+/**
+ * codex.ts — Codex adapter.
+ *
+ * Writes four things:
+ * - the rule sets, as the marked section of the workspace's `AGENTS.md`,
+ *   which Codex reads before any work, merged from `~/.codex` and every
+ *   directory from the project root down to where it runs
+ *   (https://developers.openai.com/codex/guides/agents-md), through the
+ *   shared writer (agentsMd.ts);
+ * - `.env.intutic` in the workspace, with the proxy base URLs for shells and
+ *   scripts that source it;
+ * - `openai_base_url` in Codex's user config (`$CODEX_HOME/config.toml`,
+ *   `~/.codex/config.toml` by default), merged into the user's file, so Codex
+ *   routes LLM calls through the proxy without sourcing anything — see
+ *   codexConfigMerger.ts;
+ * - the PreToolUse gate, registered in `~/.codex/hooks.json` and the
+ *   project's `.codex/hooks.json` — see codexHooks.ts.
+ *
+ * HLD §3.14 — Harness Onboarding Matrix
+ * @module
+ */
+
+import { join } from 'node:path'
+import { homedir } from 'node:os'
+import { HarnessType, anthropicBaseUrl, openaiBaseUrl, proxyHost } from '@intutic/shared-types'
+import type { SyncSopEntry } from '@intutic/shared-types'
+import type { HarnessWriteOptions, IHarnessAdapter } from './types.js'
+import { loadCredentials } from '../config/store.js'
+import { newIso } from '@intutic/id'
+import { writeCodexHooks, mergeCodexConfig, writeOwnedFile } from '@intutic/sync-daemon'
+import { AGENTS_MD, agentsMdHash, writeAgentsMd } from './agentsMd.js'
+
+const ENV_FILE = '.env.intutic'
+
+/** Codex's user config directory, resolved at call time so CODEX_HOME and
+ *  HOME changes (and tests that move them) are honoured. */
+function codexHome(): string {
+  return process.env.CODEX_HOME || join(homedir(), '.codex')
+}
+
+export const codexAdapter: IHarnessAdapter = {
+  type: HarnessType.CODEX,
+  configFileName: AGENTS_MD,
+
+  async detect(_workspaceRoot: string): Promise<boolean> {
+    if (process.env.CODEX_HOME) return true
+    const pathDirs = (process.env.PATH ?? '').split(process.platform === 'win32' ? ';' : ':')
+    try {
+      const { accessSync } = await import('node:fs')
+      for (const dir of pathDirs) {
+        try { accessSync(join(dir, 'codex')); return true } catch { /* not here */ }
+      }
+    } catch { /* ignore */ }
+    return false
+  },
+
+  async installGate(workspaceRoot: string, proxyUrl: string, opts?: HarnessWriteOptions): Promise<void> {
+    // Codex user config — persists proxy routing across sessions without env
+    // sourcing. Merged; a config.toml that does not parse is left alone.
+    if (opts?.routing !== false) await mergeCodexConfig(join(codexHome(), 'config.toml'), openaiBaseUrl(proxyUrl))
+
+    // The PreToolUse gate. The routing above governs LLM egress only; the
+    // gate is what refuses tool calls.
+    const creds = await loadCredentials()
+    await writeCodexHooks(workspaceRoot, proxyUrl, creds?.workspaceId || 'local')
+  },
+
+  /** The `AGENTS.md` section, and the workspace `.env.intutic`. */
+  async writeConfig(workspaceRoot: string, sops: SyncSopEntry[], proxyUrl: string): Promise<string | null> {
+    const filePath = join(workspaceRoot, ENV_FILE)
+    const envContent = [
+      '# Intutic Governance Rules (auto-generated)',
+      '# DO NOT EDIT — managed by intutic sync daemon',
+      `# Last sync: ${newIso()}`,
+      '# Source this file: source .env.intutic',
+      '',
+      `export ANTHROPIC_BASE_URL="${anthropicBaseUrl(proxyUrl)}"`,
+      `export OPENAI_BASE_URL="${openaiBaseUrl(proxyUrl)}"`,
+      `export INTUTIC_PROXY_URL="${proxyHost(proxyUrl)}"`,
+      `export INTUTIC_SOP_COUNT=${sops.length}`,
+      '',
+    ].join('\n')
+
+    await writeOwnedFile(filePath, workspaceRoot, envContent)
+    return (await writeAgentsMd(workspaceRoot, sops, proxyUrl)) ?? filePath
+  },
+
+  readCurrentHash(workspaceRoot: string): Promise<string | null> {
+    return agentsMdHash(workspaceRoot)
+  },
+}

@@ -1,0 +1,34 @@
+{
+  "name": "@intutic/clawde",
+  "version": "3.2.3",
+  "description": "TypeScript SDK for governing Claude and other agents: the gate client, rule records and refusal types",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/intutic/intutic",
+    "directory": "packages/clawde-sdk"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "./dist"
+  ],
+  "scripts": {
+    "lint": "eslint src",
+    "build": "tsc",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@intutic/shared-types": "workspace:*",
+    "typescript": "^5.5",
+    "vitest": "^4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

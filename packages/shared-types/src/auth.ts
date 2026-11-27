@@ -1,0 +1,565 @@
+/**
+ * Auth + RBAC Types — Shared across control plane services.
+ *
+ * HLD §5.1 — Zero-Trust Perimeter
+ *
+ * @module
+ */
+
+import { z } from 'zod'
+import type { WorkspaceRole } from './enums.js'
+import {
+  KeyRateLimitSchema,
+  SpendBudgetListSchema,
+  type HardBudgetWire,
+  type KeyRateLimit,
+  type SpendBudget,
+} from './spendBudgets.js'
+import { unknownApiKeyScopes, unknownScopesMessage } from './apiKeyScopes.js'
+
+// ─── Auth Context ────────────────────────────────────────────────────
+
+/**
+ * Auth context injected by middleware on every authenticated request.
+ * Available via `c.get('auth')` in Hono handlers.
+ */
+export interface AuthContext {
+  /** The workspace member ID (PK of workspace_members). */
+  memberId: string
+  /** The workspace this member belongs to. */
+  workspaceId: string
+  /** Display-facing email of the authenticated member. */
+  email: string
+  /** RBAC role within the workspace. */
+  role: WorkspaceRole
+  /** Cross-workspace user ID. Optional for pre-migration members. */
+  userId?: string
+  /**
+   * The org the workspace belongs to (denormalized `workspaces.orgId`).
+   * Optional: cached auth entries written before this field
+   * existed lack it, and readers must treat absence as "unknown", never as
+   * "no org" — the proxy's cell org-pinning revalidates via the control
+   * plane in that case rather than guessing.
+   */
+  orgId?: string
+  /**
+   * The API key's own model allowlist (`api_keys.allowed_models`, migration
+   * 181). Present only for a `vk_` key that set one; absent or empty means
+   * the key inherits the workspace's `allowedModels` unchanged. The proxy
+   * INTERSECTS a non-empty list with the workspace list — a key can narrow
+   * what its workspace approves, never widen it.
+   */
+  allowedModels?: string[]
+  /**
+   * Whether this key's workspace must use its own provider key on the hosted
+   * gateway (paid plans, unless listed in `INTUTIC_BYOK_EXEMPT_WORKSPACES`).
+   * The proxy reads it only when `INTUTIC_GATEWAY_REQUIRE_PROVISIONED_KEY=paid`;
+   * absence there means "required", never "exempt".
+   */
+  byokRequired?: boolean
+  /**
+   * The `vk_` key's id (`api_keys.key_id`). The proxy names the key's spend
+   * counters and rate-limit counters with it; absent on a session JWT.
+   */
+  keyId?: string
+  /**
+   * Every hard spend budget that covers this key's calls — the workspace's,
+   * the key's own and its owner's member budgets — which the proxy checks
+   * before a request leaves. Soft budgets are not listed: they only alert.
+   * Absent on an entry written before the field existed, where the proxy
+   * keeps the workspace daily cap it read before.
+   */
+  hardBudgets?: HardBudgetWire[]
+  /** The key's requests-per-minute and tokens-per-minute limits, when it has either. */
+  rateLimit?: KeyRateLimit
+  /**
+   * What the `vk_` key may do on top of its owner's role (`apiKeyScopes.ts`),
+   * already resolved: `*` for a key whose stored scopes predate the registry,
+   * and narrowed by every key above an attenuated child. Absent on a session
+   * JWT, which has no scopes. The proxy reads it from the cached entry and
+   * refuses LLM traffic from a key without `gateway:use`; an entry without the
+   * field was written before scopes were enforced.
+   */
+  scopes?: string[]
+}
+
+// ─── JWT ─────────────────────────────────────────────────────────────
+
+/** JWT access token payload (compact claims). */
+export interface JwtPayload {
+  /** Subject — member_id */
+  sub: string
+  /** Workspace ID */
+  wid: string
+  /** RBAC role */
+  role: WorkspaceRole
+  /** Issued at (epoch seconds) */
+  iat: number
+  /** Expiry (epoch seconds) */
+  exp: number
+}
+
+// ─── Login ───────────────────────────────────────────────────────────
+
+/** Login request schema (Zod validated). */
+export const LoginInputSchema = z.object({
+  email: z.string().email().max(256),
+  password: z.string().min(8).max(128),
+})
+
+/** Login request input. */
+export type LoginInput = z.infer<typeof LoginInputSchema>
+
+/** Login response payload. */
+export interface LoginResult {
+  accessToken: string
+  refreshToken: string
+  expiresIn: number
+  member: WorkspaceMemberInfo
+}
+
+// ─── Register ────────────────────────────────────────────────────────
+
+/** Registration request schema (Zod validated). */
+export const RegisterInputSchema = z.object({
+  email: z.string().email().max(256),
+  password: z.string().min(8).max(128),
+  displayName: z.string().min(1).max(128),
+  workspaceName: z.string().min(1).max(128),
+  workspaceSlug: z.string().min(1).max(64).regex(/^[a-z0-9-]+$/),
+  signupSource: z.string().max(32).optional(),
+  marketingAttribution: z.record(z.string(), z.any()).optional(),
+})
+
+/** Registration request input. */
+export type RegisterInput = z.infer<typeof RegisterInputSchema>
+
+/** Registration response payload. */
+export interface RegisterResult {
+  accessToken: string
+  refreshToken: string
+  expiresIn: number
+  member: WorkspaceMemberInfo
+  workspaceId: string
+}
+
+// ─── Refresh ─────────────────────────────────────────────────────────
+
+/** Token refresh request schema. */
+export const RefreshInputSchema = z.object({
+  refreshToken: z.string().min(1),
+})
+
+/** Token refresh response. */
+export interface RefreshResult {
+  accessToken: string
+  refreshToken: string
+  expiresIn: number
+}
+
+// ─── Change Password ─────────────────────────────────────────────────
+
+/** Change password request schema. */
+export const ChangePasswordInputSchema = z.object({
+  currentPassword: z.string().min(8).max(128),
+  newPassword: z.string().min(8).max(128),
+})
+
+// ─── Member Info ─────────────────────────────────────────────────────
+
+/** Safe projection of a workspace member (no password hash). */
+export interface WorkspaceMemberInfo {
+  memberId: string
+  workspaceId: string
+  email: string
+  displayName: string
+  role: WorkspaceRole
+  isActive: boolean
+  lastLoginAt: string | null
+  createdAt: string
+  /**
+   * The workspace's org (tenancy phase 1, migration 130) -- optional because
+   * most `WorkspaceMemberInfo` construction sites (signup responses) return
+   * org info separately in their own `org: {...}` field already, so this
+   * would be redundant there. Only `GET /api/v1/auth/me` populates it, for
+   * the dashboard to resolve which org's teams/gateway-defaults apply
+   * without a second round-trip.
+   */
+  orgId?: string
+}
+
+// ─── Member Invite ───────────────────────────────────────────────────
+
+/** Invite member request schema. */
+export const InviteMemberInputSchema = z.object({
+  email: z.string().email().max(256),
+  displayName: z.string().min(1).max(128),
+  role: z.enum(['ADMIN', 'EM', 'DEVELOPER', 'VIEWER']),
+  tempPassword: z.string().min(8).max(128),
+})
+
+/** Invite member input. */
+export type InviteMemberInput = z.infer<typeof InviteMemberInputSchema>
+
+// ─── Role Update ─────────────────────────────────────────────────────
+
+/** Update role request schema. */
+export const UpdateRoleInputSchema = z.object({
+  role: z.enum(['OWNER', 'ADMIN', 'EM', 'DEVELOPER', 'VIEWER']),
+})
+
+// ─── PLG Self-Serve Signup ───────────────────────────────────
+
+/**
+ * The signer's explicit acceptance: "I am 18 or older and agree to the Terms
+ * and the Privacy Policy". Only `true` is accepted; a body without it is
+ * refused with 400 `TERMS_NOT_ACCEPTED` before anything is created, and the
+ * control plane records the time and the terms version on the new member.
+ */
+const AcceptTermsField = z
+  .literal(true)
+  .describe('Must be true: the signer is 18 or older and agrees to the Terms and the Privacy Policy')
+
+/** Accepting the current terms version from the dashboard (`POST /api/v1/auth/terms/accept`). */
+export const AcceptTermsInputSchema = z.object({
+  acceptTerms: AcceptTermsField,
+})
+
+/** PLG signup input schema. */
+export const SignupInputSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(128),
+  name: z.string().min(1).max(128),
+  acceptTerms: AcceptTermsField,
+  workspaceName: z.string().min(1).max(64).optional(),
+  signupSource: z.string().max(32).optional(),
+  marketingAttribution: z.record(z.string(), z.any()).optional(),
+})
+
+/** PLG signup params type. */
+export type SignupParams = z.infer<typeof SignupInputSchema>
+
+/** PLG signup result. */
+export interface SignupResult {
+  user: {
+    id: string
+    email: string
+    name: string
+    emailVerified: boolean
+  }
+  workspace: {
+    id: string
+    name: string
+    planTier: string
+    trialExpiresAt: string
+  }
+  accessToken: string
+  refreshToken: string
+  cliInstall: string
+  isNewUser: boolean
+}
+
+// ─── Org Signup (Tenancy phase 4) ─────────────────────────────────────
+
+/**
+ * Org signup input schema. Distinct from `SignupInputSchema`: `orgName` is
+ * required (no "N's workspace" auto-name fallback — an org identity is the
+ * point of this path), and there is no `workspaceName` — the org's default
+ * workspace is named from the org itself.
+ */
+export const OrgSignupInputSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8).max(128),
+  name: z.string().min(1).max(128),
+  acceptTerms: AcceptTermsField,
+  orgName: z.string().min(1).max(128),
+  /**
+   * The company's own domain (e.g. "acme.com") — informational, stored in
+   * `orgs.settings.domain`. Deliberately NOT the cell hostname:
+   * the org's slug is the subdomain under gateway.intutic.ai, so no domain
+   * verification is needed here.
+   */
+  orgDomain: z
+    .string()
+    .max(255)
+    .regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i, 'must be a bare domain like acme.com')
+    .optional(),
+  signupSource: z.string().max(32).optional(),
+  marketingAttribution: z.record(z.string(), z.any()).optional(),
+})
+
+/** Org signup params type. */
+export type OrgSignupParams = z.infer<typeof OrgSignupInputSchema>
+
+/** Org signup result — same shape as SignupResult, plus the org identity. */
+export interface OrgSignupResult {
+  user: {
+    id: string
+    email: string
+    name: string
+    emailVerified: boolean
+  }
+  org: {
+    id: string
+    name: string
+    planTier: string
+    trialExpiresAt: string
+  }
+  workspace: {
+    id: string
+    name: string
+    planTier: string
+    trialExpiresAt: string
+  }
+  accessToken: string
+  refreshToken: string
+  cliInstall: string
+  isNewUser: boolean
+}
+
+/** Verify email input schema. */
+export const VerifyEmailInputSchema = z.object({
+  token: z.string().length(64),
+})
+
+/** Resend verification email input schema. */
+export const ResendVerificationInputSchema = z.object({
+  email: z.string().email(),
+})
+
+/** Magic link request schema (Zod validated). */
+export const MagicLinkRequestInputSchema = z.object({
+  email: z.string().email().max(256),
+})
+
+/** Magic link request input. */
+export type MagicLinkRequestInput = z.infer<typeof MagicLinkRequestInputSchema>
+
+/** Magic link login schema (Zod validated). */
+export const MagicLinkLoginInputSchema = z.object({
+  token: z.string().min(1),
+})
+
+/** Magic link login input. */
+export type MagicLinkLoginInput = z.infer<typeof MagicLinkLoginInputSchema>
+
+
+
+// ─── API Key ─────────────────────────────────────────────────────────
+
+/**
+ * A key's scope list: at least one, at most every scope, each one in the
+ * registry. An unknown scope is refused with a message naming the valid ones.
+ */
+export const ApiKeyScopeListSchema = z
+  .array(z.string().trim().min(1).max(64))
+  .min(1, 'At least one scope is required; use ["*"] for everything')
+  .max(64)
+  .superRefine((scopes, ctx) => {
+    const unknown = unknownApiKeyScopes(scopes)
+    if (unknown.length > 0) ctx.addIssue({ code: z.ZodIssueCode.custom, message: unknownScopesMessage(unknown) })
+  })
+
+/** API key creation request schema. */
+export const CreateApiKeyInputSchema = z.object({
+  label: z.string().min(1).max(128),
+  /**
+   * What the key may do on top of its owner's role; `["*"]` (everything) when
+   * omitted. Every entry must be in the registry (`API_SCOPES`).
+   */
+  scopes: ApiKeyScopeListSchema.default(['*']),
+  expiresInDays: z.number().int().min(1).max(365).optional(),
+  /**
+   * Optional per-key model allowlist. Omitted or empty inherits the workspace's
+   * approved-models list; a non-empty list is intersected with it at the proxy,
+   * so a key can only narrow the workspace list, never widen it.
+   */
+  allowedModels: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+  /**
+   * Automation key: exempt from the `ssoKeyMaxIdleDays` recency gate, because its
+   * owner may never log in interactively. Still bound to the member's active flag
+   * and still revocable, so offboarding applies.
+   */
+  isServiceAccount: z.boolean().default(false),
+})
+
+/** API key creation input. */
+export type CreateApiKeyInput = z.infer<typeof CreateApiKeyInputSchema>
+
+/** API key creation result (plaintext key returned ONCE). */
+export interface CreateApiKeyResult {
+  keyId: string
+  /** Plaintext vk_* token — returned ONCE, never stored. */
+  key: string
+  keyPrefix: string
+  label: string
+  scopes: string[]
+  /** Per-key model allowlist; `null` when the key inherits the workspace list. */
+  allowedModels: string[] | null
+  expiresAt: string | null
+  createdAt: string
+  /** The key's own spend budgets; empty when it has none. */
+  budgets: SpendBudget[]
+  /** The key's per-minute limits; both `null` when it has none. */
+  rateLimit: KeyRateLimit
+}
+
+/**
+ * `PATCH /api/v1/keys/:id` — replace a key's spend budgets, rate limit and/or scopes.
+ * The only way to change them: any member creates their own keys, and only an
+ * OWNER or ADMIN may say what a key can spend, so a key is created unlimited
+ * and limited afterwards. Scopes are set at creation and may be replaced here.
+ * A field left out is unchanged; `budgets: []` removes every budget, and a
+ * `rateLimit` field set to `null` removes that limit.
+ */
+export const UpdateApiKeyInputSchema = z
+  .object({
+    budgets: SpendBudgetListSchema.optional(),
+    rateLimit: KeyRateLimitSchema.optional(),
+    /** Replaces the key's scopes; applies from the key's next request. */
+    scopes: ApiKeyScopeListSchema.optional(),
+  })
+  .strict()
+  .refine(
+    (v) => v.budgets !== undefined || v.rateLimit !== undefined || v.scopes !== undefined,
+    'nothing to change: send budgets, rateLimit or scopes',
+  )
+
+export type UpdateApiKeyInput = z.infer<typeof UpdateApiKeyInputSchema>
+
+/** Safe projection of an API key (no key_hash, no plaintext). */
+export interface ApiKeyInfo {
+  keyId: string
+  keyPrefix: string
+  label: string
+  /** The scopes as stored on the key. */
+  scopes: string[]
+  /** Per-key model allowlist; `null` when the key inherits the workspace list. */
+  allowedModels: string[] | null
+  expiresAt: string | null
+  lastUsedAt: string | null
+  revokedAt: string | null
+  createdAt: string
+  /** An automation key, exempt from the SSO-recency window (see `CreateApiKeyInputSchema`). */
+  isServiceAccount: boolean
+  /** The key's own spend budgets; empty when it has none. */
+  budgets: SpendBudget[]
+  /** The key's per-minute limits; both `null` when it has none. */
+  rateLimit: KeyRateLimit
+}
+
+// ─── Dashboard Summary ──────────────────────────────────────────────
+
+/**
+ * Workspace dashboard summary — aggregated metrics for EM Dashboard.
+ * Phase 1 provides JSON API; the EM Dashboard UI is Phase 2.
+ * HLD §8b.1
+ */
+export interface DashboardSummary {
+  /** Total active sessions in the workspace. */
+  activeSessions: number
+  /**
+   * Sessions opened with `executionMode: 'SANDBOX'` in the last 30 days —
+   * `intutic exec --sandbox` runs. A 30-day window rather than
+   * "active" because a sandbox run is typically short-lived.
+   */
+  sandboxSessions30d: number
+  /** Budget utilization (current month spend vs. budget). */
+  budgetUtilization: {
+    spentUsd: number
+    budgetUsd: number
+    percentUsed: number
+  }
+  /** Anomaly count in the last 24 hours by category. */
+  anomalyCount24h: number
+  /** SOP health summary. */
+  sopHealth: {
+    /** Enforced — `VALIDATED` only. Every runtime gate filters on that state. */
+    totalActive: number
+    /**
+     * Synced into agent context and read by the model, but enforced by nothing:
+     * `HYPOTHESIZED` and `REFINED`.
+     *
+     * Separate from `totalActive` because folding them in overstates what is
+     * enforced, and dropping them understates what is deployed — this field
+     * exists because the count previously did both at once.
+     */
+    totalAdvisory: number
+    totalStale: number
+    totalInvalidated: number
+  }
+  /** Recent governance incidents (last 5). */
+  recentIncidents: Array<{
+    incidentId: string
+    sessionId: string
+    category: string
+    severity: string
+    createdAt: string
+  }>
+
+  // ── Optional UI Chart Metrics (Phase 2) ──
+  agentSuccessRate?: Array<{
+    date: string
+    rate: number
+  }>
+  tokenEfficiency?: Array<{
+    model: string
+    inputTokens: number
+    outputTokens: number
+    wastedTokens: number
+  }>
+  recurringFailures?: Array<{
+    pattern: string
+    count: number
+    severity: 'critical' | 'high' | 'medium' | 'low'
+  }>
+  sopAdherence?: Array<{
+    date: string
+    adherenceRate: number
+    threshold: number
+  }>
+  wastedTokenBreakdown?: Array<{
+    category: string
+    tokens: number
+    percentOfTotal: number
+  }>
+  /**
+   * Bytes the SnipCompactor removed from response bodies in the window.
+   *
+   * Bytes, not tokens, and deliberately outside `wastedTokenBreakdown` — the
+   * two cannot share a pie. Compaction is response-side, so its benefit lands
+   * in the next turn's prompt rather than reducing this window's input count.
+   */
+  toolOutputTrimmedBytes?: number
+  costSavings?: {
+    rawCostUsd: number
+    actualCostUsd: number
+    /**
+     * Can be negative (Wave 3.2's honest counterfactual pass removed a bug
+     * that manufactured a reward/savings bonus for the router doing
+     * nothing — `rawCostUsd` on new traces now prices identically to
+     * `actualCostUsd` when the request wasn't routed, so a genuine
+     * overspend, where routing picked a worse model, now shows as one
+     * instead of being floored to 0). Consumers must render this signed,
+     * not `Math.max(0, …)` it a second time.
+     */
+    savedUsd: number
+    savingsPercent: number
+    /**
+     * Provider prompt-cache reads over the same window — a
+     * SEPARATE population from `savedUsd`. A request can show heavy
+     * cache-read activity while `savedUsd` is flat or negative (the router
+     * moved off a model that was warm), so this must never be folded into
+     * `savedUsd` or the two figures will misrepresent each other.
+     */
+    cacheReadInputTokens: number
+  }
+  /**
+   * Runaway spend averted by proxy KILL enforcement, extrapolated forward from
+   * each killed session's measured burn rate — NOT the same population as
+   * `costSavings.savedUsd` (measured routing savings) and must never be added
+   * into it. See `runawayCounterfactualService.ts` for how this is computed.
+   */
+  runawayAvertedUsd?: number
+}
+

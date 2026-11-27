@@ -1,0 +1,161 @@
+/**
+ * Error hierarchy for `@intutic/gate`.
+ *
+ * Port of `packages/intutic-clawde/intutic_clawde/errors.py` +
+ * `intutic_clawde/gate/gate.py`'s `IntuticGateRefusal`.
+ *
+ * `IntuticGateRefusal` is the load-bearing one: {@link Gate.guard} THROWS this
+ * on a refused call rather than returning a verdict object. That is the
+ * "JS-throw contract" already used elsewhere in this repo's gate vocabulary —
+ * see `services/sync-daemon/src/harness/gateBody.ts`'s emitted gates, which
+ * either `process.exit(2)` or write a `{cancel:true,...}` stdout envelope, and
+ * `packages/mcp-proxy/src/policy.ts`, which throws a `PolicyBlockedError` for
+ * the same reason: a tool call that must not run is an exceptional control
+ * flow event, not a value the caller might forget to check.
+ *
+ * `.message` is prefixed `[Intutic Governance] BLOCKED:` — the same family the
+ * Open WebUI filter and the Python SDK raise — so harnesses and log scrapers
+ * that already recognise that prefix recognise this refusal too.
+ */
+
+import type { RefusalEvidence, RefusalScope } from './refusalDetail.js'
+
+/** Base class for every error this package throws. */
+export class GateError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'GateError'
+  }
+}
+
+/** Thrown when the SDK cannot reach the Intutic control plane. */
+export class GateConnectionError extends GateError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'GateConnectionError'
+  }
+}
+
+/**
+ * Every `code` an {@link IntuticGateRefusal} can carry: the tier that refused,
+ * or for the image-integrity tier the specific failure. Held to
+ * `packages/shared-types/fixtures/refusal-codes.json` (`gate`) by a test, as
+ * the Python gate's list and the gate SDK reference are.
+ */
+export const GATE_REFUSAL_CODES = [
+  'SSO_GROUP',
+  'SNAPSHOT',
+  'HELD',
+  // Tier R, the snapshot's rule records (gateRuleRecord.ts): a qualified
+  // requires_before, scope_paths_mode: enforce, plan_approval, allow_commands.
+  'PREREQUISITE_UNMET',
+  'OUT_OF_SCOPE',
+  'COMMAND_NOT_ALLOWED',
+  'OFF_PLAN',
+  'PLAN_NOT_APPROVED',
+  // The MCP server registry and allowlist, from the policy snapshot or the
+  // control plane's hook gate.
+  'SERVER_BLOCKED',
+  'SERVER_HELD',
+  'SERVER_NOT_APPROVED',
+  'TOOL_DISABLED',
+  'SERVER_NOT_ALLOWED',
+  // Any MCP call on a policy snapshot that failed its integrity check.
+  'POLICY_SNAPSHOT_UNVERIFIED',
+  'SOP_RULE',
+  'HOOK_GATE',
+  // The API key lacks the scope the hook gate needs (client.ts).
+  'INSUFFICIENT_SCOPE',
+  // The call is too large to evaluate (limits.ts), before any tier runs.
+  'COMMAND_TOO_LARGE',
+  // A chaos run's fault, injected after every tier allowed the call, or its
+  // unreadable plan (chaosGate.ts). Never a governance decision.
+  'CHAOS_FAULT',
+  'E_UNPINNED_LATEST',
+  'E_UNPINNED_TAG',
+  'E_UNKNOWN_REGISTRY',
+  'E_UNKNOWN_IMAGE',
+  'E_DIGEST_MISMATCH',
+  'E_MANIFEST_UNPARSEABLE',
+  // A decide rule (the Decide tier, after every deterministic tier allowed
+  // the call): refused, escalated with no way to ask, or its engine unavailable.
+  'DECIDE_REFUSED',
+  'DECIDE_ESCALATED',
+  'GOVERNANCE_UNAVAILABLE',
+  // The Workflow DevKit adapter (workflow.ts), before any tier runs.
+  'WORKFLOW_SANDBOX',
+  'NO_GATE',
+] as const
+
+export type GateRefusalCode = (typeof GATE_REFUSAL_CODES)[number]
+
+/**
+ * Raised when a tool call must not run.
+ *
+ * The structured fields (`reason`, `code`, `incidentId`) carry the
+ * machine-readable version of the refusal; `.message` carries the
+ * human-readable, prefix-recognisable one.
+ */
+export class IntuticGateRefusal extends GateError {
+  public readonly reason: string
+  public readonly code: GateRefusalCode
+  public readonly incidentId: string | undefined
+  /**
+   * Where the refusal applies, so a retry can stay out of it (paths, tools,
+   * step, detector, rule), bounded as refusalDetail.ts says. Undefined when
+   * the refusal names none, and always in an OPAQUE workspace.
+   */
+  public readonly scope: RefusalScope | undefined
+  /** What the refuser saw, bounded; undefined when nothing, and in OPAQUE. */
+  public readonly evidence: RefusalEvidence[] | undefined
+
+  constructor(reason: string, code: GateRefusalCode, incidentId?: string, detail?: { scope?: RefusalScope; evidence?: RefusalEvidence[] }) {
+    super(`[Intutic Governance] BLOCKED: ${reason}`)
+    this.name = 'IntuticGateRefusal'
+    this.reason = reason
+    this.code = code
+    this.incidentId = incidentId
+    this.scope = detail?.scope
+    this.evidence = detail?.evidence
+  }
+}
+
+/**
+ * Raised when a hold rule stopped the call to ask a person first (`code`
+ * `HELD`). A subclass, so a caller that stops on every refusal stops on this
+ * too; one that tells the user about holds catches it first.
+ *
+ * `holdId` names the hold in the review queue, and is `undefined` when the
+ * hold could not be recorded (no control plane to record it in), in which
+ * case there is nothing to approve yet. `.message` starts
+ * `[Intutic Governance] HELD:`, as the hook gates print a hold, and says who
+ * can approve it and when a retry passes. See hold.ts.
+ */
+export class IntuticGateHold extends IntuticGateRefusal {
+  public readonly holdId: string | undefined
+
+  constructor(reason: string, holdId: string | undefined) {
+    super(reason, 'HELD')
+    this.name = 'IntuticGateHold'
+    this.message = `[Intutic Governance] HELD: ${reason}`
+    this.holdId = holdId
+  }
+}
+
+/**
+ * Raised when a decide rule could not decide the call and a person should
+ * (`code` `DECIDE_ESCALATED`): the answers fell between its bands, or the
+ * option orders disagreed. A subclass, so a caller that stops on every
+ * refusal stops on this too; one that can ask its user (dsh's approval) asks
+ * with `reason` and runs the call only on a yes. `ruleId` names the rule
+ * (`decide.<ruleRef>`), and is `undefined` in an OPAQUE workspace.
+ */
+export class IntuticGateEscalation extends IntuticGateRefusal {
+  public readonly ruleId: string | undefined
+
+  constructor(reason: string, ruleId: string | undefined) {
+    super(reason, 'DECIDE_ESCALATED')
+    this.name = 'IntuticGateEscalation'
+    this.ruleId = ruleId
+  }
+}

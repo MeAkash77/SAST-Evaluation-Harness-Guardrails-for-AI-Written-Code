@@ -1,0 +1,709 @@
+/**
+ * eve adapter: `intuticApproval()`, `intuticConnectionApproval()`,
+ * `intuticAuditHooks()`.
+ *
+ * `@intutic/gate/eve` — a framework-specific specialization of the same idea
+ * `wrapTools.ts` implements generically (see that file's module doc): wrap the
+ * framework's own veto point around this package's `Gate.guard()`.
+ *
+ * eve (npm `eve`, github.com/vercel/eve) is Vercel's filesystem-first
+ * framework for durable backend AI agents: an agent is a directory (`agent/`
+ * with `instructions.md`, `agent/tools/*.ts`, `agent/connections/*.ts`,
+ * `agent/hooks/*.ts`, ...) that eve builds by walking the tree. It is a
+ * pre-1.0 PREVIEW product (integrated at 0.39.1, re-verified at 0.71.0; very active) —
+ * this adapter carries a churn shield (structural copies of eve's types,
+ * re-checked against the real ones on every eve upgrade), the same posture
+ * the dsh integration established.
+ *
+ * ## The veto mechanism — CONFIRMED against a real install, not assumed
+ *
+ * `eve@0.71.0` is installed as a devDependency of this package and its
+ * shipped `.d.ts` files were read directly (not inferred from docs alone;
+ * first against 0.39.1, re-read for 0.71.0 — paths below are 0.71.0's).
+ * eve's per-tool veto point is the `approval` property on a tool definition
+ * (`dist/src/tools/definition.d.ts`), and the same `Approval` type is
+ * accepted per-connection by `defineMcpClientConnection` /
+ * `defineOpenAPIConnection` (`dist/src/public/definitions/connections/
+ * {mcp,openapi}.d.ts`), gating ALL of that connection's tools. There is NO
+ * agent-level default approval field (`agent.d.ts` carries zero approval
+ * fields — verified) — attaching a shared policy per tool/connection is
+ * eve's own documented multi-tenant pattern
+ * (`docs/patterns/multi-tenant-approvals.md`), and exactly the shape this
+ * adapter exports.
+ *
+ * The confirmed policy contract (`dist/src/approval/definition.d.ts`,
+ * re-exported by `dist/src/public/definitions/approval.d.ts` and
+ * `eve/tools/approval`):
+ *
+ * ```ts
+ * export interface ApprovalContext<TInput = Record<string, unknown>> extends SessionContext {
+ *   readonly abortSignal: AbortSignal                 // added after 0.39.1; unused here
+ *   readonly approvedTools: ReadonlySet<string>
+ *   readonly callId: string
+ *   readonly toolInput?: ApprovalToolInput<TInput>   // Readonly<TInput> | TInput; CAN be undefined
+ *   readonly toolName: string
+ * }
+ * export type ApprovalStatus = undefined | boolean
+ *   | 'not-applicable' | 'approved' | 'denied' | 'user-approval'
+ *   | { readonly type: 'not-applicable'; readonly reason?: never }
+ *   | { readonly type: 'approved'; readonly reason?: string }
+ *   | { readonly type: 'denied'; readonly reason?: string }
+ *   | { readonly type: 'user-approval'; readonly reason?: never }
+ * export type ApprovalPolicy<TInput = Record<string, unknown>> =
+ *   (ctx: ApprovalContext<TInput>) => ApprovalStatus | Promise<ApprovalStatus>
+ * ```
+ *
+ * These are AI SDK 7 approval statuses (eve is built on `ai` v7 — the same
+ * family `vercel.ts` documents). `'denied'` / `{ type: 'denied', reason }`
+ * vetoes the call before execution; `reason` reaches the model in place of a
+ * tool result. `'not-applicable'` (and `undefined`) means "continue without a
+ * prompt"; `'user-approval'` parks the run durably for a human. The boolean
+ * forms are back-compat for eve's earlier predicate shape: `true` is treated
+ * as `'user-approval'` and `false` as `'not-applicable'` (confirmed in
+ * `docs/tools/human-in-the-loop.md`) — this adapter never RETURNS booleans,
+ * but its structural {@link EveApprovalStatus} copy includes them so the type
+ * stays field-for-field faithful to the real union.
+ *
+ * ## Allow-shape: why `'not-applicable'` and not `'approved'`
+ *
+ * Unlike the Vercel AI SDK's `toolApproval` (a separate, whole-run config
+ * that coexists with per-tool mechanisms), eve's `approval` IS the tool's one
+ * approval policy — whatever this function returns is the whole decision for
+ * that call. On allow this adapter returns `'not-applicable'` by default:
+ * eve's own "no prompt needed, continue" value, matching the semantics of an
+ * omitted `approval` (`never()`). It deliberately does NOT return
+ * `'approved'`: that value asserts an affirmative approval decision this gate
+ * did not make (Intutic's allow is "no objection", not "signed off"), and its
+ * interaction with eve's `approvedTools` bookkeeping (`once()` keys off that
+ * set) is not something this adapter verified. Callers who want eve's human
+ * flow ON TOP of the governance gate set `{ onAllow: 'user-approval' }` —
+ * "governance has no objection; still ask a person" — or compose manually
+ * (see {@link intuticApproval}).
+ *
+ * ## Audit hooks — observe-only, and honestly scoped
+ *
+ * eve's hook surface (`agent/hooks/*.ts`, `dist/src/public/definitions/
+ * hook.d.ts`) exposes `approval.candidate` / `approval.settled` stream
+ * events. Handlers are OBSERVE-ONLY by eve's own contract ("fire after eve
+ * has accepted and durably recorded each event ... cannot inject model
+ * context") — {@link intuticAuditHooks} is telemetry, not enforcement; the
+ * enforcement surface is {@link intuticApproval}. (Since 0.39.1 a hook may
+ * call `ctx.cancel()` to cancel the whole running turn, but it still cannot
+ * veto or rewrite one tool call, and it runs after the event is recorded;
+ * this adapter never calls it.) LOAD-BEARING caveat,
+ * verified against `dist/src/protocol/message.d.ts`: these two events carry
+ * `requestId`/`responderPrincipalId`/`turnId`/`stepIndex` but NOT the tool
+ * name or input.
+ *
+ * Recovering the tool name: `intuticApproval()` and `intuticAuditHooks()` are
+ * both plain functions exported from this one module and cannot be assumed to
+ * run in the same process at settlement time — eve's own docs state a parked
+ * approval survives a process restart verbatim ("the process can restart and
+ * the parked turn survives", `docs/tools/human-in-the-loop.md`), so a
+ * `requestId -> toolName` map populated at approval-decision time and read
+ * back later inside the hook would silently degrade for exactly the durable,
+ * long-parked approvals this mechanism exists for — the worst kind of fix,
+ * correct in local testing and quietly wrong in the deployments that matter
+ * most. That map was NOT built.
+ *
+ * What WAS found and built instead needs no cross-call memory at all: eve
+ * ships a THIRD hookable event, `input.requested` (confirmed in the same
+ * `HookEventMap`, `dist/src/public/definitions/hook.d.ts`), fired once when a
+ * batch of human-input requests is created — including every `kind:
+ * 'tool-approval'` request `intuticApproval()`'s `'user-approval'` return
+ * value produces. Each request in that ONE event already carries
+ * `requestId` AND `action.toolName` TOGETHER (`InputRequest`,
+ * `dist/src/shared/input.d.ts`'s `inputRequestSchema` — confirmed by
+ * the shipped zod schema, not just prose; corroborated by
+ * `docs/tools/human-in-the-loop.md`'s explicit statement that "`toolName` and
+ * `requestId` identify the action and request"). {@link intuticAuditHooks}
+ * now subscribes to it too: it emits a real, tool-identified `tool_flagged`
+ * event at REQUEST time (closing the "no tool identity" gap unconditionally,
+ * with no process-boundary risk — the whole payload arrives in one event),
+ * and best-effort caches `requestId -> toolName` in memory so the LATER
+ * `approval.candidate`/`approval.settled` events attribute to the real tool
+ * name too WHEN this cache is still warm (same-process, or a short-lived
+ * pause). When it is not — a genuinely long-parked, cross-restart approval —
+ * settlement still falls back to the synthetic {@link EVE_APPROVAL_TOOL_NAME},
+ * exactly the pre-existing behaviour, never worse. Closing that residual gap
+ * would take a persistent (non-memory) correlation store.
+ *
+ * A live `eve start` run showed that `approval.candidate`/
+ * `approval.settled` fire ONLY for the `approval: { request, response }`
+ * form. The bare form this adapter documents (`approval: intuticApproval()`)
+ * settles through a fourth hookable event, `input.resolved` (`HookEventMap`,
+ * payload `InputResolvedStreamEvent` in `dist/src/protocol/message.d.ts`:
+ * `resolutions[]` of `{ kind, outcome, requestId, response? }`, no tool name).
+ * {@link intuticAuditHooks} subscribes to it as well, so bare-policy
+ * settlements are audited, with the same cache-or-synthetic tool naming; the
+ * `{ request, response }` form fires both events and is recorded once. eve
+ * 0.71 added the `'cancelled'` outcome: a pending request withdrawn because
+ * its turn was cancelled (or the relaying run ended) before anyone answered.
+ *
+ * ## LLM egress — documented honestly, not oversold
+ *
+ * eve routes models through the Vercel AI Gateway by default (a gateway model
+ * id string in `agent.ts`'s `defineAgent({ model })`, `AI_GATEWAY_API_KEY` /
+ * `VERCEL_OIDC_TOKEN` credentials — confirmed in `docs/agent-config.md` and
+ * `docs/getting-started.mdx`). The AI Gateway wire protocol is NOT something
+ * the Intutic proxy parses, so gateway-routed egress is ungoverned by the
+ * proxy — full stop. The governable path is eve's
+ * other documented option: passing a provider-authored `LanguageModel`
+ * (`createOpenAI(...)` etc.) to `defineAgent({ model })`, where the
+ * `withIntuticProxy()` helper — implemented once in `vercel.ts` and
+ * re-exported here — applies exactly as it does for the plain Vercel AI SDK.
+ * As with that framework, there is no env-var base-URL override: routing is
+ * in-code, per provider-construction call site.
+ *
+ * @module
+ */
+
+import { active as activeGate, type Gate } from './gate.js'
+import type { ToolInput } from './gate.js'
+import { GateClient } from './client.js'
+import { IntuticGateRefusal } from './errors.js'
+
+// One routing story, one implementation: eve's direct-provider path is the
+// Vercel AI SDK's (eve is built on `ai` v7), so the helper is re-exported
+// rather than duplicated. See vercel.ts for the full module doc.
+export { intuticProxyBaseUrl, intuticProxyUrl, withIntuticProxy } from './vercel.js'
+
+/** Synthetic tool name used by {@link intuticAuditHooks} — eve's
+ *  `approval.candidate`/`approval.settled` events do not carry the real tool
+ *  name (verified against `dist/src/protocol/message.d.ts`; see module doc). */
+export const EVE_APPROVAL_TOOL_NAME = 'eve:approval'
+
+/** Bound on the settlement-dedup set in {@link intuticAuditHooks}. */
+const MAX_TRACKED_SETTLEMENTS = 1024
+
+/** Structural copy of eve's `ApprovalStatus` — this package does not depend
+ *  on `eve` at runtime, so the shape is declared here rather than imported.
+ *  Confirmed field-for-field against `eve@0.71.0`'s
+ *  `dist/src/approval/definition.d.ts` (see module doc; unchanged since
+ *  0.39.1), including
+ *  the boolean back-compat forms this adapter itself never returns. */
+export type EveApprovalStatus =
+  | undefined
+  | boolean
+  | 'not-applicable'
+  | 'approved'
+  | 'denied'
+  | 'user-approval'
+  | { readonly type: 'not-applicable'; readonly reason?: never }
+  | { readonly type: 'approved'; readonly reason?: string }
+  | { readonly type: 'denied'; readonly reason?: string }
+  | { readonly type: 'user-approval'; readonly reason?: never }
+
+/** Structural copy of the slice of eve's `ApprovalContext` this adapter
+ *  reads (`toolName`, `toolInput`). The real context is wider — it extends
+ *  `SessionContext` and also carries `approvedTools`/`callId`/`abortSignal`
+ *  — so the real type is assignable to this one, which is what makes a policy declared
+ *  against this slice assignable to eve's own `ApprovalPolicy`. */
+export interface EveApprovalContext {
+  /** Final runtime tool name. Path-derived for authored tools
+   *  (`agent/tools/refund_charge.ts` → `refund_charge`); QUALIFIED for
+   *  connection tools (`billing__updateSubscription`) — see
+   *  {@link intuticConnectionApproval}. */
+  readonly toolName: string
+  /** Parsed tool input. eve documents this CAN be undefined; a non-object is
+   *  also possible for non-record input schemas — see
+   *  {@link renderEveToolInput}'s handling. */
+  readonly toolInput?: unknown
+}
+
+/** The policy function shape this adapter returns — assignable to eve's
+ *  `ApprovalPolicy` (and therefore to a tool definition's `approval` field
+ *  and a connection's `approval` field, both of which accept `Approval =
+ *  ApprovalPolicy | ApprovalConfiguration`). */
+export type EveApprovalPolicy = (ctx: EveApprovalContext) => Promise<EveApprovalStatus>
+
+export interface IntuticApprovalOptions {
+  /** Overrides the process-wide installed gate (`install(new Gate(...))`). */
+  gate?: Gate
+  /**
+   * Status returned when the gate ALLOWS the call.
+   *
+   * - `'not-applicable'` (default): continue without a human prompt — eve's
+   *   own "no prompt needed" value, the same behaviour as an omitted
+   *   `approval` (`never()`). Use when Intutic governance is the only
+   *   approval layer this tool needs.
+   * - `'user-approval'`: park the run durably for a person even though
+   *   governance has no objection — the "governance gate + human sign-off"
+   *   stack, equivalent to composing with eve's `always()`.
+   *
+   * `'approved'` is deliberately not offered — see the module doc's
+   * "Allow-shape" section. For anything more conditional (e.g. eve's
+   * `once()`, or your own tenant policy), compose manually:
+   *
+   * ```ts
+   * import { once } from 'eve/tools/approval'
+   * const intutic = intuticApproval()
+   * // inside defineTool({ ... }):
+   * approval: async (ctx) => {
+   *   const verdict = await intutic(ctx)
+   *   if (typeof verdict === 'object' && verdict?.type === 'denied') return verdict
+   *   return once()(ctx) // your own flow decides the rest
+   * },
+   * ```
+   */
+  onAllow?: 'not-applicable' | 'user-approval'
+}
+
+/**
+ * Render an eve `toolInput` as the `tool_input` object {@link Gate.guard}
+ * evaluates.
+ *
+ * Mirrors dsh.ts's `renderDshToolInput` (same reasoning as its own mirror of
+ * `wrapTools.ts`'s non-exported `renderToolInput`): a plain object passes
+ * through as-is; `undefined` (which eve documents as possible — "toolInput
+ * can be undefined, so guard the access") becomes `{}`; any other non-object
+ * value falls back to `{ args: [...] }` so the gate still has something to
+ * evaluate.
+ */
+function renderEveToolInput(input: unknown): ToolInput {
+  if (input === undefined) return {}
+  if (input !== null && typeof input === 'object' && !Array.isArray(input)) {
+    return input as ToolInput
+  }
+  return { args: [input] }
+}
+
+/**
+ * Builds an approval policy matching eve's `ApprovalPolicy` signature, for
+ * direct use as a tool definition's `approval` field:
+ *
+ * ```ts
+ * // agent/tools/refund_charge.ts
+ * import { defineTool } from 'eve/tools'
+ * import { z } from 'zod'
+ * import { intuticApproval } from '@intutic/gate/eve'
+ *
+ * export default defineTool({
+ *   description: 'Refund a charge.',
+ *   inputSchema: z.object({ chargeId: z.string(), amount: z.number() }),
+ *   approval: intuticApproval(),
+ *   async execute(input) {
+ *     return refund(input)
+ *   },
+ * })
+ * ```
+ *
+ * (Install the gate once, process-wide, e.g. in `agent.ts`:
+ * `install(new Gate({ workspaceId: process.env.INTUTIC_WORKSPACE_ID }))`.)
+ *
+ * Resolves to `'not-applicable'` on allow (or `opts.onAllow` — see
+ * {@link IntuticApprovalOptions.onAllow}) and to `{ type: 'denied', reason }`
+ * on refusal — `reason` is the `[Intutic Governance] BLOCKED: ...` message,
+ * handed back to the model in place of a tool result; the tool's `execute`
+ * never runs.
+ *
+ * Requires a `Gate` — either passed via `{ gate }` here, or installed
+ * process-wide with `install(new Gate(...))`. A call with neither throws,
+ * refusing to run the tool unguarded rather than silently skipping
+ * enforcement — same posture as `wrapTool`/`intuticHooks`/
+ * `intuticToolApproval`. A non-refusal crash inside the gate is re-thrown
+ * rather than mapped to a denial — eve's own approval docs direct policies to
+ * "throw or deny, never silently allow", and a thrown policy fails the turn
+ * (fail closed), matching vercel.ts's posture for the same status family.
+ */
+export function intuticApproval(opts: IntuticApprovalOptions = {}): EveApprovalPolicy {
+  return async (ctx) => {
+    const g = opts.gate ?? activeGate()
+    if (g === null) {
+      throw new Error(
+        'No gate configured: call install(new Gate(...)) from @intutic/gate, or pass ' +
+          '{ gate } to intuticApproval(). Refusing to run the tool unguarded.',
+      )
+    }
+    try {
+      await g.guard(ctx.toolName, renderEveToolInput(ctx.toolInput))
+      return opts.onAllow ?? 'not-applicable'
+    } catch (exc) {
+      if (exc instanceof IntuticGateRefusal) {
+        return { type: 'denied', reason: exc.message }
+      }
+      throw exc
+    }
+  }
+}
+
+/**
+ * The same policy, shaped for a CONNECTION's `approval` field — eve's MCP and
+ * OpenAPI connections accept one `approval` gating ALL of that connection's
+ * tools (`defineMcpClientConnection`/`defineOpenAPIConnection`, confirmed at
+ * `dist/src/public/definitions/connections/{mcp,openapi}.d.ts` — an omitted
+ * `approval` means every connection tool executes without approval):
+ *
+ * ```ts
+ * // agent/connections/support.ts
+ * import { defineMcpClientConnection } from 'eve/connections'
+ * import { intuticConnectionApproval } from '@intutic/gate/eve'
+ *
+ * export default defineMcpClientConnection({
+ *   url: 'https://support.example.com/mcp',
+ *   description: 'Support tickets.',
+ *   approval: intuticConnectionApproval(),
+ * })
+ * ```
+ *
+ * Implemented AS {@link intuticApproval} (one enforcement path, not two) —
+ * the separate export exists because the surface differs in one way worth
+ * knowing: `ctx.toolName` for a connection tool is the QUALIFIED name
+ * (`support__add_internal_note`, connection slug + `__` + remote tool name —
+ * eve's own convention, per `docs/patterns/multi-tenant-approvals.md`), and
+ * that qualified name is what `Gate.guard()` evaluates and what SOP rules /
+ * snapshot `tool:` subjects must match. This adapter deliberately does not
+ * strip the prefix: the qualified name is the call's real identity inside
+ * this eve app, and un-prefixing would let two connections' same-named remote
+ * tools collapse into one rule target.
+ */
+export function intuticConnectionApproval(opts: IntuticApprovalOptions = {}): EveApprovalPolicy {
+  return intuticApproval(opts)
+}
+
+// --------------------------------------------------------------------------
+// Audit hooks (observe-only)
+// --------------------------------------------------------------------------
+
+/** Structural copy of eve's `ApprovalCandidateStreamEvent` — the
+ *  `approval.candidate` payload (`dist/src/protocol/message.d.ts`). Note:
+ *  no tool name/input fields exist on this event (see module doc). */
+export interface EveApprovalCandidateEvent {
+  readonly type: 'approval.candidate'
+  readonly data: {
+    readonly candidateId: string
+    readonly outcome: 'pending' | 'rejected' | 'failed' | 'timed-out' | 'stale'
+    readonly requestId: string
+    readonly responderPrincipalId: string
+    readonly reason?: string
+    readonly sequence: number
+    readonly stepIndex: number
+    readonly turnId: string
+  }
+}
+
+/** Structural copy of eve's `ApprovalSettledStreamEvent` — the terminal
+ *  durable settlement for one approval request. */
+export interface EveApprovalSettledEvent {
+  readonly type: 'approval.settled'
+  readonly data: {
+    readonly outcome: 'approved' | 'cancelled'
+    readonly requestId: string
+    readonly responderPrincipalId: string
+    readonly sequence: number
+    readonly stepIndex: number
+    readonly turnId: string
+  }
+}
+
+/**
+ * Structural copy of one element of eve's `InputRequestedStreamEvent.data.requests`
+ * (`InputRequest`, `dist/src/shared/input.d.ts`'s `inputRequestSchema`,
+ * read from the shipped zod schema, not just its `.d.ts`) — narrowed to the
+ * fields this module reads. Unlike {@link EveApprovalCandidateEvent} /
+ * {@link EveApprovalSettledEvent}, this DOES carry the real tool name
+ * (`action.toolName`) alongside `requestId`, in the same object.
+ */
+export interface EveInputRequest {
+  readonly requestId: string
+  readonly kind: 'question' | 'session-limit' | 'tool-approval'
+  /** Required in the real shipped schema for every `kind`; kept optional
+   *  here since this module only trusts it for `kind: 'tool-approval'` and
+   *  a structural copy should not assume more than it reads. */
+  readonly action?: {
+    readonly callId: string
+    readonly toolName: string
+    readonly input?: unknown
+  }
+}
+
+/** Structural copy of eve's `InputRequestedStreamEvent` — a REAL hookable
+ *  `HookEventMap` key (`'input.requested'`, `dist/src/public/definitions/
+ *  hook.d.ts`), fired once per batch of pending human-input requests. */
+export interface EveInputRequestedEvent {
+  readonly type: 'input.requested'
+  readonly data: {
+    readonly requests: readonly EveInputRequest[]
+    readonly sequence: number
+    readonly stepIndex: number
+    readonly turnId: string
+  }
+}
+
+/**
+ * Structural copy of one element of eve's `InputResolvedStreamEvent.data.
+ * resolutions` (`InputResolution`, `dist/src/protocol/message.d.ts`): the
+ * server-accepted terminal outcome of one human-input request. Like
+ * `approval.settled` it carries no tool name — only `requestId`.
+ * `'cancelled'` was added after 0.39.1 (present in 0.71.0): the request was
+ * withdrawn, unanswered, because its turn was cancelled or the run relaying
+ * it ended — nobody decided, so it audits as `tool_flagged`, not a veto.
+ */
+export interface EveInputResolution {
+  readonly kind: 'question' | 'session-limit' | 'tool-approval'
+  readonly outcome: 'answered' | 'approved' | 'cancelled' | 'denied' | 'ignored' | 'invalid'
+  readonly requestId: string
+  readonly response?: {
+    readonly optionId?: string
+    readonly requestId: string
+    readonly text?: string
+  }
+}
+
+/** Structural copy of eve's `InputResolvedStreamEvent` — a hookable
+ *  `HookEventMap` key (`'input.resolved'`), fired once per batch of resolved
+ *  human-input requests. It is how a BARE approval policy
+ *  (`approval: intuticApproval(...)`) settles: eve emits `approval.candidate`/
+ *  `approval.settled` only for the `{ request, response }` form (observed on
+ *  a live `eve start` server). */
+export interface EveInputResolvedEvent {
+  readonly type: 'input.resolved'
+  readonly data: {
+    readonly resolutions: readonly EveInputResolution[]
+    readonly sequence: number
+    readonly stepIndex: number
+    readonly turnId: string
+  }
+}
+
+/** Structural slice of eve's `HookContext` this adapter reads. The real
+ *  context is wider (extends `SessionContext`, `agent.name` required) — the
+ *  real type is assignable to this one. */
+export interface EveHookContext {
+  readonly session: { readonly id: string }
+  readonly agent?: { readonly name: string }
+}
+
+/** The `{ events }` object {@link intuticAuditHooks} returns — structurally
+ *  a valid eve `HookDefinition`, accepted by `defineHook` as-is. */
+export interface EveAuditHookDefinition {
+  readonly events: {
+    readonly 'input.requested': (
+      event: EveInputRequestedEvent,
+      ctx: EveHookContext,
+    ) => Promise<void>
+    readonly 'approval.candidate': (
+      event: EveApprovalCandidateEvent,
+      ctx: EveHookContext,
+    ) => Promise<void>
+    readonly 'approval.settled': (
+      event: EveApprovalSettledEvent,
+      ctx: EveHookContext,
+    ) => Promise<void>
+    readonly 'input.resolved': (
+      event: EveInputResolvedEvent,
+      ctx: EveHookContext,
+    ) => Promise<void>
+  }
+}
+
+export interface IntuticAuditHooksOptions {
+  /**
+   * Fixed control-plane client. When omitted, one client is built per eve
+   * session via `GateClient.fromEnv({ harness: 'eve', sessionId })` using the
+   * eve session id off the hook context — eve's durable session IS the
+   * meaningful attribution unit here, unlike dsh (whose plugin mounts before
+   * any session exists and settles for one process-wide id). Passing a
+   * client pins every event to THAT client's own session id instead.
+   */
+  client?: GateClient
+}
+
+/**
+ * Observe-only audit emitter for eve's human-approval lifecycle, shaped for
+ * `agent/hooks/`:
+ *
+ * ```ts
+ * // agent/hooks/intutic-audit.ts
+ * import { defineHook } from 'eve/hooks'
+ * import { intuticAuditHooks } from '@intutic/gate/eve'
+ *
+ * export default defineHook(intuticAuditHooks())
+ * ```
+ *
+ * Maps eve's approval stream events onto Intutic's gate event vocabulary
+ * (the same `tool_allowed`/`tool_blocked`/`tool_flagged` names `gate.ts`
+ * emits, so the dashboard renders both sources on one timeline):
+ *
+ * - `input.requested`, one `kind: 'tool-approval'` request → `tool_flagged`,
+ *   under the REAL tool name (`request.action.toolName`) — a genuinely new
+ *   signal this adapter did not emit before: a call is now pending human
+ *   approval. See the module doc for why this event, not a
+ *   process-memory map, is what closes "no tool identity" here.
+ * - `approval.settled` `outcome: 'approved'` → `tool_allowed` — a human
+ *   explicitly approved the parked call.
+ * - `approval.settled` `outcome: 'cancelled'` → `tool_blocked` — the request
+ *   was settled without approval; the call never ran. This is a HUMAN veto
+ *   recorded for audit, not an Intutic-gate refusal (the reason string says
+ *   so), and like every `tool_blocked` it creates an incident row.
+ * - `approval.candidate` non-`'pending'` outcomes (`rejected`/`failed`/
+ *   `timed-out`/`stale`) → `tool_flagged` — a responder's attempt to answer
+ *   went somewhere worth an operator's attention. `'pending'` (a candidate
+ *   simply being created) is routine lifecycle and deliberately NOT emitted.
+ * - `input.resolved`, one `kind: 'tool-approval'` resolution — the
+ *   settlement of a BARE approval policy, for which eve emits no
+ *   `approval.settled` — → `tool_allowed` for `'approved'`, `tool_blocked`
+ *   (a human veto, as above) for `'denied'`, and `tool_flagged` for any
+ *   other outcome (`'ignored'`/`'invalid'`, and `'cancelled'` — withdrawn
+ *   unanswered with its turn, not a human decision).
+ *
+ * The `{ request, response }` approval form fires BOTH `approval.settled` and
+ * `input.resolved` for the same request (in that order, observed live); each
+ * settlement is recorded once, by whichever of the two arrives first — the
+ * richer `approval.settled`, which also names the responder, in practice.
+ *
+ * `approval.candidate`/`approval.settled` attribute to the REAL tool name
+ * when this instance's in-memory `requestId -> toolName` cache (populated
+ * by `input.requested`) is still warm, and fall back to the synthetic
+ * {@link EVE_APPROVAL_TOOL_NAME} otherwise — see the module doc for why that
+ * fallback exists and is not itself a bug.
+ *
+ * These hooks are TELEMETRY, not enforcement: eve runs hook handlers after
+ * events are durably recorded, and they cannot veto a tool call (eve's own
+ * "observe-only" hook contract; `ctx.cancel()` only cancels the whole turn,
+ * and these handlers never call it). The enforcement surface is
+ * {@link intuticApproval}. Handlers never throw — a telemetry failure must
+ * not break the run (`GateClient.emit`'s own never-throws contract).
+ */
+export function intuticAuditHooks(opts: IntuticAuditHooksOptions = {}): EveAuditHookDefinition {
+  const perSession = new Map<string, GateClient | null>()
+
+  // Best-effort, same-process-only. Populated by `input.requested` (which
+  // carries requestId and toolName together already — no correlation is
+  // needed to populate it) and consulted by `approval.candidate`/
+  // `approval.settled` (which do not carry toolName at all). Evicted on
+  // `approval.settled` — the terminal event for a requestId, after which it
+  // is never looked up again. A process that restarts between request and
+  // settlement (eve's own docs say this is expected and safe for eve itself
+  // — "the process can restart and the parked turn survives") simply finds
+  // this map empty and falls back to EVE_APPROVAL_TOOL_NAME, exactly this
+  // function's behaviour before this cache existed.
+  const requestIdToToolName = new Map<string, string>()
+
+  // A `{ request, response }` approval settles through BOTH `approval.settled`
+  // and `input.resolved`; a bare policy only through `input.resolved`. The
+  // first of the two to arrive claims the request id and records it; the
+  // second finds the claim, releases it and records nothing. A bare-policy
+  // claim is never released by a second event, so the set is capped (oldest
+  // first) to stay bounded in a long-lived process.
+  const settled = new Set<string>()
+  function claimSettlement(requestId: string): boolean {
+    if (settled.delete(requestId)) return false
+    settled.add(requestId)
+    if (settled.size > MAX_TRACKED_SETTLEMENTS) {
+      settled.delete(settled.values().next().value as string)
+    }
+    return true
+  }
+
+  function clientFor(sessionId: string): GateClient | null {
+    if (opts.client !== undefined) return opts.client
+    let client = perSession.get(sessionId)
+    if (client === undefined) {
+      try {
+        client = GateClient.fromEnv({ harness: 'eve', sessionId })
+      } catch {
+        // fromEnv throws on a missing session id, which we always supply, or
+        // on a key with no control plane address — but a telemetry hook must
+        // never take the run down over a client it could not build.
+        client = null
+      }
+      perSession.set(sessionId, client)
+    }
+    return client
+  }
+
+  return {
+    events: {
+      'input.requested': async (event, ctx) => {
+        const client = clientFor(ctx.session.id)
+        for (const request of event.data.requests) {
+          if (request.kind !== 'tool-approval' || request.action === undefined) continue
+          requestIdToToolName.set(request.requestId, request.action.toolName)
+          if (client === null) continue
+          await client.emit(
+            'tool_flagged',
+            request.action.toolName,
+            `eve requested human approval before running this tool (request ${request.requestId})`,
+            request.action.input,
+          )
+        }
+      },
+      'approval.candidate': async (event, ctx) => {
+        if (event.data.outcome === 'pending') return
+        const client = clientFor(ctx.session.id)
+        if (client === null) return
+        const toolName = requestIdToToolName.get(event.data.requestId) ?? EVE_APPROVAL_TOOL_NAME
+        const suffix = event.data.reason ? `: ${event.data.reason}` : ''
+        await client.emit(
+          'tool_flagged',
+          toolName,
+          `eve approval candidate ${event.data.outcome} (request ${event.data.requestId}, ` +
+            `responder ${event.data.responderPrincipalId})${suffix}`,
+          event.data,
+        )
+      },
+      'approval.settled': async (event, ctx) => {
+        const toolName = requestIdToToolName.get(event.data.requestId) ?? EVE_APPROVAL_TOOL_NAME
+        requestIdToToolName.delete(event.data.requestId)
+        if (!claimSettlement(event.data.requestId)) return
+        const client = clientFor(ctx.session.id)
+        if (client === null) return
+        if (event.data.outcome === 'approved') {
+          await client.emit(
+            'tool_allowed',
+            toolName,
+            `eve approval settled: approved by ${event.data.responderPrincipalId} ` +
+              `(request ${event.data.requestId})`,
+            event.data,
+          )
+          return
+        }
+        await client.emit(
+          'tool_blocked',
+          toolName,
+          `eve approval settled: cancelled — the parked tool call never ran ` +
+            `(request ${event.data.requestId}, responder ${event.data.responderPrincipalId}). ` +
+            `Human veto recorded by the observe-only audit hook, not an Intutic gate refusal.`,
+          event.data,
+        )
+      },
+      'input.resolved': async (event, ctx) => {
+        // Claim every resolution before the first await, so an
+        // `approval.settled` for the same request handled concurrently sees
+        // the claim.
+        const toRecord: Array<{ resolution: EveInputResolution; toolName: string }> = []
+        for (const resolution of event.data.resolutions) {
+          if (resolution.kind !== 'tool-approval') continue
+          const toolName = requestIdToToolName.get(resolution.requestId) ?? EVE_APPROVAL_TOOL_NAME
+          requestIdToToolName.delete(resolution.requestId)
+          if (claimSettlement(resolution.requestId)) toRecord.push({ resolution, toolName })
+        }
+        if (toRecord.length === 0) return
+        const client = clientFor(ctx.session.id)
+        if (client === null) return
+        for (const { resolution, toolName } of toRecord) {
+          const request = `(request ${resolution.requestId})`
+          if (resolution.outcome === 'approved') {
+            await client.emit('tool_allowed', toolName, `eve approval resolved: approved ${request}`, resolution)
+          } else if (resolution.outcome === 'denied') {
+            await client.emit(
+              'tool_blocked',
+              toolName,
+              `eve approval resolved: denied — the parked tool call never ran ${request}. ` +
+                `Human veto recorded by the observe-only audit hook, not an Intutic gate refusal.`,
+              resolution,
+            )
+          } else {
+            await client.emit(
+              'tool_flagged',
+              toolName,
+              `eve approval resolved with outcome '${resolution.outcome}' ${request}`,
+              resolution,
+            )
+          }
+        }
+      },
+    },
+  }
+}

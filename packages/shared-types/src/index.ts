@@ -1,0 +1,1125 @@
+/**
+ * @intutic/shared-types — Shared TypeScript types, interfaces, and enums
+ *
+ * This package is the single source of truth for all types used by 2+ packages
+ * in the Intutic monorepo. Never duplicate type definitions across services.
+ *
+ * @packageDocumentation
+ */
+
+export {
+  RiskLevel,
+  EnforcementAction,
+  TokenUtility,
+  BudgetTier,
+  ComplexityTier,
+  ChangeClassification,
+  AnomalyType,
+  HarnessType,
+  HARNESS_COUNT,
+  HARNESS_HEADLINE_COUNT,
+  ExecutionMode,
+  IncidentStatus,
+  IncidentType,
+  INCIDENT_TYPES,
+  isIncidentType,
+  SystemIncidentType,
+  PlanLifecycleState,
+  PlanExecutionOutcome,
+  SopLifecycleState,
+  RoutingTier,
+  WorkspaceRole,
+  // WS-5 — MCP proxy governance settings
+  McpProxyFailBehavior,
+  McpProxyMode,
+  BypassEnforcementTier,
+  // Migration 163 — sop_amendments producer discriminator
+  AmendmentSource,
+} from './enums.js'
+
+export {
+  DEFAULT_WORKSPACE_SETTINGS,
+  resolveWorkspaceSettings,
+  resolveSecurityProbeSampleRate,
+  MCP_ANOMALY_DETECTOR_IDS,
+  REVERT_LANE_DEFAULTS,
+  readRequireVerifiedCompletion,
+  readClosedLanes,
+  readRevertLane,
+} from './workspaceSettings.js'
+
+export type {
+  WorkspaceSettings,
+  RevertLaneSettings,
+  McpAnomalyDetectorId,
+  McpProxyFailBehavior as McpProxyFailBehaviorType,
+  McpProxyMode as McpProxyModeType,
+  BypassEnforcementTier as BypassEnforcementTierType,
+} from './workspaceSettings.js'
+
+export type {
+  PermissionSet,
+  PolicyVerdict,
+  DctToken,
+  RiskCategory,
+  InterventionMode,
+  PluginVerdict,
+  EvaluationCascadeResult,
+} from './policy.js'
+
+export { DEFAULT_DAILY_BUDGET_USD, DEFAULT_MONTHLY_BUDGET_USD } from './finops.js'
+
+export type {
+  TraceEntry,
+  CostBreakdown,
+  TraceSummary,
+  TraceListResult,
+  TraceDetail,
+  TraceFilters,
+  TraceStep,
+  TraceFindingSummary,
+  ChangeManifestEntry,
+  UpstreamAttempt,
+  UpstreamFallback,
+} from './finops.js'
+
+
+export {
+  ANOMALY_SEVERITY_MAP,
+} from './anomaly.js'
+
+export type {
+  AnomalyEvent,
+  AnomalyClassification,
+  AnomalySeverity,
+  CorrectivePromptCard,
+  ProbeType,
+  ProbeResult,
+  TrustScoreResult,
+  TrustScoreUpdate,
+  TrustEvent,
+  GovernanceIncidentStatus,
+  CapabilityMissEvent,
+  CapabilityMissInput,
+} from './anomaly.js'
+
+export type {
+  Session,
+  SessionCheckpoint,
+} from './session.js'
+
+export type {
+  Sop,
+  SopProofTree,
+  SopLifecycleTransition,
+  SopHealthMetrics,
+  SslCompileState,
+  DreamCycleQueueItem,
+  DreamCycleEnqueueInput,
+  GodelProbeResult,
+  SopContentUpdate,
+  SopLifecycleTransitionResult,
+  CascadeImpactResult,
+  CascadeInvalidationResult,
+  AntiGamingResult,
+  SopEdgeType,
+  SopGraphEdge,
+  DeviationType,
+  PlanDeviation,
+  PlanAdherenceScore,
+  StoredPlan,
+  DecisionRecommendation,
+  DecisionMiningAnalysis,
+  GodelGateResult,
+  GodelScore,
+  ProofTreeDiff,
+  SopSummary,
+  SopListResult,
+  SopFilters,
+  DecisionEntry,
+  DecisionListResult,
+  SopProvenance,
+  SopProvenanceSource,
+} from './sop.js'
+
+export { SOURCE_PROVIDERS, DOCUMENT_PROVIDERS, isSourceProvider, isDocumentProvider } from './sourceProviders.js'
+export type { SourceProvider, DocumentProvider } from './sourceProviders.js'
+
+export {
+  ACTION_TOKENS,
+  isActionToken,
+  TOOL_TOKEN_RE,
+  GuardrailIrSchema,
+  IR_KINDS,
+  FRONT_MATTER_KINDS,
+  isFrontMatterIr,
+  SETTING_KINDS,
+  SETTING_KIND_KEYS,
+  isSettingIr,
+  settingValues,
+  isEgressHostEntry,
+  MODEL_ID_RE,
+  MAX_SETTING_VALUES,
+  MIN_EGRESS_CIDR_PREFIX,
+  validateGuardrailIr,
+  canonicalizeIr,
+  irTokens,
+  MAX_HOOK_TOOLS,
+  MAX_LIST_TOKENS,
+  MAX_LITERALS,
+  MAX_LITERAL_CHARS,
+  MAX_ROLES,
+  MAX_TITLE_CHARS,
+  MAX_RATIONALE_CHARS,
+  MAX_CALLS_LIMIT,
+} from './guardrailIr.js'
+export type {
+  ActionToken,
+  GuardrailIr,
+  HookRuleIr,
+  WasmPredicateIr,
+  DecideIr,
+  FrontMatterIr,
+  SettingIr,
+  SettingKey,
+  IrKind,
+  IrValidation,
+} from './guardrailIr.js'
+
+export {
+  escapeRegexLiteral,
+  renderToolPattern,
+  renderArgPattern,
+  scrubReason,
+  renderHookReason,
+  renderHookRule,
+  renderFrontMatterLines,
+  splitFrontMatter,
+  parseFrontMatterEnforcing,
+  isEnforceableFrontMatter,
+  frontMatterToIrs,
+  frontMatterIrsOf,
+  MAX_REASON_CHARS,
+  MAX_QUOTE_IN_REASON,
+  renderGuardrailSopFile,
+  renderWorkspaceSetting,
+  HOOK_RULE_FRONT_MATTER_KEY,
+  proxyHookRule,
+  hookRuleRoles,
+  hookRuleAppliesToRole,
+  HOOK_RULE_ROLES,
+  unknownHookRuleRoles,
+  renderHookRuleFrontMatterLine,
+  DECIDE_FRONT_MATTER_KEY,
+  renderDecideFrontMatterLine,
+} from './guardrailRender.js'
+export type { HookRuleCitation, RenderedHookRule, RenderedWorkspaceSetting, ParsedFrontMatter, GuardrailSopFileInput, ProxyHookRule } from './guardrailRender.js'
+
+export {
+  DECIDE_MAX_QUESTIONS,
+  DECIDE_MAX_OPTIONS,
+  DECIDE_MAX_RULES_PER_CALL,
+  DECIDE_MAX_WHEN_CHARS,
+  DECIDE_MIN_ASK_CHARS,
+  DECIDE_MAX_ASK_CHARS,
+  DECIDE_DEFAULT_BAND,
+  DECIDE_APPROVAL_RE,
+  NONE_OF_THESE,
+  parseWhen,
+  canonicalWhen,
+  decideOptions,
+  decideQuestionBand,
+  validateDecideRule,
+  parseDecideLine,
+  parseDecideLines,
+  decideHashInput,
+  decideRuleHash,
+  kAnd,
+  kOr,
+  kNot,
+  bandValue,
+  choiceOrders,
+  choiceAtoms,
+  evalWhen,
+  combinerScore,
+  decideAtoms,
+  decideRuleOutcome,
+  selectDecideRules,
+  decideCallOutcome,
+  DECIDE_JS_SOURCE,
+} from './decide.js'
+export {
+  SNAPSHOT_FORMAT_RECORD_TAG,
+  SNAPSHOT_FORMAT,
+  DECIDE_SNAPSHOT_FORMAT,
+  DECIDE_RECORD_TAG,
+  DECIDE_FALLBACK_PREFIX,
+  DECIDE_SOP_TITLE_MAX_CHARS,
+  encodeSnapshotFormatRecord,
+  decodeSnapshotFormatRecord,
+  decideRuleRef,
+  decideFallbackId,
+  decideFallbackReason,
+  decideRuleText,
+  parseDecidePin,
+  encodeDecideRecord,
+  decodeDecideRecord,
+  DECIDE_RECORD_JS_SOURCE,
+} from './decideRecord.js'
+export type { DecideStamp, DecidePin, DecideRecord, DecideRuleCheck } from './decideRecord.js'
+export type {
+  DecideBand,
+  DecideQuestion,
+  DecideRule,
+  DecideExpr,
+  DecideValidation,
+  DecideDecl,
+  Tri as DecideTri,
+  ChoiceAtom,
+  DecideAtoms,
+  DecideAnswerInput,
+  DecideCombiner,
+  DecideRuleOutcome,
+  DecideCandidate,
+  DecideSelection,
+  DecideRuleResult,
+  DecideCallOutcome,
+} from './decide.js'
+
+export {
+  GUARDRAIL_STATUSES,
+  LIVE_GUARDRAIL_STATUSES,
+  GUARDRAIL_SOP_TITLE_PREFIX,
+  guardrailFileStem,
+  guardrailIdFromSopTitle,
+  GUARDRAIL_TARGETS,
+  GUARDRAIL_EVENT_TYPES,
+  GUARDRAIL_PROVENANCES,
+  AUTHORED_NAME_MAX_CHARS,
+  AUTHORED_DESCRIPTION_MAX_CHARS,
+  AuthoredGuardrailCreateSchema,
+  AuthoredGuardrailUpdateSchema,
+  isCandidateCitationEvidence,
+  LEDGER_OVERLAP_JACCARD,
+  LEDGER_NEAR_IDENTICAL_JACCARD,
+  LEDGER_IMPACT_MAX_DEPTH,
+  LEDGER_EDGE_TYPES,
+} from './policyGuardrails.js'
+export type {
+  GuardrailStatus,
+  GuardrailTarget,
+  GuardrailProvenance,
+  AuthoredGuardrailCreate,
+  AuthoredGuardrailUpdate,
+  AuthoredGuardrailWriteResult,
+  GuardrailCheckResult,
+  GuardrailValidationResponse,
+  GuardrailValidationFailure,
+  AuthoredCandidateEvidence,
+  GuardrailEventType,
+  GuardrailThresholds,
+  GuardrailThresholdsResponse,
+  GuardrailClauseRef,
+  GuardrailDocumentRef,
+  GuardrailSummary,
+  GuardrailEvent,
+  GuardrailPassageRef,
+  GuardrailDetail,
+  GuardrailListFilters,
+  GuardrailReadiness,
+  GuardrailReplay,
+  GuardrailConflictKind,
+  GuardrailConflict,
+  PolicyExtractionRunRef,
+  PolicyDocumentSummary,
+  PolicyPassageRow,
+  PolicyClauseRow,
+  PolicyExtractionRunRow,
+  PolicyDocumentDetail,
+  ExtractDocumentResult,
+  TokenCoverage,
+  LedgerGraph,
+  LedgerEdgeType,
+  LedgerImpact,
+  PassageSearchResult,
+  LedgerDuplicateSide,
+  LedgerDuplicates,
+  CandidateCitationEvidence,
+} from './policyGuardrails.js'
+
+
+export {
+  VALID_SOP_TRANSITIONS,
+  ENFORCEMENT_BY_STATE,
+  VALID_PLAN_TRANSITIONS,
+} from './sop.js'
+
+export {
+  IntuticError,
+  E_NOT_FOUND,
+  E_CACHE_UNAVAILABLE,
+  E_UNAUTHORIZED,
+  E_OFFBOARDING_IN_PROGRESS,
+  E_SCIM_DUPLICATE,
+  E_SCIM_AUTH_FAILED,
+  E_FORBIDDEN,
+  E_INSUFFICIENT_SCOPE,
+  E_BUDGET_EXCEEDED,
+  E_RATE_LIMITED,
+  E_APPEND_ONLY_VIOLATION,
+  E_APPROVAL_RATIONALE_REQUIRED,
+  E_VALIDATION_FAILED,
+  E_SIGNUP_DISABLED,
+  E_DOMAIN_NOT_VERIFIED,
+  E_TERMS_NOT_ACCEPTED,
+  // Identity Federation
+  E_SSO_DISABLED,
+  E_SSO_NO_MEMBERSHIP,
+  E_OIDC_INVALID_STATE,
+  E_OIDC_TOKEN_EXCHANGE_FAILED,
+  E_OIDC_CLAIMS_MISSING,
+  E_PROVIDER_DISABLED,
+  E_PROVIDER_IN_USE,
+  E_FEATURE_NOT_AVAILABLE,
+  E_SSL_NOT_ENFORCED,
+  isIntuticError,
+} from './errors.js'
+export type { IntuticErrorCode } from './errors.js'
+
+export {
+  CreateSessionSchema,
+  CreateTraceSchema,
+  PolicyVerdictSchema,
+} from './api-contracts.js'
+export type {
+  CreateSessionInput,
+  CreateTraceInput,
+  PolicyVerdictInput,
+  ReviewBudget,
+  ListMeta,
+  IncidentRow,
+  TrajectoryAlertRow,
+  AnomalyRow,
+} from './api-contracts.js'
+
+export {
+  LoginInputSchema,
+  RegisterInputSchema,
+  RefreshInputSchema,
+  ChangePasswordInputSchema,
+  InviteMemberInputSchema,
+  UpdateRoleInputSchema,
+  CreateApiKeyInputSchema,
+  UpdateApiKeyInputSchema,
+  ApiKeyScopeListSchema,
+  SignupInputSchema,
+  OrgSignupInputSchema,
+  AcceptTermsInputSchema,
+  VerifyEmailInputSchema,
+  ResendVerificationInputSchema,
+  MagicLinkRequestInputSchema,
+  MagicLinkLoginInputSchema,
+} from './auth.js'
+
+export {
+  API_SCOPE_AREAS,
+  API_SCOPES,
+  API_SCOPE_NAMES,
+  ALL_SCOPES,
+  GATEWAY_USE_SCOPE,
+  AUTOMATION_KEY_SCOPES,
+  isApiKeyScope,
+  unknownApiKeyScopes,
+  scopeGrants,
+  scopesGrantAny,
+  effectiveApiKeyScopes,
+  compactScopes,
+  intersectScopes,
+  unknownScopesMessage,
+} from './apiKeyScopes.js'
+export type { ApiKeyScope, ApiKeyScopeArea, ApiKeyScopeEntry } from './apiKeyScopes.js'
+
+export type {
+  AuthContext,
+  JwtPayload,
+  LoginInput,
+  LoginResult,
+  RegisterInput,
+  RegisterResult,
+  RefreshResult,
+  WorkspaceMemberInfo,
+  InviteMemberInput,
+  CreateApiKeyInput,
+  UpdateApiKeyInput,
+  CreateApiKeyResult,
+  ApiKeyInfo,
+  DashboardSummary,
+  SignupParams,
+  SignupResult,
+  OrgSignupParams,
+  OrgSignupResult,
+  MagicLinkRequestInput,
+  MagicLinkLoginInput,
+} from './auth.js'
+
+export {
+  SopHashReportSchema,
+  DaemonStatusSchema,
+  BatchConfigCapturePayloadSchema,
+} from './sync.js'
+
+export type {
+  SyncSopEntry,
+  SyncConfigPayload,
+  SopFileHash,
+  SopHashReport,
+  DetectedHarness,
+  DaemonStatus,
+  IntuticCredentials,
+  IntuticConfig,
+  IntegrityStore,
+  CapturedConfigFile,
+  BatchConfigCapturePayload,
+  ConfigDiff,
+} from './sync.js'
+
+export {
+  CreateSsoProviderSchema,
+  UpdateUserProfileSchema,
+} from './identity.js'
+
+export type {
+  User,
+  UserInfo,
+  SsoProvider,
+  CreateSsoProviderInput,
+  OidcClaims,
+  UpdateUserProfileInput,
+  // SCIM 2.0 (RFC 7643/7644) and the offboarding cascade it drives.
+  ScimUserResource,
+  ScimListResponse,
+  ScimPatchOp,
+  OffboardingStepResult,
+  OffboardingResult,
+} from './identity.js'
+
+// Usage
+export type {
+  UsageSummary,
+  UsageEvent,
+  ModelBreakdown,
+  VirtualKeyBreakdown,
+  MemberUsage,
+  MemberUsageResponse,
+  TeamUsage,
+  TeamUsageResponse,
+  BranchUsage,
+  BranchUsageResponse,
+  CommitUsage,
+  CommitUsageResponse,
+  PullRequestState,
+  PullRequestUsage,
+  PullRequestSources,
+  PullRequestUsageResponse,
+  PullRequestRefreshResult,
+  GitHubWebhookInfo,
+  GitHubWebhookSecret,
+} from './usage.js'
+export { normalizeGitRemote } from './gitRemote.js'
+
+// WS2: Advanced Observability
+export type {
+  TraceDagNode,
+  TraceDagResult,
+} from './observability.js'
+
+// WS4: Enterprise Identity & Compliance
+export {
+  IssueOboTokenInputSchema,
+  AttenuateTokenInputSchema,
+} from './attenuation.js'
+
+export type {
+  OboTokenGrant,
+  AttenuationResult,
+  AttenuationChainLink,
+  IssueOboTokenInput,
+  AttenuateTokenInput,
+  SsoGroupClearance,
+  SsoGroupPolicy,
+} from './attenuation.js'
+
+export {
+  SsoGroupPolicySchema,
+  parseSsoGroupPolicy,
+  evaluateSsoGroupClearance,
+  ssoGroupToolMatches,
+  ssoGroupRuleId,
+  encodeSsoGroupRecord,
+  decodeSsoGroupRecord,
+  SSO_GROUP_RECORD_TAG,
+} from './ssoGroupClearance.js'
+export type { SsoGroupDecision, SsoGroupRecord } from './ssoGroupClearance.js'
+export {
+  parseMcpRegistryRecord,
+  encodeMcpRegistryRecord,
+  decodeMcpRegistryRecord,
+  evaluateMcpRegistry,
+  isUnrestrictedMcpRegistry,
+  MCP_REGISTRY_RECORD_TAG,
+  MCP_REGISTRY_JS_SOURCE,
+  encodeMcpAllowlistRecord,
+  decodeMcpAllowlistRecord,
+  evaluateMcpAllowlist,
+  MCP_ALLOWLIST_RECORD_TAG,
+  MCP_ALLOWLIST_JS_SOURCE,
+  mcpSnapshotUnverifiedRefusal,
+  MCP_SNAPSHOT_UNVERIFIED_JS_SOURCE,
+} from './mcpRegistryRecord.js'
+export type {
+  McpRegistryRecord,
+  McpRegistryRefusal,
+  McpAllowlistRecord,
+  McpAllowlistRefusal,
+  McpSnapshotUnverifiedRefusal,
+} from './mcpRegistryRecord.js'
+export { GEMINI_CLI_GATE_ID, gateIdentitiesOf, harnessOfGate } from './gateIdentity.js'
+
+// MCP governance: call budgets, tool-change risk, description poisoning
+export {
+  McpBudgetSettingsSchema,
+  parseMcpBudgetPolicy,
+  budgetsForCall,
+  budgetWindow,
+  budgetWarnAt,
+  describeMcpBudget,
+  MCP_BUDGET_DEFAULT_WARN_PCT,
+  MAX_MCP_BUDGETS,
+  MAX_MCP_BUDGET_LIMIT,
+  MCP_BUDGET_SCOPES,
+  MCP_BUDGET_PERIODS,
+} from './mcpBudgets.js'
+export type {
+  McpBudget,
+  McpBudgetScope,
+  McpBudgetPeriod,
+  McpBudgetPolicy,
+  McpBudgetSettings,
+  McpBudgetCall,
+  McpBudgetCharge,
+} from './mcpBudgets.js'
+// LLM spend budgets (workspace, virtual key, member) and key rate limits
+export {
+  SpendBudgetSchema,
+  SpendBudgetListSchema,
+  KeyRateLimitSchema,
+  spendBudgetWindow,
+  describeSpendBudget,
+  SPEND_BUDGET_PERIODS,
+  SPEND_BUDGET_SCOPES,
+  MAX_SPEND_BUDGET_USD,
+  MAX_KEY_RPM,
+  MAX_KEY_TPM,
+  MEMBER_BUDGET_DEFAULT,
+} from './spendBudgets.js'
+export type {
+  SpendBudget,
+  SpendBudgetPeriod,
+  SpendBudgetEnforcement,
+  SpendBudgetScope,
+  KeyRateLimit,
+  HardBudgetWire,
+} from './spendBudgets.js'
+export {
+  scoreToolSetChange,
+  normalizeToolDefinition,
+  riskLevelOf,
+  MAX_TOOL_DESCRIPTION_CHARS,
+  MAX_TOOL_SCHEMA_CHARS,
+  MCP_TOOL_RISK_HIGH,
+  MCP_TOOL_RISK_MEDIUM,
+  MCP_TOOL_CAPABILITY_POINTS,
+} from './mcpToolRisk.js'
+export type {
+  McpToolDefinition,
+  McpToolCapability,
+  McpToolRiskRule,
+  McpToolRiskLevel,
+  McpToolRiskReason,
+  McpToolSetChange,
+} from './mcpToolRisk.js'
+export { scanToolDescription } from './toolPoison.js'
+
+// WS4 + WS5 new error codes
+export {
+  E_ATTENUATION_CAP_VIOLATION,
+  E_OVERAGE_HARD_CAP_EXCEEDED,
+  E_LOOP_NOT_VERIFIED,
+  E_LOOP_UNVERIFIABLE,
+  E_LOOP_VERIFY_STALE,
+} from './errors.js'
+
+// Phase 7: Intelligence Engine types (LLDs #45, #47, #48, #49, #50, #51)
+export type {
+  // SSL Runtime Enforcement
+  SslSchedulingContext,
+  SslActivationResult,
+  SslGraphJson,
+  SslStep,
+  SslToolCallContext,
+  SslEnforcementResult,
+  SslStepState,
+  SslViolationEntry,
+  SslComplianceReport,
+  SslOutOfOrderEntry,
+  ConstraintViolation,
+  ConstraintEvalResult,
+  // Token Intelligence
+  ToolCallTokenBreakdown,
+  CostPrediction,
+  TokenBaseline,
+  // Auto-Classification & Optimization
+  TraceClassificationContext,
+  WastePattern,
+  OptimizationRecommendation,
+  LlmProbeResult,
+  ProbeViolation,
+  // Slash Commands
+  SlashCommandRequest,
+  SlashCommandResponse,
+  // Harness Config & SkillOpt
+  ConfigEdit,
+  SkillOptSuggestion,
+} from './intelligence.js'
+
+export {
+  // Token Intelligence
+  type InputTokenBucket,
+  getInputBucket,
+  // Auto-Classification & Optimization
+  type WasteType,
+  type RecommendationType,
+} from './intelligence.js'
+
+// Notification Hub + Slack Adapter
+export * from './notifications.js'
+
+// Restored Stripe billing & subscription types
+export * from './billing.js'
+
+// Restored task management and alerting adapter types
+export * from './taskManagement.js'
+
+// Multi-provider credential registry
+export * from './providers.js'
+
+// Model catalog & cohort wizard
+export * from './modelCatalog.js'
+export * from './providerVerification.js'
+export * from './cloudProbe.js'
+
+
+
+
+export {
+  WASM_HOST_IMPORTS,
+  unsupportedWasmImports,
+  explainWasmImport,
+  type WasmHostImport,
+} from './wasmHost.js'
+export {
+  parseWasmRuleDescriptors,
+  type WasmRuleDescriptor,
+  type WasmRuleDescriptorsParse,
+  type WasmRuleMode,
+} from './wasmRuleDescriptor.js'
+
+// Rego policies compiled by OPA, run as rules (packages/proxy/src/wasm/opa.rs).
+export * from './regoRules.js'
+export {
+  REGO_HOST_BUILTINS,
+  REGO_HOST_BUILTIN_NAMES,
+  type RegoBuiltin,
+  type RegoBuiltinContext,
+  type RegoDigest,
+} from './regoBuiltins.js'
+
+export {
+  FIELDS as RULE_DSL_FIELDS,
+  OPERATORS as RULE_DSL_OPERATORS,
+  RENDERABLE_VERDICTS,
+  PredicateError,
+  validatePredicate,
+  renderRule,
+  type Predicate,
+  type Condition,
+  type Operator,
+  type FieldKind,
+} from './rulePredicateDsl.js'
+
+export { evaluatePredicate, compilePredicate, predicateStringValues } from './rulePredicateEval.js'
+
+export {
+  TOON_THRESHOLD_ROWS,
+  TOON_MAX_CELL_CHARS,
+  TOON_MAGIC,
+  extractColumns,
+  serializeCell,
+  toonEncode,
+  toonDecode,
+  shouldToon,
+  toonEncodeToolResult,
+  toonDecodeToolResult,
+} from './toon.js'
+
+export {
+  SECURITY_POSTURES,
+  COST_POSTURES,
+  findPosture,
+  type PosturePreset,
+  type PostureKind,
+  type PreImageEntry,
+} from './posturePresets.js'
+
+export {
+  DESTRUCTIVE_SQL_STATEMENTS,
+  findDestructiveSql,
+  type DestructiveSqlStatement,
+} from './destructiveSql.js'
+
+export {
+  HOLD_APPROVAL_HINT_TEMPLATE,
+  HOLD_ID_PLACEHOLDER,
+  holdApprovalHint,
+} from './holdMessages.js'
+
+export {
+  OPAQUE_REFUSAL_MESSAGE,
+  INTERVENTION_MODE_RECORD_TAG,
+  isOpaqueInterventionMode,
+  encodeInterventionModeRecord,
+  isOpaqueInterventionModeRecord,
+} from './opaqueRefusal.js'
+
+export {
+  SECRET_VALUE_PATTERNS,
+  secretPatternAlternation,
+  type SecretValuePattern,
+} from './secretPatterns.js'
+
+export {
+  DEFAULT_UPSTREAM_RETRY,
+  DEFAULT_UPSTREAM_RETRY_STATUSES,
+  UPSTREAM_PROVIDERS,
+  UPSTREAM_RETRY_LIMITS,
+  UpstreamFallbackTargetSchema,
+  UpstreamRetrySettingsSchema,
+  type UpstreamFallbackTarget,
+  type UpstreamProvider,
+  type UpstreamRetrySettings,
+} from './upstreamRetry.js'
+
+export {
+  PII_ACTIONS,
+  PII_DEFINITION,
+  PII_DETECTOR_IDS,
+  PiiDetectorSettingsSchema,
+  effectivePiiActions,
+  parseWorkspacePiiDetectors,
+  type PiiAction,
+  type PiiDefinition,
+  type PiiDetectorDefinition,
+  type PiiDetectorId,
+  type PiiDetectorSettings,
+  type WorkspacePiiDetectors,
+} from './piiDetectors.js'
+
+export {
+  SKILL_SCAN_PATTERNS,
+  SKILL_CONTENT_BLOCK_PATTERN_IDS,
+  scanSkillContent,
+  excerptFor,
+  EXCERPT_RADIUS,
+  SKILL_CONTENT_TRANSPORT_CHARS,
+  skillContentForTransport,
+  skillExceedsTransportCap,
+  SKILL_PARTIAL_SCAN_REASON,
+  type SemanticSkillVerdict,
+  type SkillScanCategory,
+  type SkillScanEngine,
+  type SkillScanPattern,
+  type SkillScanFinding,
+  type SkillScanResult,
+} from './skillScan.js'
+
+export {
+  SCRIPT_SCAN_PATTERNS,
+  scanScriptContent,
+  detectScriptLanguage,
+  MAX_SKILL_DIR_DEPTH,
+  MAX_FILES_PER_SKILL,
+  MAX_SCRIPT_SCAN_BYTES,
+  MAX_SCRIPT_HASH_BYTES,
+  type ScriptLanguage,
+  type SkillScriptsFacet,
+  type ScriptScanPattern,
+  type ScriptScanFinding,
+  type ScriptScanResult,
+} from './scriptScan.js'
+
+export {
+  deriveEnforcementInputs,
+  type EnforcementFacets,
+  type GovernanceCoverageInputs,
+} from './governanceCoverage.js'
+
+export {
+  DEVICE_INVENTORY_SCHEMA_VERSION,
+  REDACTED_PATH,
+  REDACTED_SEGMENT,
+  homeRelativePath,
+  sanitizeMcpEndpoint,
+  type DeviceInventory,
+  type InventoryDeviceIdentity,
+  type InventoryGateKind,
+  type InventoryGuardProbes,
+  type InventoryHarness,
+  type InventoryMcpServer,
+  type InventorySkill,
+} from './devInventory.js'
+
+export {
+  DEFAULT_PROXY_HOST,
+  proxyHost,
+  anthropicBaseUrl,
+  openaiBaseUrl,
+} from './proxyBaseUrls.js'
+export { HARNESS_RULES_FILES, rulesFileOf, harnessesReading, decisionsTargetOf, rulesFrontMatterOf } from './harnessRules.js'
+export type { HarnessRulesTarget } from './harnessRules.js'
+export { phraseText, hasPhrase, PHRASES_JS_SOURCE } from './phrases.js'
+export type { PhraseText } from './phrases.js'
+export { parseShell, dropCarriedText, isAllowEntry, commandsOutsideAllow, SHELL_PARSE_JS_SOURCE } from './shellParse.js'
+export type { SimpleCommand } from './shellParse.js'
+export { sequenceAlternatives, compileSequence, sequenceMatch, SEQUENCE_JS_SOURCE } from './sequence.js'
+export {
+  COMMAND_SIZE_LIMIT,
+  ARGUMENTS_SIZE_LIMIT,
+  HOOK_TIMEOUT_SECONDS,
+  GATE_DEADLINE_MARGIN_MS,
+  HOOK_GATE_TIMEOUTS,
+  gateDeadlineMs,
+  DETERMINISTIC_WORST_CASE_MS,
+  DECIDE_BUDGET_MARGIN_MS,
+  DECIDE_SDK_BUDGET_MS,
+  decideBudgetMs,
+} from './gateLimits.js'
+export type { HookGateHarness, HookGateTimeout, HookTimeoutSetBy } from './gateLimits.js'
+export {
+  BRIDGE_GATED_HARNESSES,
+  DELEGATED_GATE_HARNESSES,
+  NO_GATE_HARNESSES,
+  SDK_GATED_HARNESSES,
+  gateKindForHarness,
+  type GateKind,
+} from './gateKind.js'
+export { DEFAULT_FUEL_BUDGET, FUEL_EXPORT, REGO_FUEL_BUDGET, meterFuel } from './wasmFuel.js'
+export { WASM_PAGE_BYTES, capDeclaredMemory } from './wasmMemoryCap.js'
+export {
+  RULE_LOAD_FAILURE_REASONS,
+  RULE_LOAD_FAILURE_TEXT,
+  isRuleLoadFailureReason,
+  type RuleLoadFailureReason,
+} from './ruleLoadFailures.js'
+export { GATE_DECISION_VERDICTS, type GateDecisionVerdict } from './gateDecisions.js'
+
+export {
+  CHAOS_PLAN_ENV,
+  CHAOS_EVENTS_ENV,
+  CHAOS_PLAN_VERSION,
+  FAULT_IDS,
+  FAULT_CATALOG,
+  PROBE_IDS,
+  FaultSchema,
+  ChaosPlanSchema,
+  ChaosEventSchema,
+  ExperimentSchema,
+  FaultCounter,
+  encodeChaosPlan,
+  decodeChaosPlan,
+  matchesPattern,
+  faultMatches,
+  faultMessage,
+  parseChaosEvents,
+  resilienceScore,
+} from './chaos.js'
+export {
+  chaosGateDecode,
+  chaosGateMatches,
+  chaosGateEvent,
+  chaosGateAppend,
+  chaosGateClaim,
+  chaosGateCall,
+  CHAOS_GATE_JS_SOURCE,
+} from './chaosGate.js'
+export type { ChaosGateFault, ChaosGatePlan, ChaosGateCall, ChaosGateFaultOutcome, ChaosGateFs } from './chaosGate.js'
+export type {
+  FaultId,
+  Fault,
+  FaultMatch,
+  FaultSafety,
+  ChaosComponent,
+  ChaosPlan,
+  ChaosEvent,
+  Experiment,
+  ProbeId,
+  ProbeOutcome,
+  RunVerdict,
+} from './chaos.js'
+
+export { mcpDaemonPolicyGenKey, mcpDaemonPolicyKey, legacyMcpDaemonPolicyKey } from './mcpDaemonPolicyCache.js'
+
+// Control-plane response schemas (src/responses/): what each declared route answers with.
+export * from './responses/index.js'
+
+// Release flags: which products have shipped (release.ts).
+export {
+  CLOUD_RELEASED,
+  SELF_HOST_RELEASED,
+  CONTROL_PLANE_PRODUCT_RELEASED,
+  HOSTED_CONTROL_PLANE_URL,
+  NO_CONTROL_PLANE_MESSAGE,
+} from './release.js'
+
+// Decide engine client and its self-hosted host guard (decideEngine.ts, decideHostGuard.ts).
+export {
+  DECIDE_ADAPTERS,
+  DECIDE_DEFAULT_ENGINE_URL,
+  DECIDE_DEFAULT_TIMEOUT_MS,
+  DECIDE_MAX_STATE_BYTES,
+  DECIDE_MAX_RESPONSE_STATE_BYTES,
+  DECIDE_RULE_TEXT_MAX_BYTES,
+  DECIDE_LAST_USER_TURN_MAX_CHARS,
+  DECIDE_MIN_CALL_MS,
+  DECIDE_UNAVAILABLE_REFUSAL,
+  DecideEngineError,
+  buildDecideResponseState,
+  buildDecideToolCallState,
+  createDecideEngine,
+  decideCanonicalJson,
+  decideEngineErrorOutcome,
+  decideQuestionPrompts,
+  resolveDecideEngineConfig,
+  runDecideCanary,
+  DECIDE_ENGINE_JS_SOURCE,
+} from './decideEngine.js'
+export type {
+  DecideAdapter,
+  DecideAnswer,
+  DecideCanaryResult,
+  DecideEngine,
+  DecideEngineConfig,
+  DecideEngineErrorCode,
+  DecideEngineOptions,
+  DecideEngineResult,
+  DecideModelIdentity,
+  DecideQuestionCall,
+  DecideResponseStateInput,
+  DecideToolCallStateInput,
+} from './decideEngine.js'
+// The engine protections around one call's decide rules (decideEvaluate.ts).
+export {
+  DECIDE_CANARY_FILE,
+  DECIDE_CANARY_TTL_MS,
+  createDecideCanaryFileStore,
+  decideCanaryFresh,
+  decideEffectiveRollout,
+  evaluateDecideCall,
+  decideRuleCalls,
+  decideRuleEstimateMs,
+  decideStoredQ95Ms,
+  decideDecision,
+  decideShadowFindings,
+  decideUnavailableDecision,
+  DECIDE_EVALUATE_JS_SOURCE,
+  DECIDE_GATE_JS_SOURCE,
+} from './decideEvaluate.js'
+export type {
+  DecideCanaryEntry,
+  DecideCanaryFs,
+  DecideCanaryStore,
+  DecideDecision,
+  DecideEffectiveRollout,
+  DecideEvaluateDeps,
+  DecideEvaluateInput,
+  DecideEvaluation,
+  DecideRuleEntry,
+  DecideRuleReport,
+  DecideShadowWhy,
+} from './decideEvaluate.js'
+export {
+  DECIDE_HOSTED_DENYLIST,
+  DecideHostRefusedError,
+  assertSelfHostedDecisionHost,
+  checkSelfHostedDecisionHost,
+  DECIDE_HOST_GUARD_JS_SOURCE,
+} from './decideHostGuard.js'
+export type { DecideHostVerdict } from './decideHostGuard.js'
+// decide(state, questions, opts) for the SDKs (decideSdk.ts).
+export { DECIDE_ENGINE_FILE_PATH, DECIDE_SDK_DEFAULT_BUDGET_MS, decideQuestions, loadDecideEngineFile } from './decideSdk.js'
+export type { DecideSdkAnswer, DecideSdkOptions, DecideSdkResult } from './decideSdk.js'
+
+// The decide log and its drift alarm (decideLog.ts), and the excerpt's redaction patterns.
+export {
+  DECIDE_ARGS_EXCERPT_MAX_BYTES,
+  DECIDE_DRIFT_ESCALATION_DELTA,
+  DECIDE_DRIFT_INTERVAL_MS,
+  DECIDE_DRIFT_MIN_DECISIONS,
+  DECIDE_LOG_LINE_MAX_BYTES,
+  DECIDE_LOG_RETENTION_DAYS,
+  DECIDE_REDACTED,
+  DECIDE_STATS_KEEP,
+  appendDecideLogLine,
+  buildDecideDecisionRecord,
+  buildDecideEventRecord,
+  checkDecideDrift,
+  decideArgsExcerpt,
+  decideEngineHost,
+  decideLogDeps,
+  decideLogEngine,
+  decideLogFileDate,
+  decideLogFileName,
+  decideLogLine,
+  decideRedact,
+  decideTrackedP,
+  decideUtf8Prefix,
+  DECIDE_LOG_JS_SOURCE,
+  readDecideEvalRunBaseline,
+  readDecideStats,
+  recordDecideStats,
+  writeDecideCallLog,
+  writeDecideStats,
+} from './decideLog.js'
+export type {
+  DecideDecisionRecord,
+  DecideDrift,
+  DecideEvalRunBaseline,
+  DecideLogAnswer,
+  DecideLogContext,
+  DecideLogEngine,
+  DecideLogEvent,
+  DecideLogFs,
+  DecideLogRule,
+  DecideLogWriteDeps,
+  DecideStats,
+  DecideStatsDecision,
+} from './decideLog.js'
+export { decideLogRedactionSources } from './decideLogRedaction.js'
+
+// ─── Loops, graphs and gates ───────────────────────────────
+export * from './testOutcome.js'
+export * from './scopeMatch.js'
+export * from './lanes.js'
+export * from './refusalDetail.js'
+export * from './gateRuleRecord.js'
+export * from './loopVerify.js'
+export * from './sopKeySince.js'

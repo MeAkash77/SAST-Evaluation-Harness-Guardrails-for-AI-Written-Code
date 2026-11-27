@@ -1,0 +1,158 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import * as os from 'node:os'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import { buildProxyEnv, resolveSandboxRequirement, openSandboxSession, closeSandboxSession } from './exec.js'
+import type { IntuticCredentials } from '@intutic/shared-types'
+import type { GraphIdentity } from '../lib/graphIdentity.js'
+
+const creds: IntuticCredentials = {
+  apiKey: 'vk_test_wk1',
+  workspaceId: 'wk1',
+  controlPlaneUrl: 'https://cp.example',
+  email: 'dev@example.com',
+  storedAt: new Date(0).toISOString(),
+}
+
+describe('resolveSandboxRequirement', () => {
+  let tmpHome: string
+  let origHome: string | undefined
+
+  beforeEach(async () => {
+    tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), 'intutic-home-'))
+    await fs.mkdir(path.join(tmpHome, '.intutic'), { recursive: true })
+    origHome = process.env.HOME
+    process.env.HOME = tmpHome
+    // The control plane the credentials were saved with.
+    await fs.writeFile(path.join(tmpHome, '.intutic', 'credentials.json'), JSON.stringify({ controlPlaneUrl: 'https://cp.test.invalid' }))
+  })
+  afterEach(async () => {
+    process.env.HOME = origHome
+    vi.restoreAllMocks()
+    await fs.rm(tmpHome, { recursive: true, force: true })
+  })
+
+  it("returns the control plane's value and caches it", async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ settings: { sandboxRequirement: 'require' } }),
+    })) as unknown as typeof fetch)
+
+    expect(await resolveSandboxRequirement(creds)).toBe('require')
+    // cache written for offline use
+    const cached = JSON.parse(await fs.readFile(path.join(tmpHome, '.intutic', 'exec-policy.json'), 'utf-8'))
+    expect(cached.sandboxRequirement).toBe('require')
+  })
+
+  it('falls back to the cache when the control plane is unreachable', async () => {
+    await fs.writeFile(
+      path.join(tmpHome, '.intutic', 'exec-policy.json'),
+      JSON.stringify({ sandboxRequirement: 'warn' }),
+    )
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down') }) as unknown as typeof fetch)
+    expect(await resolveSandboxRequirement(creds)).toBe('warn')
+  })
+
+  it('defaults to off with no control plane and no cache (open-core safe)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }) as unknown as typeof fetch)
+    expect(await resolveSandboxRequirement(creds)).toBe('off')
+  })
+
+  it('coerces an unexpected value to off rather than trusting it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ settings: { sandboxRequirement: 'YOLO' } }),
+    })) as unknown as typeof fetch)
+    expect(await resolveSandboxRequirement(creds)).toBe('off')
+  })
+})
+
+const identity: GraphIdentity = { graphId: 'gr_test', nodeId: 'nd_test', parentId: '', depth: 0 }
+
+describe('openSandboxSession / closeSandboxSession — sandbox-usage telemetry', () => {
+  // There is no default control plane while none has launched; name one.
+  const savedUrl = process.env.INTUTIC_CONTROL_PLANE_URL
+  beforeEach(() => {
+    process.env.INTUTIC_CONTROL_PLANE_URL = 'https://cp.example'
+  })
+  afterEach(() => {
+    vi.restoreAllMocks()
+    if (savedUrl === undefined) delete process.env.INTUTIC_CONTROL_PLANE_URL
+    else process.env.INTUTIC_CONTROL_PLANE_URL = savedUrl
+  })
+
+  it('opens a SANDBOX-mode session and returns its id', async () => {
+    let sentBody: unknown
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      sentBody = JSON.parse(init?.body as string)
+      return { ok: true, json: async () => ({ sessionId: 'ses_abc123' }) }
+    }) as unknown as typeof fetch)
+
+    const id = await openSandboxSession(creds, identity, 'docker')
+    expect(id).toBe('ses_abc123')
+    expect(sentBody).toMatchObject({
+      workspaceId: 'wk1',
+      harnessType: 'sandbox',
+      executionMode: 'SANDBOX',
+    })
+  })
+
+  it('returns null (never throws) when the control plane rejects the request', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, json: async () => ({}) })) as unknown as typeof fetch)
+    expect(await openSandboxSession(creds, identity, 'docker')).toBeNull()
+  })
+
+  it('returns null (never throws) when the control plane is unreachable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED') }) as unknown as typeof fetch)
+    expect(await openSandboxSession(creds, identity, 'docker')).toBeNull()
+  })
+
+  it('closeSandboxSession PATCHes the end endpoint and never throws on failure', async () => {
+    const fetchMock = vi.fn(async () => { throw new Error('down') })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    await expect(closeSandboxSession(creds, 'ses_abc123')).resolves.toBeUndefined()
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/sessions/ses_abc123/end'),
+      expect.objectContaining({ method: 'PATCH' }),
+    )
+  })
+})
+
+describe('Subprocess Exec Env Builder', () => {
+  it('points every SDK convention at the local proxy', () => {
+    const apiKey = 'intk_test12345'
+    const env = buildProxyEnv(apiKey)
+
+    expect(env.OPENAI_API_BASE).toBe('http://localhost:4000/v1')
+    expect(env.OPENAI_BASE_URL).toBe('http://localhost:4000/v1')
+    expect(env.OPENAI_API_BASE_URL).toBe('http://localhost:4000/v1')
+    expect(env.OPENAI_HOST).toBe('http://localhost:4000')
+    expect(env.ANTHROPIC_BASE_URL).toBe('http://localhost:4000')
+
+    expect(env.OPENAI_API_KEY).toBe(apiKey)
+    expect(env.ANTHROPIC_API_KEY).toBe(apiKey)
+    expect(env.INTUTIC_API_KEY).toBe(apiKey)
+  })
+
+  it('leaves the key variables alone without a login, so the agent keeps its own', () => {
+    const env = buildProxyEnv(undefined)
+
+    expect(env.ANTHROPIC_BASE_URL).toBe('http://localhost:4000')
+    expect(env).not.toHaveProperty('OPENAI_API_KEY')
+    expect(env).not.toHaveProperty('ANTHROPIC_API_KEY')
+    expect(env).not.toHaveProperty('INTUTIC_API_KEY')
+  })
+
+  it('uses INTUTIC_PROXY_URL when set, trailing slashes trimmed', () => {
+    const prev = process.env.INTUTIC_PROXY_URL
+    process.env.INTUTIC_PROXY_URL = 'https://proxy.internal.example:8443/'
+    try {
+      const env = buildProxyEnv('intk_test12345')
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://proxy.internal.example:8443')
+      expect(env.OPENAI_BASE_URL).toBe('https://proxy.internal.example:8443/v1')
+    } finally {
+      if (prev === undefined) delete process.env.INTUTIC_PROXY_URL
+      else process.env.INTUTIC_PROXY_URL = prev
+    }
+  })
+})

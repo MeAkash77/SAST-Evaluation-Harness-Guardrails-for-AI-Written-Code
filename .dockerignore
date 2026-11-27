@@ -1,0 +1,44 @@
+node_modules
+.dist
+dist
+.git
+.github
+.turbo
+*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example
+*.md
+!README.md
+LICENSE
+.vscode
+.cursor
+.idea
+coverage
+__tests__
+tests
+*.test.ts
+*.spec.ts
+vitest.config.*
+.dockerignore
+Dockerfile
+docker-compose*.yml
+
+# Rust proxy (separate build pipeline)
+packages/proxy
+
+# Config/docs (not needed in Docker builds)
+config/
+docs/lld/
+docs/runbooks/
+docs/proposals/
+docs/recents/
+docs/reference/
+
+# Build output that is never copied into an image but is still transferred as
+# build context. `target/` is 10GB here; shipping it to the daemon on every
+# build is what timed out a control-plane image push on
+# 2026-07-30 ("failed to copy: write: broken pipe").
+target
+release-artifacts

@@ -1,0 +1,84 @@
+---
+title: Governance Controls Checklist
+description: A control-by-control mapping of what Intutic actually enforces today, stated precisely rather than rounded up.
+---
+
+# Governance Controls Checklist <Badge type="tip" text="Open-Core" />
+
+Enterprise security teams evaluating an "agent governance" product increasingly
+arrive with a specific checklist in hand — six controls that separate a
+governed agent fleet from a liability: agent-issued identity, an immutable
+audit trail, task-scoped permissions, a hard stop with clean rollback, live
+behavioural drift monitoring, and sweeps for unauthorized agents already in
+the stack.
+
+This page maps each one to what Intutic actually ships — not a marketing
+gloss. Where coverage is partial, it says so, and says why.
+
+| Control | Coverage | What backs it |
+|---|---|---|
+| **Identity issued to the agent itself** | Partial | Graph identity (`node_id`/`agent_role`/`graph_id`) is explicitly **not** verified — see the warning in [Graph Guardrails → Node identity](/guide/graph-guardrails#node-identity). An ephemeral, employee-scoped agent credential exists as a real, distinct credential type in the Cloud/Enterprise tier — see below. |
+| **An immutable audit trail behind every decision** | Strong | An append-only `notification_log` (database-trigger enforced, `UPDATE`/`DELETE` refused), trace Merkle roots with a tamper-evidence chain, and refused requests are traced too — not just the ones that succeeded. See [How It Works](/guide/how-it-works). |
+| **Permissions scoped to the task, not the role on paper** | Strong | `deny_tools` blocks a tool outright; `scope_paths` bounds *where* a task may touch; `allow_commands` bounds *which shell commands* it may run; `plan_steps` bounds *what* it consists of — genuinely task-scoped, not just role-scoped. See [SOP Front Matter](/reference/sop-front-matter). |
+| **A hard stop, and clean rollback, when an agent exceeds its authority** | Strong | `KILL` refuses the request outright; `loop kill` and `review_before` holds stop a run from proceeding. Separately, `intutic rollback` reverts a flagged-but-allowed tool call's file changes from a local pre-image cache — opt-in, captured by the Claude Code hook only, and scoped to the `warn` enforcement tier today (a `KILL`ed call never executes, so there's nothing to revert; a `require`-tier violation is refused before it runs). See [`intutic rollback`](/reference/cli#intutic-rollback). |
+| **Live monitoring for behavioural drift before it compounds** | Strong | Trajectory analysis, behavioral drift events, and anomaly promotion (a repeated finding escalates from "recorded" to "acted on" — see [Graph Guardrails](/guide/graph-guardrails)) all run continuously, not as a point-in-time audit. |
+| **Continuous sweeps for unauthorized agents already inside your stack** | Partial-to-strong | With a control plane, active network probes, run by the sync daemon at startup and on every sync on a machine where containment is expected (the workspace enforces egress, or the machine applied `intutic enforce`), raise a `CRITICAL` incident, one per machine, host and day, when a direct HTTPS connection to a provider host (`api.anthropic.com`, `api2.cursor.sh`) succeeds with a certificate the Intutic CA did not issue — containment that should be there is not. Harness config drift detection catches manual edits to governance files. The gap: the containment the probe checks for needs to be *enabled* — `intutic enforce` is opt-in, not the default. |
+
+<!-- ENTERPRISE_ONLY_START -->
+::: tip Cloud / Enterprise — agent-scoped credentials
+On-behalf-of ephemeral tokens are a distinct credential type for a bounded
+task and time window — not the developer's own shared key, and not a
+session: they name the tools they cover, and a service checks one against a
+tool with `POST /api/v1/auth/obo-token/verify`. The tool-call gates do not
+accept them yet. See [On-Behalf-Of (OBO) Tokens](/guide/security#on-behalf-of-obo-tokens). Enterprise device visibility also reports whether host-level
+enforcement (`intutic enforce`) is actually active on a given machine, not
+just configured to be — strengthening the "sweeps for unauthorized agents"
+row above.
+:::
+<!-- ENTERPRISE_ONLY_END -->
+
+## Policy review — SOPs are files you commit, not records you edit through a UI
+
+An SOP is a plain markdown file with front matter, and it is enforced by the
+local proxy reading straight off disk (`.intutic/sops/*.md`) — not gitignored,
+so the default state is that a policy change goes through the exact same
+pull-request review your code does, before it ever takes effect. This is real
+today, not aspirational: the same directory ships to a Kubernetes cluster as a
+`proxy-sops` ConfigMap, so a policy PR merge and a production policy rollout
+can be the same event.
+
+<!-- ENTERPRISE_ONLY_START -->
+**Where this is incomplete:** the control plane's own SOP registry —
+lifecycle states, the judge/validation pipeline, anti-gaming checks — is a
+separate system from the files on disk, and the two connect over three
+commands (`push`, `pull`, `status`), not a live sync. `intutic sops push` now
+carries each file's own declared title, risk tier and version faithfully
+(one control-plane SOP per file, not a folder concatenated under one
+hardcoded tier) and updates the SOP a pulled file records instead of
+creating a duplicate, `intutic sops pull` brings the registry's SOPs back down as
+files, and `intutic sops status` reports drift between the two, read-only.
+See [GitOps for SOPs](/guide/gitops-sops) for the full push/pull/status flow
+and what still requires a human to notice drift rather than a dashboard
+signal. If your policy review process depends on the control plane's
+lifecycle gates, treat the file-based review flow above as a complement to
+that, not a replacement for it, until an operator has actually run `pull` or
+`status` to confirm the two agree.
+<!-- ENTERPRISE_ONLY_END -->
+
+## What "Strong" and "Partial" mean here
+
+"Strong" means the control is enforced today, with a real mechanism behind
+it, not a policy document. "Partial" means real coverage exists but doesn't
+close the whole gap the control describes — usually because the missing
+half would require verifying something (a client-supplied identity claim)
+that is structurally unverifiable without a stronger primitive underneath it,
+or because the control is opt-in rather than a default.
+
+## Related
+
+| Page | What it covers |
+|---|---|
+| [Graph Guardrails](/guide/graph-guardrails) | The deterministic detector taxonomy and SOP enforcement |
+| [Security](/security) | Full threat model, data flow, and encryption |
+| [Policies & Enforcement](/guide/policies) | Network egress control and sandboxed execution |
+| [Sandboxed Execution](/guide/sandboxed-execution) | What `intutic exec --sandbox` isolates, and what platforms it does and doesn't cover |

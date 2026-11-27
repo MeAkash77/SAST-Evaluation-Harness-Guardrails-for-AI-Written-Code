@@ -1,0 +1,1384 @@
+//! Configuration loader — LiteLLM-compatible config.yaml parser.
+//!
+//! Reads the same config.yaml format as BerriAI/LiteLLM and LiteLLM-Rust.
+//! Adds Intutic-specific settings under `intutic_settings`.
+
+use serde::Deserialize;
+use std::path::Path;
+
+/// What the router does with the model it selects.
+///
+/// `Enforce` is the `Default` so an existing config keeps its behaviour. A
+/// router that silently stops routing is the worse of the two failure
+/// directions — the operator sees no change and assumes it is still working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    /// Do not route at all. Distinct from `enabled: false`, which also skips
+    /// the reward loop; `Off` is for turning routing off while leaving the rest
+    /// of the machinery observable.
+    Off,
+    /// Select, record, and serve the requested model anyway.
+    Shadow,
+    #[default]
+    Enforce,
+}
+
+/// Top-level configuration structure
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProxyConfig {
+    /// LiteLLM model list (provider routes).
+    ///
+    /// Defaults to empty. Upstreams are resolved from `ANTHROPIC_UPSTREAM_URL`
+    /// and friends at request time (see proxy.rs), so an empty list is a valid
+    /// standalone setup rather than a misconfiguration — and without a default
+    /// here, a proxy with no config.yaml cannot start at all.
+    #[serde(default)]
+    pub model_list: Vec<ModelEntry>,
+
+    /// Intutic-specific settings (WASM, DLP, SnipCompactor)
+    #[serde(default)]
+    pub intutic_settings: IntuticSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModelEntry {
+    pub model_name: String,
+    pub litellm_params: LiteLLMParams,
+}
+
+/// The one `litellm_params` field the proxy reads. A LiteLLM config's
+/// `api_key`, `api_base` and `general_settings` are not modelled: upstreams
+/// and keys come from the environment, and serde ignores unknown keys, so a
+/// config copied from LiteLLM still loads without implying they take effect.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiteLLMParams {
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct IntuticSettings {
+    #[serde(default)]
+    pub snip_compactor: SnipCompactorConfig,
+    #[serde(default)]
+    pub dlp: DlpConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
+    #[serde(default)]
+    pub routing: RoutingConfig,
+    /// Override for the local WASM rule directory (default: `~/.intutic/wasm`).
+    /// The `INTUTIC_WASM_DIR` env var takes precedence over this value.
+    #[serde(default)]
+    pub wasm_local_dir: Option<String>,
+    /// `/fix` and `/draw` command behaviour.
+    #[serde(default)]
+    pub commands: CommandsConfig,
+    /// Local memory vaults searched by `/fix`.
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    /// Default ceiling for a workflow (loop run).
+    #[serde(default)]
+    pub workflow: WorkflowConfig,
+    /// Response-side tool-call gate.
+    #[serde(default)]
+    pub response_gate: ResponseGateConfig,
+    /// Bounded, DLP-scrubbed response-snippet capture for
+    /// `response_injection:*` echo findings.
+    #[serde(default)]
+    pub response_injection_snippet: ResponseInjectionSnippetConfig,
+    /// L1 egress enforcement — deny/monitor/enforce + allow policy.
+    #[serde(default)]
+    pub egress: crate::egress_policy::EgressConfig,
+    /// L2 hosted-gateway front door — vk_-only enforcement.
+    #[serde(default)]
+    pub gateway: crate::gateway::GatewayConfig,
+    /// Cloud upstreams — Bedrock, Vertex AI, Azure OpenAI (`crate::cloud`).
+    #[serde(default)]
+    pub providers: crate::cloud::config::ProvidersConfig,
+    /// Customer calls to decision models (`/v1/systemone`, `/v1/decisions`).
+    #[serde(default)]
+    pub decision_traffic: DecisionTrafficConfig,
+}
+
+/// Whether the decision-traffic version pin refuses or only logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionTrafficMode {
+    /// A call naming a moving alias, or a model with no version, is refused.
+    #[default]
+    Enforce,
+    /// Such a call is forwarded and logged as `would_refuse_unpinned`.
+    Shadow,
+}
+
+/// Governing customer calls to decision models (`crate::decision_traffic`).
+///
+/// DLP and egress apply to these calls with their own settings; this block
+/// holds what is particular to decision traffic.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DecisionTrafficConfig {
+    #[serde(default)]
+    pub mode: DecisionTrafficMode,
+    /// Admit a model with no pinned version, such as `jev-latest`.
+    #[serde(default)]
+    pub allow_unpinned: bool,
+    /// The lowest acceptable top probability per question name, `*` for every
+    /// question. A question answered below its floor is named in the
+    /// `x-intutic-decision-abstain` response header.
+    #[serde(default)]
+    pub floors: std::collections::BTreeMap<String, f64>,
+    /// Models whose every call needs a person before the app acts on it
+    /// (`x-intutic-decision-requires-human: 1`).
+    #[serde(default)]
+    pub consequential_models: Vec<String>,
+    /// Where `/v1/systemone` calls go: `UPSTREAM_URL`, else TypeSafe's API.
+    #[serde(default)]
+    pub systemone_upstream: Option<String>,
+    /// Where `/v1/decisions` calls go: `UPSTREAM_URL`, else OpenAI's API.
+    #[serde(default)]
+    pub decisions_upstream: Option<String>,
+}
+
+impl DecisionTrafficConfig {
+    /// A floor outside `[0, 1]` is a mistake in the file, not a setting.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, floor) in &self.floors {
+            if !(floor.is_finite() && (0.0..=1.0).contains(floor)) {
+                anyhow::bail!(
+                    "decision_traffic.floors.{name} = {floor} is not a probability between 0 and 1"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Refusing a forbidden tool call in the model's *response*, before the client
+/// can execute it (`plugins::response_gate`).
+///
+/// Both fields default to the safe direction. `enabled` is on because the
+/// alternative is a deny list that only takes effect one turn after the call it
+/// forbids has already run — which is what the request-side check alone gives
+/// you, and is not what an operator writing `deny_tools` believes they bought.
+///
+/// The gate is inert for any role with an empty deny list, so a default-on
+/// fail-closed gate cannot affect a workspace that has declared no policy.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ResponseGateConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// What to do when the response body will not parse and a deny list is in
+    /// force: refuse (`true`, the default) or forward it unverified.
+    ///
+    /// Streaming is unaffected — see `plugins::response_gate` for why a stream
+    /// cannot honour this without ending every stream rather than a suspect one.
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
+
+    /// After refusing a call on a non-streaming response, ask the model to carry
+    /// on without it, instead of answering with the refusal and ending the
+    /// agent's turn. Off by default: each continuation is another billed call.
+    #[serde(default)]
+    pub continue_after_refusal: bool,
+}
+
+impl Default for ResponseGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fail_closed: true,
+            continue_after_refusal: false,
+        }
+    }
+}
+
+/// Bounded, DLP-scrubbed capture of response text around a firing
+/// `response_injection:*` pattern (`injection::extract_scrubbed_snippet`).
+///
+/// Capture, not enforcement — `response_injection_findings` never influences
+/// a disposition and this config cannot change that. It only controls
+/// whether an operator gets enough context to adjudicate a finding as
+/// TRUE_POSITIVE/FALSE_POSITIVE.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ResponseInjectionSnippetConfig {
+    /// Off disables snippet capture; pattern names alone still ride the
+    /// trace as before. Default on.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Total window width in bytes, split ~evenly before/after the match.
+    /// Hard-capped at `injection::MAX_SNIPPET_WINDOW_BYTES` regardless of
+    /// this value — that cap is NOT operator-configurable, deliberately.
+    #[serde(default = "default_snippet_window_bytes")]
+    pub window_bytes: usize,
+}
+
+impl Default for ResponseInjectionSnippetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_bytes: 200,
+        }
+    }
+}
+
+fn default_snippet_window_bytes() -> usize {
+    200
+}
+
+/// Default spend ceiling for a workflow, for deployments with no control plane.
+///
+/// `WorkflowBudgetDetector` compares a loop run's spend against a ceiling written
+/// by "whoever started the run". In the enterprise deployment that is the control
+/// plane. In open core nothing wrote it, so the ceiling was always absent, which
+/// correctly reads as "unbudgeted" — and the detector could therefore never fire.
+/// This gives open core a writer without changing the enterprise behaviour: the
+/// value is only ever set if no ceiling exists.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WorkflowConfig {
+    /// Ceiling in USD applied to a loop run that arrives without one. `None`
+    /// leaves runs uncapped, which is the behaviour before this setting existed.
+    #[serde(default)]
+    pub default_budget_usd: Option<f64>,
+}
+
+/// Local markdown memory vaults (Obsidian, Logseq, Foam, or any notes folder).
+///
+/// This is the local-first counterpart to the cloud memory providers: search
+/// runs on the developer's machine, so a private vault never leaves it.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MemoryConfig {
+    /// Master switch for local vault search.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Vault directories to search. `~` is expanded. A vault found by walking
+    /// up from the working directory (one carrying a `.obsidian`, `.logseq` or
+    /// `.foam` marker) is searched even when this list is empty.
+    #[serde(default)]
+    pub vaults: Vec<String>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            vaults: Vec::new(),
+        }
+    }
+}
+
+/// Settings for the `/fix` and `/draw` blocking commands.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CommandsConfig {
+    /// When true, `/fix` does not answer locally: the synthesis card is
+    /// appended to the user's prompt (command token stripped) and the turn is
+    /// forwarded to the upstream provider, so the model sees the enhanced
+    /// prompt. `/draw` stays blocking either way — a visualization has no
+    /// upstream half. Default false: blocking costs zero tokens.
+    #[serde(default)]
+    pub non_blocking: bool,
+}
+
+/// Policy enforcement settings — controls connection to the control plane
+/// for pre-request SOP policy checks.
+///
+/// If `fail_closed` is true (the default), a policy check failure or timeout
+/// causes the request to be refused with 403 `policy_denied` (403
+/// `GOVERNANCE_UNAVAILABLE` when the workspace's PII detector actions cannot be
+/// read). If false, the request is allowed through (fail-open, useful in dev
+/// mode only).
+#[derive(Debug, Deserialize, Clone)]
+pub struct PolicyConfig {
+    /// Base URL of the Intutic control plane (e.g., `https://api.intutic.ai`).
+    /// Set via `CONTROL_PLANE_URL` env var (takes precedence over config file).
+    #[serde(default)]
+    pub control_plane_url: Option<String>,
+
+    /// Whether to block the request (fail closed) when the control plane
+    /// is unreachable or returns an unexpected error.
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
+
+    /// Timeout in milliseconds for the policy check HTTP call.
+    #[serde(default = "default_policy_timeout_ms")]
+    pub timeout_ms: u64,
+    // Multi-region failover was removed on 2026-07-30. `current_region`,
+    // `fallback_region`, `fallback_region_url` and `effective_control_plane_url()`
+    // lived here: the accessor was called only by its own tests while production
+    // read `control_plane_url` directly (proxy.rs:1226,1381,2021), and no env var
+    // it needed was set in any manifest. It had been recorded as done; it
+    // never was. The control-plane half went the same day.
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            control_plane_url: std::env::var("CONTROL_PLANE_URL").ok(),
+            fail_closed: true,
+            timeout_ms: 3_000,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SnipCompactorConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_max_tool_output_tokens")]
+    pub max_tool_output_tokens: usize,
+    #[serde(default = "default_collapse_threshold")]
+    pub collapse_repetitions_above: usize,
+    #[serde(default = "default_true")]
+    pub import_dedup: bool,
+    #[serde(default = "default_true")]
+    pub stack_trace_dedup: bool,
+    #[serde(default = "default_true")]
+    pub whitespace_normalize: bool,
+
+    // ── JSON-aware compression (snip_json.rs) ──────────────────────────────
+    /// Maximum number of array items to retain before collapsing the tail.
+    #[serde(default = "default_json_max_array_items")]
+    pub json_max_array_items: usize,
+    /// Maximum characters to keep from a JSON string value.
+    /// Values shorter than this are always preserved verbatim.
+    #[serde(default = "default_json_max_string_value_chars")]
+    pub json_max_string_value_chars: usize,
+    /// Minimum Shannon entropy (0–1) for a string value to be preserved verbatim
+    /// despite being longer than `json_max_string_value_chars`.
+    /// High-entropy values (UUIDs, hashes, API keys) are kept.
+    #[serde(default = "default_json_entropy_threshold")]
+    pub json_entropy_threshold: f64,
+
+    // ── Code skeleton extraction (snip_code.rs) ────────────────────────────
+    /// When true, code blocks detected in tool outputs are compressed to their
+    /// structural skeleton (function signatures, type definitions, imports).
+    #[serde(default = "default_true")]
+    pub code_skeleton_enabled: bool,
+    /// Minimum line count for a code block to be worth skeleton-extracting.
+    /// Blocks shorter than this pass through unchanged.
+    #[serde(default = "default_code_skeleton_min_lines")]
+    pub code_skeleton_min_lines: usize,
+
+    /// Enable per-thread incremental parse cache for code skeleton extraction.
+    /// When true, identical code blocks (same content hash) are not re-parsed by
+    /// tree-sitter on the same thread — the cached skeleton is returned immediately.
+    ///
+    /// Activate only after 30-day telemetry review confirms:
+    ///   - p99 code input > 50 KB  AND  same-content hit rate > 20%.
+    ///
+    /// Default: false (cache disabled; negligible overhead when off).
+    #[serde(default)]
+    pub code_skeleton_incremental_cache: bool,
+}
+
+impl Default for SnipCompactorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_tool_output_tokens: 8192,
+            collapse_repetitions_above: 3,
+            import_dedup: true,
+            stack_trace_dedup: true,
+            whitespace_normalize: true,
+            json_max_array_items: 3,
+            json_max_string_value_chars: 20,
+            json_entropy_threshold: 0.85,
+            code_skeleton_enabled: true,
+            code_skeleton_min_lines: 10,
+            code_skeleton_incremental_cache: false,
+        }
+    }
+}
+
+/// An operator-supplied DLP pattern.
+///
+/// The built-in set in `dlp.rs` is deliberately narrow: every pattern there is
+/// anchored on a literal prefix or magic substring, because a false positive in
+/// a secret scanner teaches people to switch it off. That doctrine excludes a
+/// whole class of things operators legitimately need to stop — PHI, customer
+/// identifiers, internal record formats — which are shaped by *their* schema,
+/// not by a vendor's.
+///
+/// Those cannot ship in the binary, and until now there was no way to add them
+/// at all: `DlpConfig` was three booleans, `PATTERNS` was a `Lazy` built once,
+/// and there was no env var, config key, or control-plane source. Adding one
+/// pattern meant editing Rust and cutting a release.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CustomDlpPattern {
+    /// Stable identifier. Appears in `DlpFinding.pattern_name`, so the
+    /// escalation detector counts distinct names — reuse one and two findings
+    /// collapse into one for threshold purposes.
+    pub name: String,
+    /// Grouping used by SOP taint rules (`pii()` matches `pii` and `phi`) and by the redaction
+    /// placeholder, which is `[REDACTED_{CATEGORY}]`, uppercased.
+    pub category: String,
+    /// Rust `regex` crate syntax. Note: no lookaround. Use inline group flags
+    /// such as `(?i: ... )` for case-insensitivity.
+    pub regex: String,
+    /// `block` or `redact`. Those are the only two the enforcer implements —
+    /// there is no warn or mask tier — so anything else is rejected at boot
+    /// rather than silently treated as one of them.
+    #[serde(default = "default_redact_action")]
+    pub action: String,
+}
+
+fn default_redact_action() -> String {
+    "redact".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DlpConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub scan_input: bool,
+    #[serde(default = "default_true")]
+    pub scan_output: bool,
+    /// Operator patterns, appended to the built-in set. Compiled once at boot;
+    /// a bad regex is a named startup failure, never a panic at first scan.
+    #[serde(default)]
+    pub patterns: Vec<CustomDlpPattern>,
+    /// Action per built-in PII detector, by id (`pii.card`, `pii.iban`,
+    /// `pii.ssn`, `pii.email`, `pii.phone`): `off`, `redact` or `block`.
+    /// Unlisted detectors keep their defaults from `dlp/pii_detectors.json`;
+    /// an unknown id or action stops the proxy at boot
+    /// (`dlp::install_pii_actions`). For a workspace that sets
+    /// `piiDetectors`, that setting is the baseline for its requests and
+    /// these may only tighten it (`dlp::workspace_pii_policy`); `enabled`,
+    /// `scan_input` and `scan_output` switch off this machine's own patterns,
+    /// never the detectors the workspace names (`dlp::direction_scan`).
+    #[serde(default)]
+    pub detectors: std::collections::BTreeMap<String, String>,
+    /// How many bytes of decoded response text the streaming forward loop
+    /// lags behind the model, so that a secret split across two SSE deltas is
+    /// seen whole before its first byte is forwarded.
+    ///
+    /// `None` — the default — means the bound derived from the installed
+    /// pattern set (`dlp::derive_holdback`), currently 1020 bytes. `0`
+    /// disables the holdback and restores the pre-holdback behaviour exactly,
+    /// split-pattern leak included. Any other value is a deliberate trade:
+    /// secrets longer than it can still be split undetected.
+    ///
+    /// # Why the default is on, at the full derived bound
+    ///
+    /// Both available defaults do harm, so this picks the one whose harm is
+    /// visible.
+    ///
+    /// Defaulting to `0` would ship a DLP control that reports healthy and
+    /// does not enforce — `dlp.scan_output: true` would keep meaning "output
+    /// DLP is on" while the split-delta case walked through it. That is the
+    /// failure mode this codebase warns about repeatedly, and it is invisible
+    /// by construction: nothing in a metric, a log or a dashboard
+    /// distinguishes "no secrets in the output" from "secrets we could not
+    /// see". A latency regression, by contrast, is noticed within one
+    /// request.
+    ///
+    /// Defaulting to the derived bound is not free and the cost is not small:
+    /// time-to-first-token grows by the time the model needs to produce the
+    /// holdback (2.5–4 s at 250–400 B/s for the built-in set's 1020 bytes).
+    /// Three things make it defensible rather than reckless:
+    ///
+    /// 1. It is scoped to deployments that already asked for output DLP:
+    ///    `enabled && scan_output`, or a workspace whose `piiDetectors`
+    ///    baseline scans responses whatever those switches say. The
+    ///    deployments whose latency changes are exactly the ones that were
+    ///    being told they had a protection they did not have.
+    /// 2. It is not silent. `dlp::resolve_holdback` logs the effective byte
+    ///    count, the derived bound, the pattern that set it, and the
+    ///    latency consequence, once, on the first streamed response.
+    /// 3. It costs time-to-first-token only. The holdback is flushed before
+    ///    the terminal event, so the last byte and the total response time
+    ///    are unchanged. An operator who cannot pay it sets a smaller number
+    ///    and the boot log states, in bytes, what that buys.
+    ///
+    /// The alternative of picking some smaller round number as the default
+    /// was rejected: it would have neither the guarantee of the derived bound
+    /// nor the honesty of `0`, and no one could say what it protected.
+    #[serde(default)]
+    pub stream_holdback_bytes: Option<usize>,
+}
+
+impl Default for DlpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_input: true,
+            scan_output: true,
+            patterns: Vec::new(),
+            detectors: std::collections::BTreeMap::new(),
+            stream_holdback_bytes: None,
+        }
+    }
+}
+
+/// Contextual bandit routing settings.
+///
+/// In control-plane-managed workspaces the Valkey feature-flag hash
+/// (`workspace:feature_flags:{ws}` → `ff_bandit_routing`) is authoritative.
+/// `enabled` only applies when that hash is absent — i.e. standalone
+/// open-core mode with no control plane managing the workspace.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoutingConfig {
+    /// `None` — defer entirely to the Valkey feature flag (control-plane managed).
+    /// `Some(true)` — enable bandit routing in standalone mode.
+    ///
+    /// Standalone, `mode: shadow` with `enabled` unset turns routing on for
+    /// shadow: see [`RoutingConfig::standalone_active`].
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Candidate model pool for Thompson sampling. A request enters routing
+    /// only when its model is a candidate, or a dated snapshot or `-latest`
+    /// alias of one (`routing::bandit::model_line`); anything else bypasses
+    /// the bandit entirely. A workspace's own `routingCandidates` setting
+    /// replaces this list for that workspace, and either list is narrowed per
+    /// request to the models the request can reach (`proxy::routing_pool`):
+    /// a translatable wire format, the model allowlists, the spend budgets, a
+    /// credential, and the models that credential was seen to list.
+    ///
+    /// When `model_list` is non-empty, candidates are validated against it at
+    /// config load and unmatched names are DROPPED with an error log — see
+    /// `load_config`. This comment used to say the names "must match
+    /// `model_list` entries" while nothing checked: `model_list` was parsed and
+    /// never read by any code, so a typo here produced a candidate the bandit
+    /// could select and the upstream would 404 — session-locked, unpenalised,
+    /// and repeated by every fresh session. With an empty `model_list`
+    /// (standalone, upstreams from env) no validation is possible and the
+    /// runtime fallback in proxy.rs is the safety net.
+    #[serde(default = "default_candidate_models")]
+    pub candidate_models: Vec<String>,
+
+    /// When set, any Anthropic-bound model is rewritten to this ID after
+    /// routing. `None` (the default) leaves the routed model untouched.
+    ///
+    /// Note this fires AFTER selection, so a workspace using it gets no reward
+    /// signal: crediting the chosen arm with a different model's behaviour is
+    /// worse than learning nothing. See `override_fired` in proxy.rs.
+    #[serde(default)]
+    pub anthropic_model_override: Option<String>,
+
+    /// What routing does with its selection.
+    ///
+    /// `Shadow` runs `route_model` in full and records what it would have
+    /// picked, while the request is served with the model the caller asked for.
+    /// That yields reach and exposure — "we would have downgraded 34% of
+    /// requests, $X/mo" — and **nothing about quality**, because the other model
+    /// never ran. Only mirroring can measure that.
+    ///
+    /// Standalone, `mode: shadow` is enough on its own: with `enabled` unset
+    /// it runs the selection for shadow ([`RoutingConfig::standalone_active`]).
+    /// It used to need `enabled: true` as well and, without it, silently did
+    /// nothing. An explicit `enabled: false` still wins, with a warning at
+    /// startup.
+    #[serde(default)]
+    pub mode: RoutingMode,
+
+    /// Fraction of eligible requests to mirror, in `[0.0, 0.05]`.
+    ///
+    /// Mirroring issues the SAME request to the routed candidate as well,
+    /// serves the requested model's response, and scores the candidate's off the
+    /// latency path. It is the only thing in the plan that produces real quality
+    /// evidence — shadow cannot, because the cheap model never ran.
+    ///
+    /// Capped at 5%: every mirrored request is paid for twice.
+    #[serde(default)]
+    pub mirror_sample_rate: f64,
+
+    /// An explicit, operator-directed mirror candidate — independent of
+    /// `mode`/shadow routing.
+    ///
+    /// Before this field existed, the mirror candidate (`mirror_candidate` in
+    /// `proxy.rs`) could only come from `shadow_selection`, which is itself only populated when
+    /// `mode: shadow` is active AND the bandit's selection for this request
+    /// happened to disagree with what was served. That makes mirroring
+    /// structurally unreachable for the case an operator actually wants: "test
+    /// THIS specific model release against a sample of live traffic," where the
+    /// model may not be one the bandit would ever pick — it may not even be a
+    /// bandit candidate at all.
+    ///
+    /// When set, `proxy.rs` mirrors this model for a sampled
+    /// fraction of ALL eligible non-streaming traffic (still governed by
+    /// `mirror_sample_rate` and the same concurrency/rate ceilings in
+    /// `routing::mirror`), regardless of what shadow routing decided. If both
+    /// this field and a shadow disagreement would apply to the same request,
+    /// this one wins — it is operator-directed ("test THIS model now"), while
+    /// the shadow candidate is an incidental byproduct of whatever the bandit
+    /// happened to disagree on that turn.
+    ///
+    /// **Deliberately NOT run through the `candidate_models`/`model_list`
+    /// validation in `load_config` below.** That filter drops any
+    /// `candidate_models` entry the (non-empty) `model_list` doesn't already
+    /// know about, on the theory that an unlisted name is a routing typo the
+    /// bandit would otherwise select and have the upstream 404. Neither
+    /// justification applies here: this field is never selected by the bandit
+    /// (`route_model` never reads it), and the mirrored call never resolves an
+    /// upstream through `model_list` at all — it is resolved like a fallback
+    /// target (`proxy::resolve_target`): the candidate's own provider, URL and
+    /// credential, and skipped, with the reason counted, when the request's
+    /// format cannot reach it as-is or the workspace has no key for it. The
+    /// whole point of this knob is to mirror-test a model release that has
+    /// *not* been onboarded to `model_list` yet; running it through that filter
+    /// would silently drop it at startup with no visible error the moment an
+    /// operator configured exactly the thing this field exists for. A typo'd
+    /// name here still fails safely: `run_mirror` treats a non-2xx or
+    /// unreachable upstream as "not scoreable" and drops it, same as any other
+    /// mirror candidate.
+    ///
+    /// `None` (the default) leaves mirroring exactly as before: driven only by
+    /// shadow disagreement, when `mode: shadow` is active.
+    #[serde(default)]
+    pub mirror_candidate_model: Option<String>,
+
+    /// Ceiling, in seconds, on how long a session's injected SOP advisory
+    /// block stays pinned to its first-rendered bytes.
+    ///
+    /// The bandit's session lock above already pins the MODEL choice for
+    /// KV-cache warmth; this is the same idea applied to the governance text
+    /// `sops::inject_into_body` prepends at `system[0]`/`messages[0]` on
+    /// every request, which used to re-render (and therefore potentially
+    /// change) on every turn even with the model held constant — moving the
+    /// prefix underneath a cache the model pin could not save. The pin's
+    /// Valkey key TTL IS this mechanism: set once at pin-creation time from
+    /// this value, never refreshed on a later read, so a session cannot
+    /// game staleness by staying active.
+    ///
+    /// `0` disables pinning entirely — every request falls back to exactly
+    /// today's per-request render-and-inject behaviour. This one DOES get a
+    /// config off-switch (unlike the cache-aware pricing-correctness fix): prompt
+    /// content staleness for up to this many seconds is a real, if usually
+    /// small, product trade — a SOP edited or a tier flipped mid-session
+    /// will not reach an active session's injected text until the pin
+    /// expires — and that trade-off is more subjective than a pricing bug,
+    /// so an operator who wants zero staleness at the cost of the cache win
+    /// gets to say so.
+    ///
+    /// Defaults to 600 (10 minutes): long enough that a typical multi-turn
+    /// agent session sees one stable prefix for its whole working span
+    /// rather than re-paying the cache-cold cost every few turns, short
+    /// enough that an edited SOP or a flipped tier reaches every active
+    /// session within one coffee break rather than "whenever this session
+    /// happens to end."
+    #[serde(default = "default_sop_pin_max_age_secs")]
+    pub sop_pin_max_age_secs: u64,
+
+    /// How old a `SessionRouting::cache_observed_at` observation may be and
+    /// still count as "fresh" for the cache-honesty guard (`bandit.rs`,
+    /// immediately after the session-lock check). Defaults to 300 —
+    /// Anthropic's own prompt-cache TTL, so this tracks the window the
+    /// observation is actually still true for, not an arbitrary staleness
+    /// budget. `0` is the KILL SWITCH: the guard never finds a fresh
+    /// observation and always falls through to normal sampling.
+    #[serde(default = "default_cache_guard_max_age_secs")]
+    pub cache_guard_max_age_secs: u64,
+
+    /// The minimum observed cache-read fraction (basis points, 0-10_000) for
+    /// the guard to consider a scope "warm enough" to decline sampling and
+    /// stay on the requested model. Defaults to 5000 (50%) — a coin-flip
+    /// cache-read rate is not worth pinning a whole turn's routing decision
+    /// over, but a majority-warm prefix is.
+    #[serde(default = "default_cache_guard_min_read_bp")]
+    pub cache_guard_min_read_bp: u32,
+
+    /// Prompt size, in bytes, above which the guard's cold-start heuristic
+    /// declines to sample on a scope's FIRST turn (no cache observation
+    /// exists yet to consult). A large first prompt is the shape most
+    /// likely to be worth keeping a stable prefix for. Fires at most once
+    /// per scope — the moment any real cache observation exists (even a
+    /// stale or cold one), evidence supersedes the heuristic permanently.
+    /// `0` disables just this heuristic, leaving the evidence-based guard
+    /// itself untouched.
+    #[serde(default = "default_cache_guard_cold_start_prompt_bytes")]
+    pub cache_guard_cold_start_prompt_bytes: usize,
+
+    #[serde(default)]
+    pub reward: RewardConfig,
+
+    /// Retrying a provider call that failed before any response reached the
+    /// client — `routing::retry` has the rules. On by default. A workspace's
+    /// `upstreamRetry` setting overrides these field by field.
+    #[serde(default)]
+    pub retry: crate::routing::retry::RetryConfig,
+
+    /// Where a request goes when its model's retries are exhausted: ordered
+    /// targets keyed by the model that was sent upstream. Empty by default —
+    /// a fallback serves a model the caller did not ask for, so it is opted
+    /// into per model, never implied.
+    #[serde(default)]
+    pub fallbacks: crate::routing::retry::FallbackMap,
+}
+
+impl RoutingConfig {
+    /// Whether routing runs when no control-plane feature flags govern the
+    /// workspace (standalone open core). `enabled` when it is set; otherwise
+    /// on exactly for `mode: shadow`, which only records what it would pick
+    /// and serves the requested model. `mode: off` is checked separately by
+    /// the caller, ahead of this and of the flags.
+    pub fn standalone_active(&self) -> bool {
+        self.enabled.unwrap_or(self.mode == RoutingMode::Shadow)
+    }
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            candidate_models: default_candidate_models(),
+            anthropic_model_override: None,
+            // Enforce: an existing config keeps routing. A router that silently
+            // stops routing is the worse failure direction.
+            mode: RoutingMode::default(),
+            // No mirroring unless asked for. Every mirrored request is paid for
+            // twice, so it must be opted into rather than defaulted on.
+            mirror_sample_rate: 0.0,
+            // Unset: mirroring stays driven by shadow disagreement only, same
+            // as before this field existed.
+            mirror_candidate_model: None,
+            sop_pin_max_age_secs: default_sop_pin_max_age_secs(),
+            cache_guard_max_age_secs: default_cache_guard_max_age_secs(),
+            cache_guard_min_read_bp: default_cache_guard_min_read_bp(),
+            cache_guard_cold_start_prompt_bytes: default_cache_guard_cold_start_prompt_bytes(),
+            reward: RewardConfig::default(),
+            retry: crate::routing::retry::RetryConfig::default(),
+            fallbacks: crate::routing::retry::FallbackMap::new(),
+        }
+    }
+}
+
+/// Local deterministic reward loop settings.
+///
+/// Rewards are computed only from signals the proxy already observes
+/// (upstream success, latency vs SLO, token anomaly, cost ratio) — no LLM
+/// judge. The update rule matches the control-plane reward cron so arm state
+/// stays continuous when a workspace upgrades to cloud-managed learning.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RewardConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Latency SLO; responses slower than this are penalised proportionally.
+    /// Includes full stream duration for streaming responses.
+    #[serde(default = "default_latency_slo_ms")]
+    pub latency_slo_ms: u32,
+
+    /// Maximum reward deduction for exceeding the latency SLO.
+    #[serde(default = "default_latency_penalty")]
+    pub latency_penalty: f64,
+
+    /// Reward deduction when the token-anomaly detector fires.
+    #[serde(default = "default_token_anomaly_penalty")]
+    pub token_anomaly_penalty: f64,
+
+    /// Maximum reward deduction when the routed model costs more than the
+    /// requested model would have.
+    #[serde(default = "default_cost_penalty")]
+    pub cost_penalty: f64,
+}
+
+impl Default for RewardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            latency_slo_ms: 30_000,
+            latency_penalty: 0.3,
+            token_anomaly_penalty: 0.2,
+            cost_penalty: 0.2,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_max_tool_output_tokens() -> usize {
+    8192
+}
+fn default_collapse_threshold() -> usize {
+    3
+}
+fn default_policy_timeout_ms() -> u64 {
+    3_000
+}
+fn default_json_max_array_items() -> usize {
+    3
+}
+fn default_json_max_string_value_chars() -> usize {
+    20
+}
+fn default_json_entropy_threshold() -> f64 {
+    0.85
+}
+fn default_code_skeleton_min_lines() -> usize {
+    10
+}
+/// One current model per first-party provider, ids as the pricing bundle and
+/// model catalog name them. An Anthropic-format request can be routed only
+/// between the Claude and Gemini entries (there is no Messages → OpenAI
+/// translation); an OpenAI-format request between all three.
+fn default_candidate_models() -> Vec<String> {
+    vec![
+        "claude-sonnet-5-5".to_string(),
+        "gpt-4.1".to_string(),
+        "gemini-3.8-flash".to_string(),
+    ]
+}
+fn default_sop_pin_max_age_secs() -> u64 {
+    600
+}
+fn default_cache_guard_max_age_secs() -> u64 {
+    300
+}
+fn default_cache_guard_min_read_bp() -> u32 {
+    5_000
+}
+fn default_cache_guard_cold_start_prompt_bytes() -> usize {
+    20_000
+}
+fn default_latency_slo_ms() -> u32 {
+    30_000
+}
+fn default_latency_penalty() -> f64 {
+    0.3
+}
+fn default_token_anomaly_penalty() -> f64 {
+    0.2
+}
+fn default_cost_penalty() -> f64 {
+    0.2
+}
+
+pub fn load_config(path: &str) -> anyhow::Result<ProxyConfig> {
+    // A missing config file is not an error. `npm i -g @intutic/proxy` installs
+    // a binary and nothing else, so a user following the documented install has
+    // no config.yaml in their working directory — and this previously exited
+    // with a bare `No such file or directory (os error 2)`, which says nothing
+    // about what was being looked for (issue #1). Every field either has a
+    // serde default or is optional, so defaults are a working standalone
+    // configuration: DLP on, no control plane, upstreams from env.
+    //
+    // A file that exists but is malformed still fails: that is a real mistake
+    // and silently ignoring it would be worse than stopping.
+    let contents = match std::fs::read_to_string(Path::new(path)) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                path = %path,
+                "No config file found — running with built-in defaults. \
+                 Set CONFIG_PATH to use one."
+            );
+            String::from("{}")
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to read config file '{}': {}",
+                path,
+                e
+            ));
+        }
+    };
+    let mut config: ProxyConfig = serde_yaml::from_str(&contents)?;
+
+    // Environment variables take precedence over config file
+    if let Ok(env_url) = std::env::var("CONTROL_PLANE_URL") {
+        if !env_url.is_empty() {
+            config.intutic_settings.policy.control_plane_url = Some(env_url);
+        }
+    }
+
+    // Dynamically route based on INTUTIC_REGION
+    if let Ok(region) = std::env::var("INTUTIC_REGION") {
+        if !region.is_empty() {
+            if let Some(ref mut url) = config.intutic_settings.policy.control_plane_url {
+                if url.contains("api.intutic.ai") {
+                    *url = url.replace("api.intutic.ai", &format!("api.{}.intutic.ai", region));
+                } else if url.contains("control-plane.intutic.svc") {
+                    *url = url.replace(
+                        "control-plane.intutic.svc",
+                        &format!("control-plane.intutic-{}.svc", region),
+                    );
+                }
+            }
+        }
+    }
+
+    // Out-of-range retry values are clamped and unusable fallback targets
+    // dropped here, once, rather than on every request.
+    {
+        let routing = &mut config.intutic_settings.routing;
+        routing.retry = routing.retry.clone().bounded();
+        routing.fallbacks =
+            crate::routing::retry::sanitize_fallbacks(std::mem::take(&mut routing.fallbacks));
+    }
+
+    // ── Candidate-pool validation: the read that makes `model_list` real ──
+    //
+    // `model_list` was parsed and consumed by nothing, while the field comment
+    // on `candidate_models` claimed the two "must match" — a textbook inert
+    // control inside the routing layer itself. When a model list exists, it is
+    // now the registry of servable models: candidates it does not contain are
+    // dropped loudly rather than left for an upstream 404 to discover.
+    //
+    // Dropped, not fatal. The proxy sits on the developer's hot path, and
+    // refusing to boot over a routing typo would block every request to make a
+    // point about a subset of them. An emptied pool disables the bandit
+    // entirely (route_model only engages when the requested model is in the
+    // pool), which is the correct fail-safe: no routing beats wrong routing.
+    if !config.model_list.is_empty() {
+        let servable: std::collections::HashSet<&str> = config
+            .model_list
+            .iter()
+            .flat_map(|m| [m.model_name.as_str(), m.litellm_params.model.as_str()])
+            .collect();
+        let routing = &mut config.intutic_settings.routing;
+        let before = routing.candidate_models.len();
+        routing.candidate_models.retain(|c| {
+            let ok = servable.contains(c.as_str());
+            if !ok {
+                tracing::error!(
+                    candidate = %c,
+                    "routing.candidate_models entry not present in model_list — dropped. \
+                     The bandit will not consider it; add it to model_list to route to it."
+                );
+            }
+            ok
+        });
+        if before > 0 && routing.candidate_models.is_empty() {
+            tracing::error!(
+                "every routing candidate was dropped by model_list validation; \
+                 bandit routing is effectively disabled for this proxy"
+            );
+        }
+        // `mirror_candidate_model` is INTENTIONALLY not passed through this
+        // `retain` — see its doc comment on `RoutingConfig` for the full
+        // reasoning. Short version: it is not a bandit candidate and the
+        // mirrored call does not resolve its upstream via `model_list`, so
+        // filtering it here would only silently defeat the field's purpose
+        // (testing a model `model_list` does not know about yet).
+    }
+
+    if let Some(warning) = shadow_without_routing_warning(&config.intutic_settings.routing) {
+        tracing::warn!("{warning}");
+    }
+
+    config.intutic_settings.decision_traffic.validate()?;
+
+    Ok(config)
+}
+
+/// The startup warning for `mode: shadow` under an explicit `enabled: false`,
+/// which runs no selection standalone and so records nothing.
+fn shadow_without_routing_warning(routing: &RoutingConfig) -> Option<&'static str> {
+    (routing.mode == RoutingMode::Shadow && routing.enabled == Some(false)).then_some(
+        "routing.mode is shadow but routing.enabled is false: standalone, no selection runs,          so shadow routing records nothing. Remove `enabled: false` (shadow alone turns it on)          or set mode to off.",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    /// A config copied from LiteLLM loads: the keys the proxy does not act on
+    /// (`api_key`, `api_base`, `general_settings`) are ignored, not refused.
+    #[test]
+    fn a_litellm_config_with_keys_the_proxy_ignores_still_loads() {
+        let config: ProxyConfig = serde_yaml::from_str(
+            r#"
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: https://llm.example.internal
+general_settings:
+  master_key: not-used
+  database_url: postgresql://not-used
+intutic_settings:
+  harness_overrides:
+    advertise_url: false
+"#,
+        )
+        .expect("a LiteLLM-shaped config parses");
+        assert_eq!(config.model_list[0].litellm_params.model, "openai/gpt-4o");
+    }
+
+    /// Absent `routing:` block yields control-plane-deferred defaults.
+    #[test]
+    fn test_routing_config_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("INTUTIC_REGION");
+        let config_content = r#"
+model_list: []
+general_settings: {}
+intutic_settings: {}
+"#;
+        let file_path = std::env::temp_dir().join("test_routing_defaults.yaml");
+        std::fs::write(&file_path, config_content).unwrap();
+        let config = load_config(file_path.to_str().unwrap()).unwrap();
+
+        let routing = &config.intutic_settings.routing;
+        assert_eq!(routing.enabled, None);
+        assert_eq!(
+            routing.candidate_models,
+            vec!["claude-sonnet-5-5", "gpt-4.1", "gemini-3.8-flash"]
+        );
+        assert!(routing.anthropic_model_override.is_none());
+        assert!(routing.reward.enabled);
+        assert_eq!(routing.reward.latency_slo_ms, 30_000);
+        assert!((routing.reward.latency_penalty - 0.3).abs() < f64::EPSILON);
+        assert!((routing.reward.token_anomaly_penalty - 0.2).abs() < f64::EPSILON);
+        assert!((routing.reward.cost_penalty - 0.2).abs() < f64::EPSILON);
+        assert!(config.intutic_settings.wasm_local_dir.is_none());
+        // Mirroring's two independent switches must BOTH default off: a typo
+        // adding a nonzero sample rate somewhere is bounded by
+        // `MAX_SAMPLE_RATE`, but nothing bounds an operator accidentally
+        // inheriting a candidate model they never configured — the field must
+        // come back `None` with no config present at all.
+        assert_eq!(
+            routing.mirror_sample_rate, 0.0,
+            "mirroring must be off until explicitly opted into"
+        );
+        assert!(
+            routing.mirror_candidate_model.is_none(),
+            "no config file must not somehow name a mirror candidate"
+        );
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    /// The feature's two independent knobs both default off, and — the part
+    /// that actually matters — `mirror_sample_rate: 0.0` makes the whole
+    /// feature a no-op REGARDLESS of `mirror_candidate_model`. A leftover or
+    /// mis-set candidate model with no sample rate to go with it must never
+    /// fire.
+    ///
+    /// The candidate-model half is `should_mirror`'s job to enforce (it takes
+    /// the rate, not the config struct), and
+    /// `routing::mirror::tests::does_not_mirror_when_disabled` already pins
+    /// that a `0.0` rate refuses regardless of which two distinct model names
+    /// are passed. This test pins the config-level half: that defaulting
+    /// leaves both knobs in the state that test relies on.
+    #[test]
+    fn mirroring_is_a_complete_no_op_when_unconfigured() {
+        let default_routing = RoutingConfig::default();
+        assert_eq!(default_routing.mirror_sample_rate, 0.0);
+        assert!(default_routing.mirror_candidate_model.is_none());
+    }
+
+    /// The response gate must be on, and fail closed, without anyone writing a
+    /// `response_gate:` block. A gate that ships off is a gate nobody enables.
+    #[test]
+    fn test_response_gate_defaults_on_and_closed() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("INTUTIC_REGION");
+        let file_path = std::env::temp_dir().join("test_response_gate_defaults.yaml");
+        std::fs::write(&file_path, "model_list: []\nintutic_settings: {}\n").unwrap();
+        let config = load_config(file_path.to_str().unwrap()).unwrap();
+
+        let gate = &config.intutic_settings.response_gate;
+        assert!(gate.enabled);
+        assert!(gate.fail_closed);
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    /// Both switches are reachable from config.yaml, and one may be set without
+    /// silently resetting the other.
+    #[test]
+    fn test_response_gate_explicit() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("INTUTIC_REGION");
+        let file_path = std::env::temp_dir().join("test_response_gate_explicit.yaml");
+        std::fs::write(
+            &file_path,
+            "model_list: []\nintutic_settings:\n  response_gate:\n    fail_closed: false\n",
+        )
+        .unwrap();
+        let config = load_config(file_path.to_str().unwrap()).unwrap();
+
+        let gate = &config.intutic_settings.response_gate;
+        assert!(gate.enabled, "an unspecified field must keep its default");
+        assert!(!gate.fail_closed);
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    /// The default pool names models the pricing bundle knows exactly, so a
+    /// default pick is priced at its own rate and is a model that exists — a
+    /// stale default (the pool once named `claude-3-5-sonnet`) is routed to
+    /// until a provider retires it.
+    #[test]
+    fn default_candidates_are_models_the_pricing_bundle_names() {
+        let bundle: serde_json::Value =
+            serde_json::from_str(include_str!("pricing/offline_bundle.json")).unwrap();
+        let models = bundle["models"].as_object().unwrap();
+        for candidate in default_candidate_models() {
+            assert!(models.contains_key(&candidate), "{candidate}");
+        }
+    }
+
+    /// Explicit `routing:` block round-trips; unspecified reward fields keep defaults.
+    #[test]
+    fn test_routing_config_explicit() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("INTUTIC_REGION");
+        let config_content = r#"
+model_list: []
+intutic_settings:
+  routing:
+    enabled: true
+    candidate_models: ["claude-3-5-sonnet", "gpt-4o"]
+    anthropic_model_override: "claude-opus-4-5"
+    reward:
+      enabled: false
+      latency_slo_ms: 5000
+      latency_penalty: 0.5
+  wasm_local_dir: "/custom/wasm"
+"#;
+        let file_path = std::env::temp_dir().join("test_routing_explicit.yaml");
+        std::fs::write(&file_path, config_content).unwrap();
+        let config = load_config(file_path.to_str().unwrap()).unwrap();
+
+        let routing = &config.intutic_settings.routing;
+        assert_eq!(routing.enabled, Some(true));
+        assert_eq!(
+            routing.candidate_models,
+            vec!["claude-3-5-sonnet", "gpt-4o"]
+        );
+        assert_eq!(
+            routing.anthropic_model_override.as_deref(),
+            Some("claude-opus-4-5")
+        );
+        assert!(!routing.reward.enabled);
+        assert_eq!(routing.reward.latency_slo_ms, 5_000);
+        assert!((routing.reward.latency_penalty - 0.5).abs() < f64::EPSILON);
+        // Unspecified fields fall back to defaults.
+        assert!((routing.reward.token_anomaly_penalty - 0.2).abs() < f64::EPSILON);
+        assert!((routing.reward.cost_penalty - 0.2).abs() < f64::EPSILON);
+        assert_eq!(
+            config.intutic_settings.wasm_local_dir.as_deref(),
+            Some("/custom/wasm")
+        );
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    /// `mode: off` must actually stop routing.
+    ///
+    /// The enum documented three values and only `Shadow` was ever read:
+    /// `bandit_active` came from the feature flags or `routing.enabled`, so a
+    /// workspace could set `mode: off` and keep routing AND keep enforcing. A
+    /// config knob a reader would reasonably take for a kill switch, that
+    /// stopped nothing. There was no test for `mode` at all.
+    #[test]
+    fn routing_mode_off_is_read_by_the_proxy() {
+        let proxy = include_str!("proxy.rs");
+        assert!(
+            proxy.contains("RoutingMode::Off"),
+            "`mode: off` is documented and never consulted — it must gate `bandit_active`",
+        );
+        // And it must gate the decision, not merely be mentioned.
+        assert!(
+            proxy.contains("let bandit_active = !routing_off"),
+            "`off` must short-circuit `bandit_active`, or a remote flag overrides \
+             the operator's stop",
+        );
+    }
+
+    /// Standalone `mode: shadow` used to do nothing without `enabled: true`,
+    /// although the field's comment says shadow runs the selection.
+    #[test]
+    fn standalone_shadow_turns_routing_on_unless_explicitly_disabled() {
+        let shadow = |enabled| RoutingConfig {
+            enabled,
+            mode: RoutingMode::Shadow,
+            ..Default::default()
+        };
+        assert!(
+            shadow(None).standalone_active(),
+            "shadow alone must run the selection"
+        );
+        assert!(shadow(Some(true)).standalone_active());
+        assert!(
+            !shadow(Some(false)).standalone_active(),
+            "an explicit false still wins"
+        );
+        assert!(shadow_without_routing_warning(&shadow(Some(false))).is_some());
+        assert!(shadow_without_routing_warning(&shadow(None)).is_none());
+
+        // Enforce keeps needing `enabled: true` standalone.
+        let enforce = |enabled| RoutingConfig {
+            enabled,
+            mode: RoutingMode::Enforce,
+            ..Default::default()
+        };
+        assert!(!enforce(None).standalone_active());
+        assert!(enforce(Some(true)).standalone_active());
+
+        let proxy = include_str!("proxy.rs");
+        assert!(
+            proxy.contains(".standalone_active()"),
+            "the proxy must decide standalone routing through standalone_active"
+        );
+    }
+
+    #[test]
+    fn routing_mode_parses_all_three_values() {
+        for (raw, want) in [
+            ("off", RoutingMode::Off),
+            ("shadow", RoutingMode::Shadow),
+            ("enforce", RoutingMode::Enforce),
+        ] {
+            let got: RoutingMode = serde_yaml::from_str(raw).expect("mode parses");
+            assert_eq!(got, want, "`{raw}` must parse to {want:?}");
+        }
+    }
+
+    /// The validation that makes `model_list` a read structure.
+    ///
+    /// It was parsed and consumed by nothing while the candidate-pool comment
+    /// claimed the two "must match" — so a typo produced a candidate the
+    /// bandit could select and the upstream would 404, session-locked and
+    /// unpenalised. These drive the real loader through a temp file, because
+    /// the validation lives in `load_config`, not in serde.
+    #[test]
+    fn candidates_absent_from_a_nonempty_model_list_are_dropped() {
+        let dir = std::env::temp_dir().join("intutic-config-validation-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+model_list:
+  - model_name: real-model
+    litellm_params:
+      model: openai/real-model
+intutic_settings:
+  routing:
+    enabled: true
+    candidate_models: ["real-model", "typo-model"]
+"#,
+        )
+        .expect("write config");
+
+        let cfg = load_config(path.to_str().unwrap()).expect("loads");
+        let pool = &cfg.intutic_settings.routing.candidate_models;
+        assert_eq!(
+            pool,
+            &vec!["real-model".to_string()],
+            "a candidate model_list does not carry must be dropped, not left for \
+             an upstream 404 to discover"
+        );
+    }
+
+    #[test]
+    fn an_empty_model_list_validates_nothing() {
+        // Standalone: upstreams from env, no registry to check against. The
+        // runtime fallback in proxy.rs is the net for this shape.
+        let dir = std::env::temp_dir().join("intutic-config-validation-test-empty");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "intutic_settings:\n  routing:\n    candidate_models: [\"anything-goes\"]\n",
+        )
+        .expect("write config");
+        let cfg = load_config(path.to_str().unwrap()).expect("loads");
+        assert_eq!(
+            cfg.intutic_settings.routing.candidate_models,
+            vec!["anything-goes".to_string()]
+        );
+    }
+
+    /// The startup trap `mirror_candidate_model` must NOT fall into.
+    ///
+    /// `candidate_models` entries absent from a non-empty `model_list` are
+    /// dropped by `load_config` (see
+    /// `candidates_absent_from_a_nonempty_model_list_are_dropped` above) —
+    /// correctly, for the bandit, whose selection resolves an upstream
+    /// through `model_list`. `mirror_candidate_model` does neither of those
+    /// things: the bandit never reads it, and the mirrored call reuses the
+    /// primary request's already-resolved upstream verbatim. If this field
+    /// were run through the same `retain`, an operator configuring a
+    /// brand-new model release — the exact case the field exists for — would
+    /// have it silently eaten at startup, with no visible error and mirroring
+    /// simply never happening. This pins that it survives a `model_list` that
+    /// has never heard of it.
+    #[test]
+    fn mirror_candidate_model_survives_a_model_list_that_does_not_list_it() {
+        let dir = std::env::temp_dir().join("intutic-config-validation-test-mirror-candidate");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+model_list:
+  - model_name: real-model
+    litellm_params:
+      model: openai/real-model
+intutic_settings:
+  routing:
+    mirror_sample_rate: 0.05
+    mirror_candidate_model: "brand-new-unreleased-model"
+"#,
+        )
+        .expect("write config");
+
+        let cfg = load_config(path.to_str().unwrap()).expect("loads");
+        assert_eq!(
+            cfg.intutic_settings
+                .routing
+                .mirror_candidate_model
+                .as_deref(),
+            Some("brand-new-unreleased-model"),
+            "model_list validation must not silently drop a mirror candidate \
+             it has never heard of — that is precisely the model this field \
+             exists to let an operator test"
+        );
+    }
+}
+
+#[cfg(test)]
+mod decision_traffic_tests {
+    use super::*;
+
+    #[test]
+    fn decision_traffic_defaults_to_enforce_and_reads_every_setting() {
+        let cfg: ProxyConfig = serde_yaml::from_str("{}").unwrap();
+        let dt = &cfg.intutic_settings.decision_traffic;
+        assert_eq!(dt.mode, DecisionTrafficMode::Enforce);
+        assert!(!dt.allow_unpinned && dt.floors.is_empty());
+
+        let cfg: ProxyConfig = serde_yaml::from_str(
+            "intutic_settings:\n  decision_traffic:\n    mode: shadow\n    allow_unpinned: true\n    \
+             floors: {approve: 0.8, \"*\": 0.5}\n    consequential_models: [jev-1.14.0]\n    \
+             systemone_upstream: http://kev.internal:8009\n",
+        )
+        .unwrap();
+        let dt = &cfg.intutic_settings.decision_traffic;
+        assert_eq!(dt.mode, DecisionTrafficMode::Shadow);
+        assert!(dt.allow_unpinned);
+        assert_eq!(dt.floors.get("*"), Some(&0.5));
+        assert_eq!(dt.consequential_models, ["jev-1.14.0"]);
+        assert_eq!(
+            dt.systemone_upstream.as_deref(),
+            Some("http://kev.internal:8009")
+        );
+        assert!(dt.validate().is_ok());
+    }
+
+    #[test]
+    fn a_floor_that_is_not_a_probability_is_refused() {
+        for bad in ["1.5", "-0.1", ".nan"] {
+            let cfg: ProxyConfig = serde_yaml::from_str(&format!(
+                "intutic_settings:\n  decision_traffic:\n    floors: {{approve: {bad}}}\n"
+            ))
+            .unwrap();
+            assert!(
+                cfg.intutic_settings.decision_traffic.validate().is_err(),
+                "{bad}"
+            );
+        }
+        let unknown_mode: Result<ProxyConfig, _> =
+            serde_yaml::from_str("intutic_settings:\n  decision_traffic:\n    mode: off\n");
+        assert!(unknown_mode.is_err(), "a mode typo must not pass silently");
+    }
+}

@@ -1,0 +1,126 @@
+# Default Intutic Proxy Configuration — dev mode
+model_list:
+  - model_name: claude-3-5-sonnet
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20241022
+
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+
+  - model_name: gemini-2.0-flash
+    litellm_params:
+      model: gemini/gemini-2.0-flash
+
+general_settings:
+  master_key: ""
+
+intutic_settings:
+  snip_compactor:
+    enabled: true
+    max_tool_output_tokens: 8192
+    collapse_repetitions_above: 3
+    import_dedup: true
+    stack_trace_dedup: true
+    whitespace_normalize: true
+
+  dlp:
+    enabled: true
+    scan_input: true
+    scan_output: true
+
+  policy:
+    # Will be overridden by CONTROL_PLANE_URL env var if set
+    control_plane_url: "https://api.intutic.ai"
+    fail_closed: true
+    timeout_ms: 3000
+
+  harness_overrides:
+    advertise_url: true
+
+  # Contextual bandit model routing (standalone open-core mode).
+  # In control-plane-managed workspaces the ff_bandit_routing feature flag
+  # in Valkey is authoritative and this block's `enabled` is ignored.
+  # routing:
+  #   enabled: true
+  #   # The models the router may choose between. A workspace's own
+  #   # routingCandidates setting replaces this list for that workspace, and
+  #   # each request only ever sees the candidates it can reach: one in a
+  #   # format the request can be translated to (an Anthropic-format request
+  #   # never goes to an OpenAI model), allowed, within budget, with a key.
+  #   candidate_models: ["claude-sonnet-5-5", "gpt-4.1", "gemini-3.8-flash"]
+  #   # Uncomment to restore the pre-v1.6 behavior of pinning every
+  #   # Anthropic-bound request to a single model:
+  #   # anthropic_model_override: "claude-opus-4-8"
+  #
+  #   # off | shadow | enforce. Default enforce, so an existing config keeps
+  #   # routing — a router that silently stops routing is the worse failure
+  #   # direction. `shadow` selects in full and serves the model the caller
+  #   # asked for anyway, recording what it WOULD have picked.
+  #   #
+  #   # Shadow yields reach and counterfactual cost ("we would have downgraded
+  #   # 34% of requests, $X/mo") and NOTHING about quality — the other model
+  #   # never ran. Only mirroring measures that.
+  #   #
+  #   # In a control-plane-managed workspace the ff_shadow_routing flag is
+  #   # authoritative. It is a separate flag from ff_bandit_routing on purpose:
+  #   # once that key exists for a workspace, this file is ignored for it
+  #   # forever, so a config toggle could not roll shadow back.
+  #   mode: shadow
+  #
+  #   # Fraction of eligible requests to ALSO issue to the routed candidate,
+  #   # scoring its response off the latency path and discarding it. This is
+  #   # the only thing here that measures quality rather than reach.
+  #   #
+  #   # EVERY MIRRORED REQUEST IS BILLED TWICE. Start at 0.01, not the 0.05
+  #   # ceiling. The ceiling is enforced in code regardless of what is written
+  #   # here, so a typo adding a zero costs a rounding error rather than the
+  #   # month; concurrency is capped at 4 in flight; streaming is never
+  #   # mirrored.
+  #   mirror_sample_rate: 0.01
+  #
+  #   # An explicit, operator-directed mirror candidate — independent of
+  #   # `mode`/shadow above. When set, THIS model is mirrored against a
+  #   # sampled fraction of ALL eligible traffic (still governed by
+  #   # `mirror_sample_rate` and the ceilings above), regardless of what
+  #   # shadow routing decided. This is how you mirror-test a brand-new model
+  #   # release the bandit would never pick on its own — it does not even
+  #   # need to be listed in `candidate_models` or `model_list` above.
+  #   # Unset (the default) leaves mirroring driven by shadow disagreement
+  #   # only, as above.
+  #   mirror_candidate_model: null
+  #
+  #   reward:
+  #     enabled: true
+  #     latency_slo_ms: 30000
+  #     latency_penalty: 0.3
+  #     token_anomaly_penalty: 0.2
+  #     # Two-sided since v1.11: cheaper earns, costlier loses. Safe only
+  #     # because response integrity is scored — rewarding cheapness without a
+  #     # quality signal is how a router learns to save money by being wrong.
+  #     cost_penalty: 0.2
+  #
+  #   # Retrying a provider call that failed before any response reached the
+  #   # client: 429, 500, 502, 503, 504, 529, timeouts and dropped connections.
+  #   # ON by default with these values; a stream that has started is never
+  #   # retried. A provider's retry-after is honoured when it fits the budget.
+  #   retry:
+  #     enabled: true
+  #     max_attempts: 3          # per model, first call included (max 5)
+  #     initial_backoff_ms: 500  # full jitter, doubling per attempt...
+  #     max_backoff_ms: 8000     # ...up to this
+  #     budget_ms: 30000         # the whole request: calls, waits, fallbacks
+  #     on_status: [429, 500, 502, 503, 504, 529]
+  #
+  #   # Ordered targets per model, tried once that model's retries run out.
+  #   # Empty by default. Only targets that take the request in its original
+  #   # wire format are used; the session lock is never moved.
+  #   fallbacks:
+  #     claude-opus-4-1:
+  #       - model: claude-sonnet-4-5
+  #       - model: deepseek-chat
+  #         provider: deepseek
+
+  # Directory scanned for locally installed WASM rules (default ~/.intutic/wasm;
+  # the INTUTIC_WASM_DIR env var takes precedence).
+  # wasm_local_dir: "~/.intutic/wasm"

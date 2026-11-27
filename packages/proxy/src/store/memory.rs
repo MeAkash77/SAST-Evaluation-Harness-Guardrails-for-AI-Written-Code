@@ -1,0 +1,1657 @@
+//! In-memory [`LocalStore`] and null [`ControlPlaneCache`] — standalone open
+//! core, no Valkey.
+//!
+//! `update_arm` calls [`crate::routing::reward::apply_update`], the update rule
+//! that already existed in-tree as the Lua script's documented mirror. The
+//! local path reuses the oracle rather than reimplementing it, so the two
+//! cannot drift by construction — only by floating-point representation, which
+//! `tests/reward_test.rs` bounds at 1e-12.
+//!
+//! ## Durability — learning only
+//!
+//! Constructed with [`MemoryStore::durable`], arm state and its ownership
+//! markers persist to `~/.intutic/bandit-state.json` and reload on boot, so a
+//! per-session CLI proxy accumulates learning across restarts and actually
+//! reaches `bandit.rs`'s `total_pulls >= 20` gate. [`MemoryStore::new`] is the
+//! ephemeral form used by tests.
+//!
+//! **Only learning persists.** Credentials, the response cache, session routing,
+//! tool sequences and judged chunks are memory-only and always will be — see
+//! the credentials note below. Snapshotting is a whole-file atomic replace
+//! (write temp, `rename`), so a crash mid-write cannot leave a torn file; the
+//! worst case is losing the most recent update, which costs one pull.
+//!
+//! ## Two proxies, one `$HOME`
+//!
+//! Atomic replace stops a *torn* file but not a *lost update*: each process
+//! writes its whole view, so the last writer would otherwise erase whatever the
+//! other had learned. Persisting therefore takes an exclusive `flock` on a
+//! sidecar lock file and merges the on-disk state before writing.
+//!
+//! The merge keeps, per arm, whichever copy has more `pulls`. That is
+//! convergent rather than linearizable — two processes that both advance the
+//! same arm keep the further-along one instead of summing them — which is the
+//! right trade here: arm state is a running estimate, and losing a handful of
+//! pulls costs a little exploration, whereas summing would double-count shared
+//! history and skew the posterior. Arms only one process has seen are always
+//! preserved.
+//!
+//! Locking is Unix-only. On other platforms the merge still runs, which
+//! narrows the race without closing it.
+//!
+//! ## What this deliberately does not have
+//!
+//! * **TTLs on ownership.** `ttl_secs` is accepted and ignored. The marker
+//!   arbitrates between *distributed* writers; with one process there is no
+//!   second writer and nothing to expire. The response cache *does* honour its
+//!   TTL, because that one bounds staleness rather than ownership.
+//! * **Outage counters.** Nothing reads them locally — they are a cloud-cron
+//!   input, and in local mode the reward loop already learns the same failures
+//!   as 0-rewards — so both the clear and the increment are no-ops.
+//! * **Publish channels.** Traces and anomalies have no subscriber standalone.
+//!   They are logged at debug rather than silently dropped, so `RUST_LOG=debug`
+//!   still shows the trace stream.
+//!
+//! ## Credentials
+//!
+//! `workspace:credentials` holds OAuth tokens and API keys. They live in
+//! process memory only and are **never** written to disk, including by the
+//! durable form. That is a deliberate decision, not an omission: persisting
+//! them would put long-lived provider credentials in a plaintext file under
+//! `$HOME` with no key management, which is a materially worse trade than
+//! re-capturing them from the next request's `Authorization` header — which is
+//! where they came from in the first place. Do not let them ride along with the
+//! arm state.
+//!
+//! @module
+
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use super::{
+    BreakGlassGrant, CachedResponse, ClaimOutcome, ControlPlaneAuth, ControlPlaneCache,
+    FeatureFlags, HardCapStatus, JudgeScope, LocalStore, NotifyScope, Ownership, PinScope,
+    PinnedSopBlock, SessionRouting, TokenBaseline,
+};
+use crate::paths::intutic_dir;
+use crate::routing::bandit::BanditArmState;
+use crate::routing::mirror::MirrorPairEvent;
+
+/// Fires once per process, the first time a mirrored pair is discarded.
+static MIRROR_DISCARD_WARNING: std::sync::Once = std::sync::Once::new();
+use crate::routing::reward::apply_update;
+use crate::telemetry::ExecutionTrace;
+
+/// A cache entry plus the instant it stops being valid.
+struct Expiring {
+    value: CachedResponse,
+    expires_at: Instant,
+}
+
+/// A pinned SOP advisory block plus the instant its TTL elapses.
+/// Same shape as [`Expiring`], kept separate rather than made generic — two
+/// call sites do not earn an abstraction, and `CachedResponse` and
+/// `PinnedSopBlock` are otherwise unrelated types that happen to both want a
+/// TTL today.
+struct ExpiringPin {
+    value: PinnedSopBlock,
+    expires_at: Instant,
+}
+
+/// The persisted subset: learning, and nothing else. Serde field names are the
+/// on-disk format — `arms` matches the shape of a `bandit:{ws}` hash so the
+/// snapshot stays readable next to the Valkey representation.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Snapshot {
+    #[serde(default)]
+    arms: HashMap<String, HashMap<String, BanditArmState>>,
+    /// Workspaces this proxy claimed local arm ownership for. `"cloud"` markers
+    /// are never written here — only a control plane sets those, and a
+    /// standalone proxy has none.
+    #[serde(default)]
+    local_owned: Vec<String>,
+}
+
+impl Snapshot {
+    /// Fold another process's snapshot into this one. Per arm the copy with
+    /// more `pulls` wins; arms only the other side has are adopted wholesale.
+    fn merge_from(&mut self, other: Snapshot) {
+        for (workspace_id, other_arms) in other.arms {
+            let mine = self.arms.entry(workspace_id).or_default();
+            for (arm_key, other_arm) in other_arms {
+                match mine.get(&arm_key) {
+                    Some(existing) if existing.pulls >= other_arm.pulls => {}
+                    _ => {
+                        mine.insert(arm_key, other_arm);
+                    }
+                }
+            }
+        }
+        for ws in other.local_owned {
+            if !self.local_owned.contains(&ws) {
+                self.local_owned.push(ws);
+            }
+        }
+    }
+}
+
+/// Exclusive advisory lock held for the duration of a snapshot update.
+///
+/// Unix-only; elsewhere this is a no-op and the merge alone narrows the race.
+/// Acquisition failure is not fatal — a snapshot written without the lock is
+/// still atomic and still merged, just not serialised against a concurrent
+/// writer.
+struct FileLock {
+    #[cfg(unix)]
+    file: Option<std::fs::File>,
+}
+
+impl FileLock {
+    fn acquire(path: &std::path::Path) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .ok();
+            if let Some(f) = &file {
+                // SAFETY: `f` owns a valid fd for the duration of this call.
+                if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                    tracing::debug!("could not lock {}; proceeding unlocked", path.display());
+                    return Self { file: None };
+                }
+            }
+            Self { file }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Self {}
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(f) = &self.file {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `f` is still alive; releasing a lock we hold.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+/// How many distinct tool-history scopes a standalone proxy remembers at once.
+/// Ten thousand concurrent sessions is far past what a single standalone
+/// proxy serves; the point is a ceiling, not a tuning knob.
+pub const DEFAULT_SCOPE_CAP: usize = 10_000;
+
+#[derive(Default)]
+struct ScopeIndex {
+    order: std::collections::VecDeque<String>,
+    seen: std::collections::HashSet<String>,
+}
+
+/// One graph's recorded node kinds (`node → kind`) and when they expire.
+type GraphKinds = (HashMap<String, String>, u64);
+
+#[derive(Default)]
+pub struct MemoryStore {
+    arms: Mutex<HashMap<String, HashMap<String, BanditArmState>>>,
+    modes: Mutex<HashMap<String, Ownership>>,
+    sessions: Mutex<HashMap<String, SessionRouting>>,
+    tool_sequences: Mutex<HashMap<String, Vec<String>>>,
+    /// Unix-second timestamp of each recorded call, per session — the
+    /// in-memory stand-in for the Valkey ZSET `record_calls_and_count_window`
+    /// uses. Trimmed to the caller's window on every write, so this never
+    /// grows past what a live window can hold.
+    call_timestamps: Mutex<HashMap<String, Vec<i64>>>,
+    /// Cumulative extracted-call count per session, for per-turn deltas.
+    extracted_tool_counts: Mutex<HashMap<String, u64>>,
+    /// First-seen order and membership of every scope the five per-session
+    /// maps above (`sessions`, `tool_sequences`, `call_timestamps`,
+    /// `extracted_tool_counts`, `tool_signatures`) hold, so they are bounded
+    /// together (interview-audit closeout Wave 2). Before this, a standalone
+    /// proxy kept every scope it ever saw for the life of the process — and
+    /// the client-fingerprint rung in `tool_history_scope` makes the scope
+    /// population as large as the callers choose. Past `scope_cap` the
+    /// oldest-seen scope is dropped from all five maps: first-seen order, not
+    /// least-recently-used, because a session that has been quiet for ten
+    /// thousand other sessions is over either way, and tracking recency would
+    /// cost a write on every read.
+    scope_index: Mutex<ScopeIndex>,
+    /// `None` = `DEFAULT_SCOPE_CAP`; tests set a small cap through
+    /// `with_scope_cap`.
+    scope_cap: Option<usize>,
+    /// First tool signature seen per session, for drift detection.
+    tool_signatures: Mutex<HashMap<String, String>>,
+    credentials: Mutex<HashMap<String, HashMap<String, String>>>,
+    responses: Mutex<HashMap<String, Expiring>>,
+    cache_counters: Mutex<HashMap<String, HashMap<String, i64>>>,
+    cache_savings: Mutex<HashMap<String, f64>>,
+    session_chunks: Mutex<HashMap<String, Vec<String>>>,
+    /// Loop-run spend and ceiling, keyed by run id.
+    ///
+    /// A run genuinely can span processes, and this map cannot see the others.
+    /// But the common open-core case is one proxy on one developer's machine
+    /// with no Valkey, and returning `(None, None)` there meant a workflow
+    /// budget could never be exceeded no matter what the run cost — the
+    /// detector's input did not exist. Aggregating what this process *can* see
+    /// is a floor on the truth, and a floor that crosses the ceiling is still a
+    /// real breach.
+    workflow_spend: Mutex<HashMap<String, f64>>,
+    workflow_budgets: Mutex<HashMap<String, f64>>,
+    /// Reask trips, keyed `session|kind`.
+    ///
+    /// Implemented rather than stubbed, for the same reason as `workflow_spend`
+    /// above: a stub returning 1 would mean an agent could be reasked forever
+    /// and never escalate, so the reask verb would degrade to a steer in exactly
+    /// the deployment where nobody is watching a dashboard. Standalone is one
+    /// proxy process on one machine, so a process-local counter is not an
+    /// approximation of the session — it *is* the session.
+    ///
+    /// No TTL here. The process lifetime is shorter than the one-hour window
+    /// the Valkey path uses, so the restart is the expiry.
+    reask_attempts: Mutex<HashMap<String, u32>>,
+    /// Recorded test outcomes per session scope. Bounded with
+    /// the other per-session maps by `touch_scope`'s cap.
+    action_outcomes: Mutex<HashMap<String, HashMap<String, String>>>,
+    /// Context signatures per graph, with the Valkey hash's
+    /// contract: set-if-absent, a field cap, a TTL and an LRU of graphs.
+    context_sigs: Mutex<crate::context_sig::CtxSigMemoryStore>,
+    /// Recorded node kinds per graph: `key → (node → kind,
+    /// expires_at)`, capped like the signatures.
+    node_kinds: Mutex<HashMap<String, GraphKinds>>,
+    /// Per-key rate counters, keyed by `key_limits::rate_counter_keys`, each
+    /// with the minute it counts. A proxy without Valkey is one process, so
+    /// these are the whole count; old minutes are dropped as new ones start.
+    rate_counters: Mutex<HashMap<String, (i64, u64)>>,
+    /// Pinned SOP advisory blocks, keyed by [`PinScope::storage_key`].
+    /// Memory-only, same as the response cache above — a pin outlives one
+    /// request but never the process, which matches its purpose (holding a
+    /// prefix stable for a session, not across a restart).
+    sop_pins: Mutex<HashMap<String, ExpiringPin>>,
+    /// `None` = ephemeral. Set only by [`MemoryStore::durable`].
+    snapshot_path: Option<PathBuf>,
+}
+
+/// Carry standalone learning into a control-plane-backed store on first
+/// connect, so upgrading from open core to Cloud does not silently reset every
+/// arm to `Beta(1,1)` and drop the workspace back into cold start.
+///
+/// Deliberately conservative:
+///
+/// * **Never overwrites.** Only arms absent from the destination are seeded, so
+///   a workspace the control plane already knows about is left exactly as it is.
+///   Re-running this is a no-op.
+/// * **Never migrates ownership.** The `reward_mode` marker is re-arbitrated by
+///   `SET NX` against the real store; carrying a local claim across would let
+///   this proxy believe it owns a workspace a cloud cron is already writing.
+/// * **Never removes the snapshot.** Disconnecting returns you to standalone
+///   with your learning intact.
+///
+/// Returns the number of arms seeded. Failure is logged and swallowed by the
+/// caller — a migration that does not happen costs learning, which the bandit
+/// re-acquires; a migration that blocks startup costs the whole proxy.
+pub async fn migrate_local_learning(
+    store: &std::sync::Arc<dyn LocalStore>,
+    path: &std::path::Path,
+) -> anyhow::Result<usize> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let snapshot: Snapshot = serde_json::from_str(&raw)?;
+
+    let mut seeded = 0usize;
+    for (workspace_id, local_arms) in snapshot.arms {
+        if local_arms.is_empty() {
+            continue;
+        }
+        let existing = store.load_arms(&workspace_id).await.unwrap_or_default();
+        for (arm_key, state) in local_arms {
+            if existing.contains_key(&arm_key) {
+                continue;
+            }
+            if store
+                .seed_arm(&workspace_id, &arm_key, &state)
+                .await
+                .is_ok()
+            {
+                seeded += 1;
+            }
+        }
+    }
+    Ok(seeded)
+}
+
+/// Where standalone learning lives. Sits beside `local_spend`'s files, which is
+/// the existing precedent for proxy-owned state under `$HOME`.
+/// Where trust-on-first-use tool pins live.
+fn tool_pin_path() -> PathBuf {
+    default_snapshot_path().with_file_name("tool-pins.json")
+}
+
+fn load_tool_pins() -> HashMap<String, String> {
+    std::fs::read_to_string(tool_pin_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Whole-file atomic replace, same as the bandit snapshot: write a temporary
+/// file and rename, so a crash mid-write cannot leave a truncated pin file
+/// that would read as "nothing pinned" and re-baseline every workspace.
+fn save_tool_pins(pins: &HashMap<String, String>) {
+    let path = tool_pin_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(encoded) = serde_json::to_string_pretty(pins) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, encoded).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+pub(crate) fn default_snapshot_path() -> PathBuf {
+    intutic_dir().join("bandit-state.json")
+}
+
+impl MemoryStore {
+    /// Ephemeral. Nothing touches disk.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An ephemeral store that forgets its oldest-seen scopes past `cap`.
+    /// Production uses `DEFAULT_SCOPE_CAP`; this exists so a test can watch
+    /// eviction happen with four scopes instead of ten thousand.
+    pub fn with_scope_cap(cap: usize) -> Self {
+        Self {
+            scope_cap: Some(cap),
+            ..Self::default()
+        }
+    }
+
+    /// Record that `scope` now has state in one of the per-session maps, and
+    /// evict the oldest-seen scopes from all of them once the cap is passed.
+    /// Called after the writer has released its own map lock, so the index
+    /// lock is never held inside a map lock and eviction takes each map lock
+    /// on its own.
+    fn touch_scope(&self, scope: &str) {
+        let cap = self.scope_cap.unwrap_or(DEFAULT_SCOPE_CAP).max(1);
+        let evicted: Vec<String> = {
+            let Ok(mut idx) = self.scope_index.lock() else {
+                return;
+            };
+            if !idx.seen.insert(scope.to_string()) {
+                return;
+            }
+            idx.order.push_back(scope.to_string());
+            let mut out = Vec::new();
+            while idx.order.len() > cap {
+                if let Some(old) = idx.order.pop_front() {
+                    idx.seen.remove(&old);
+                    out.push(old);
+                }
+            }
+            out
+        };
+        if evicted.is_empty() {
+            return;
+        }
+        if let Ok(mut m) = self.sessions.lock() {
+            for k in &evicted {
+                m.remove(k);
+            }
+        }
+        if let Ok(mut m) = self.tool_sequences.lock() {
+            for k in &evicted {
+                m.remove(k);
+            }
+        }
+        if let Ok(mut m) = self.call_timestamps.lock() {
+            for k in &evicted {
+                m.remove(k);
+            }
+        }
+        if let Ok(mut m) = self.extracted_tool_counts.lock() {
+            for k in &evicted {
+                m.remove(k);
+            }
+        }
+        if let Ok(mut m) = self.tool_signatures.lock() {
+            for k in &evicted {
+                m.remove(k);
+            }
+        }
+        if let Ok(mut m) = self.action_outcomes.lock() {
+            for k in &evicted {
+                m.remove(k);
+            }
+        }
+        tracing::debug!(
+            evicted = evicted.len(),
+            cap,
+            "forgot the oldest-seen tool-history scopes"
+        );
+    }
+
+    /// Persists learning to `~/.intutic/bandit-state.json`, loading any
+    /// existing snapshot. A missing, unreadable or corrupt snapshot starts
+    /// empty rather than failing: losing learning degrades routing to the
+    /// cold-start path, which is survivable, whereas refusing to boot is not.
+    pub fn durable() -> Self {
+        Self::durable_at(default_snapshot_path())
+    }
+
+    pub fn durable_at(path: PathBuf) -> Self {
+        let store = Self {
+            snapshot_path: Some(path.clone()),
+            ..Self::default()
+        };
+
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<Snapshot>(&raw) {
+                Ok(snap) => {
+                    let arm_count: usize = snap.arms.values().map(|w| w.len()).sum();
+                    if let Ok(mut arms) = store.arms.lock() {
+                        *arms = snap.arms;
+                    }
+                    if let Ok(mut modes) = store.modes.lock() {
+                        for ws in snap.local_owned {
+                            modes.insert(ws, Ownership::Local);
+                        }
+                    }
+                    tracing::info!(
+                        path = %path.display(),
+                        arms = arm_count,
+                        "restored standalone bandit learning"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    "bandit snapshot is corrupt, starting fresh: {}", e
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %path.display(), "no bandit snapshot yet");
+            }
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                "could not read bandit snapshot, starting fresh: {}", e
+            ),
+        }
+        store
+    }
+
+    /// Atomic whole-file replace, under an exclusive cross-process lock and
+    /// merged with whatever is already on disk. Best-effort: a snapshot failure
+    /// must never fail the request that triggered it, so errors are logged and
+    /// swallowed.
+    fn persist(&self) {
+        let Some(path) = &self.snapshot_path else {
+            return;
+        };
+        let mut snapshot = {
+            let Ok(arms) = self.arms.lock() else { return };
+            let Ok(modes) = self.modes.lock() else { return };
+            Snapshot {
+                arms: arms.clone(),
+                local_owned: modes
+                    .iter()
+                    .filter(|(_, o)| **o == Ownership::Local)
+                    .map(|(ws, _)| ws.clone())
+                    .collect(),
+            }
+        };
+
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!("could not create {}: {}", dir.display(), e);
+                return;
+            }
+        }
+
+        // Held for the whole read-merge-write-rename. The lock lives on a
+        // sidecar path because the snapshot itself is replaced by `rename`,
+        // which would detach a lock taken on the old inode.
+        let _guard = FileLock::acquire(&path.with_extension("json.lock"));
+
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(on_disk) = serde_json::from_str::<Snapshot>(&raw) {
+                snapshot.merge_from(on_disk);
+            }
+        }
+
+        let Ok(encoded) = serde_json::to_string(&snapshot) else {
+            return;
+        };
+        // Same-directory temp so the rename stays within one filesystem and is
+        // therefore atomic; a crash leaves either the old file or the new one.
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, encoded) {
+            tracing::warn!("could not write bandit snapshot: {}", e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::warn!("could not replace bandit snapshot: {}", e);
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Lock helper — a poisoned mutex means another thread panicked mid-update.
+/// Surfacing that as an error beats masking it, on every path that returns one.
+fn lock<'a, T>(m: &'a Mutex<T>, what: &str) -> anyhow::Result<std::sync::MutexGuard<'a, T>> {
+    m.lock()
+        .map_err(|_| anyhow::anyhow!("{what} store poisoned"))
+}
+
+#[async_trait]
+impl LocalStore for MemoryStore {
+    async fn update_arm(
+        &self,
+        workspace_id: &str,
+        arm_key: &str,
+        reward: f64,
+        now_rfc3339: &str,
+    ) -> anyhow::Result<()> {
+        let mut arms = lock(&self.arms, "arm")?;
+        let ws = arms.entry(workspace_id.to_string()).or_default();
+        // Absent arm starts at Beta(1,1) with 0 pulls — the same defaults the
+        // Lua script falls back to when HGET misses or the JSON is corrupt.
+        let (alpha, beta, pulls) = ws
+            .get(arm_key)
+            .map(|a| (a.alpha, a.beta, a.pulls))
+            .unwrap_or((1.0, 1.0, 0));
+        let (alpha, beta, pulls) = apply_update(alpha, beta, pulls, reward);
+        ws.insert(
+            arm_key.to_string(),
+            BanditArmState {
+                alpha,
+                beta,
+                pulls,
+                last_updated: now_rfc3339.to_string(),
+            },
+        );
+        drop(arms);
+        self.persist();
+        Ok(())
+    }
+
+    async fn load_arms(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<HashMap<String, BanditArmState>> {
+        Ok(lock(&self.arms, "arm")?
+            .get(workspace_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn seed_arm(
+        &self,
+        workspace_id: &str,
+        arm_key: &str,
+        state: &BanditArmState,
+    ) -> anyhow::Result<()> {
+        lock(&self.arms, "arm")?
+            .entry(workspace_id.to_string())
+            .or_default()
+            .insert(arm_key.to_string(), state.clone());
+        self.persist();
+        Ok(())
+    }
+
+    async fn reward_mode(&self, workspace_id: &str) -> anyhow::Result<Option<Ownership>> {
+        Ok(lock(&self.modes, "mode")?.get(workspace_id).copied())
+    }
+
+    async fn claim_local_ownership(
+        &self,
+        workspace_id: &str,
+        _ttl_secs: u64,
+    ) -> anyhow::Result<ClaimOutcome> {
+        let mut modes = lock(&self.modes, "mode")?;
+        if modes.contains_key(workspace_id) {
+            return Ok(ClaimOutcome::Lost);
+        }
+        modes.insert(workspace_id.to_string(), Ownership::Local);
+        drop(modes);
+        self.persist();
+        Ok(ClaimOutcome::Claimed)
+    }
+
+    async fn refresh_ownership(&self, _workspace_id: &str, _ttl_secs: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn clear_outage_failures(&self, _workspace_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn record_mirror_outcome(
+        &self,
+        _workspace_id: &str,
+        _candidate_model: &str,
+        _faulted: bool,
+        _measured: bool,
+        _cost_usd: f64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn incr_outage_failure(&self, _workspace_id: &str, _arm_key: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn session_routing(&self, scope: &str) -> anyhow::Result<SessionRouting> {
+        debug_assert!(scope.contains(':'), "session routing scope must be tool_history_scope's {{workspace}}:{{agent}} output, not a bare session id: {scope:?}");
+        Ok(lock(&self.sessions, "session")?
+            .get(scope)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_session_locked_model(&self, scope: &str, model: &str) -> anyhow::Result<()> {
+        debug_assert!(scope.contains(':'), "session routing scope must be tool_history_scope's {{workspace}}:{{agent}} output, not a bare session id: {scope:?}");
+        {
+            let mut sessions = lock(&self.sessions, "session")?;
+            let sess = sessions.entry(scope.to_string()).or_default();
+            sess.locked_model = Some(model.to_string());
+            // Survives `clear_session_locked_model` — see `SessionRouting::last_model`.
+            sess.last_model = Some(model.to_string());
+        }
+        self.touch_scope(scope);
+        Ok(())
+    }
+
+    async fn clear_session_locked_model(&self, scope: &str) -> anyhow::Result<()> {
+        debug_assert!(scope.contains(':'), "session routing scope must be tool_history_scope's {{workspace}}:{{agent}} output, not a bare session id: {scope:?}");
+        if let Some(sess) = lock(&self.sessions, "session")?.get_mut(scope) {
+            sess.locked_model = None;
+        }
+        Ok(())
+    }
+
+    async fn record_session_cache(
+        &self,
+        scope: &str,
+        model: &str,
+        cache_read_bp: u32,
+    ) -> anyhow::Result<()> {
+        debug_assert!(scope.contains(':'), "session routing scope must be tool_history_scope's {{workspace}}:{{agent}} output, not a bare session id: {scope:?}");
+        {
+            let mut sessions = lock(&self.sessions, "session")?;
+            let sess = sessions.entry(scope.to_string()).or_default();
+            sess.cache_warm_model = Some(model.to_string());
+            sess.cache_read_bp = Some(cache_read_bp);
+            sess.cache_observed_at = Some(chrono::Utc::now().timestamp());
+        }
+        self.touch_scope(scope);
+        Ok(())
+    }
+
+    async fn record_session_cache_unreported(
+        &self,
+        scope: &str,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        debug_assert!(scope.contains(':'), "session routing scope must be tool_history_scope's {{workspace}}:{{agent}} output, not a bare session id: {scope:?}");
+        {
+            let mut sessions = lock(&self.sessions, "session")?;
+            let sess = sessions.entry(scope.to_string()).or_default();
+            if sess.cache_warm_model.is_none() {
+                sess.cache_warm_model = Some(model.to_string());
+                sess.cache_observed_at = Some(chrono::Utc::now().timestamp());
+            }
+        }
+        self.touch_scope(scope);
+        Ok(())
+    }
+
+    async fn record_tool_sequence(
+        &self,
+        session_id: &str,
+        new_tools: &[String],
+        cap: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let out = {
+            let mut sequences = lock(&self.tool_sequences, "tool-sequence")?;
+            let sequence = sequences.entry(session_id.to_string()).or_default();
+            if !new_tools.is_empty() {
+                sequence.extend_from_slice(new_tools);
+                if sequence.len() > cap {
+                    let start = sequence.len() - cap;
+                    *sequence = sequence.split_off(start);
+                }
+            }
+            sequence.clone()
+        };
+        self.touch_scope(session_id);
+        Ok(out)
+    }
+
+    async fn record_calls_and_count_window(
+        &self,
+        session_id: &str,
+        new_call_count: usize,
+        now_unix_secs: i64,
+        window_secs: i64,
+    ) -> anyhow::Result<u32> {
+        let count = {
+            let mut timestamps = lock(&self.call_timestamps, "call-window")?;
+            let entry = timestamps.entry(session_id.to_string()).or_default();
+            let window_start = now_unix_secs - window_secs;
+
+            entry.retain(|&ts| ts >= window_start);
+            entry.extend(std::iter::repeat_n(now_unix_secs, new_call_count));
+
+            entry.len() as u32
+        };
+        self.touch_scope(session_id);
+        Ok(count)
+    }
+
+    async fn swap_extracted_tool_count(&self, session_id: &str, new_count: u64) -> u64 {
+        let prev = {
+            let Ok(mut counts) = lock(&self.extracted_tool_counts, "tool-count") else {
+                return 0;
+            };
+            counts
+                .insert(session_id.to_string(), new_count)
+                .unwrap_or(0)
+        };
+        self.touch_scope(session_id);
+        prev
+    }
+
+    async fn workspace_credential(&self, workspace_id: &str, fields: &[&str]) -> Option<String> {
+        let creds = self.credentials.lock().ok()?;
+        let ws = creds.get(workspace_id)?;
+        fields
+            .iter()
+            .find_map(|f| ws.get(*f).filter(|v| !v.is_empty()).cloned())
+    }
+
+    async fn set_workspace_credential(&self, workspace_id: &str, field: &str, value: &str) {
+        if let Ok(mut creds) = self.credentials.lock() {
+            creds
+                .entry(workspace_id.to_string())
+                .or_default()
+                .insert(field.to_string(), value.to_string());
+        }
+    }
+
+    async fn cached_response(&self, hash: &str) -> Option<CachedResponse> {
+        let mut responses = self.responses.lock().ok()?;
+        match responses.get(hash) {
+            Some(e) if e.expires_at > Instant::now() => Some(e.value.clone()),
+            // Expired: drop it here rather than growing an unbounded map of
+            // dead entries, since nothing else sweeps this.
+            Some(_) => {
+                responses.remove(hash);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn store_response(
+        &self,
+        hash: &str,
+        response: &CachedResponse,
+        ttl_secs: u64,
+    ) -> anyhow::Result<()> {
+        lock(&self.responses, "response-cache")?.insert(
+            hash.to_string(),
+            Expiring {
+                value: response.clone(),
+                expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+            },
+        );
+        Ok(())
+    }
+
+    async fn incr_cache_counter(&self, workspace_id: &str, field: &str, by: i64) {
+        if let Ok(mut counters) = self.cache_counters.lock() {
+            *counters
+                .entry(workspace_id.to_string())
+                .or_default()
+                .entry(field.to_string())
+                .or_insert(0) += by;
+        }
+    }
+
+    async fn add_cache_savings(&self, workspace_id: &str, amount: f64) {
+        if let Ok(mut savings) = self.cache_savings.lock() {
+            *savings.entry(workspace_id.to_string()).or_insert(0.0) += amount;
+        }
+    }
+
+    /// No subscriber exists standalone. Logged rather than dropped so the
+    /// trace stream is still observable via `RUST_LOG=debug`.
+    async fn publish_trace(&self, trace: &ExecutionTrace) -> anyhow::Result<()> {
+        tracing::debug!(
+            trace_id = %trace.trace_id,
+            workspace_id = %trace.workspace_id,
+            model = %trace.model,
+            verdict = %trace.verdict,
+            latency_ms = trace.latency_ms,
+            "execution trace (standalone: not published)"
+        );
+        Ok(())
+    }
+
+    /// Same standalone degrade as `publish_trace` above: no cross-process
+    /// transport, so this is logged rather than dropped silently. The mirrored
+    /// call this event describes was already made — and billed — by the time
+    /// this runs; the message says so rather than reading like routine
+    /// bookkeeping.
+    async fn publish_mirror_pair(&self, event: &MirrorPairEvent) -> anyhow::Result<()> {
+        // Once per process at warn (the same `Once` shape as the WASM
+        // registry's no-root warning), then debug per pair: an operator who
+        // turned mirroring on standalone is paying for a second upstream call
+        // on up to 5% of traffic and getting nothing durable back, and a
+        // debug line nobody reads is not how they should find out.
+        MIRROR_DISCARD_WARNING.call_once(|| {
+            tracing::warn!(
+                workspace_id = %event.workspace_id,
+                candidate = %event.candidate_model,
+                "mirroring is on, but this proxy is standalone: every mirrored candidate call is billed and its comparison result is discarded — there is no control plane to judge it or report on it. Set mirror_sample_rate to 0, or run with a control plane."
+            );
+        });
+        tracing::debug!(
+            workspace_id = %event.workspace_id,
+            candidate = %event.candidate_model,
+            "mirrored candidate call was billed, but its comparison result is discarded — standalone has no control plane to publish it to"
+        );
+        Ok(())
+    }
+
+    async fn publish_system_anomaly(&self, workspace_id: &str, description: &str) {
+        tracing::warn!(
+            workspace_id = %workspace_id,
+            "system anomaly (standalone: not published): {}",
+            description
+        );
+    }
+
+    /// Standalone has no cross-process transport, so a notification can only
+    /// be logged.
+    ///
+    /// This is the degrade path chosen deliberately over a file-backed spool:
+    /// a spool with an advisory lock gives mutual exclusion, not fan-out,
+    /// ordering or liveness, and notifications are read-once and
+    /// time-sensitive — getting fan-out wrong means a sibling silently never
+    /// receives a KILL. Every session-scoped guarantee still holds here; only
+    /// cross-node delivery is lost, and `intutic start` provisions Valkey
+    /// whenever it can.
+    async fn publish_notification(&self, scope: NotifyScope, id: &str, payload: &str) {
+        tracing::info!(
+            scope = ?scope,
+            target = %id,
+            "governance notification (standalone: not delivered to siblings): {}",
+            payload
+        );
+    }
+
+    /// No-op: membership needs state shared across processes.
+    async fn touch_graph_node(
+        &self,
+        _workspace_id: &str,
+        _graph_id: &str,
+        _node_id: &str,
+        _ttl_secs: u64,
+    ) {
+    }
+
+    /// Always empty.
+    ///
+    /// Load-bearing rather than a stub: it makes graph broadcast a no-op
+    /// instead of letting a single-process view be mistaken for the whole
+    /// graph, which would deliver findings to one node and silently strand
+    /// every other.
+    async fn graph_members(&self, _workspace_id: &str, _graph_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Trust-on-first-use, persisted to disk.
+    ///
+    /// Durability is the whole point rather than a nicety: a pin that dies
+    /// with the process is no pin at all, because a rug pull only has to wait
+    /// for the proxy to restart. Kept in its own file rather than alongside
+    /// the bandit snapshot — that one is a running estimate where losing an
+    /// update costs a little exploration, whereas losing a pin silently
+    /// re-baselines onto whatever a server is serving now.
+    async fn pinned_tool_signature(
+        &self,
+        workspace_id: &str,
+        harness: &str,
+        signature: &str,
+    ) -> Option<String> {
+        let mut guard = self.tool_signatures.lock().ok()?;
+        if guard.is_empty() {
+            *guard = load_tool_pins();
+        }
+        // Keyed by harness as well as workspace — see the trait doc.
+        //
+        // This changes the on-disk key shape, so pins written by an older build
+        // are not found and each harness re-pins on its next request. That is the
+        // correct migration: the old key held one harness's tool set under a name
+        // that claimed to cover all of them, so carrying it forward would keep
+        // exactly the false positive this fixes. Re-pinning costs one
+        // trust-on-first-use window per harness, which is the same window a fresh
+        // install has.
+        let key = format!("{workspace_id}\u{1f}{harness}");
+        match guard.get(&key) {
+            Some(existing) => Some(existing.clone()),
+            None => {
+                guard.insert(key, signature.to_string());
+                save_tool_pins(&guard);
+                Some(signature.to_string())
+            }
+        }
+    }
+
+    /// `None` — a graph spans processes, so its size is not knowable here.
+    async fn graph_node_count(&self, _workspace_id: &str, _graph_id: &str) -> Option<u32> {
+        None
+    }
+
+    /// `None` — no opinion, not "dead".
+    ///
+    /// Returning `Some(false)` here would declare every parent gone and orphan
+    /// an entire graph on a store that never tracked it.
+    async fn is_graph_member(
+        &self,
+        _workspace_id: &str,
+        _graph_id: &str,
+        _node_id: &str,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// `None` — no spend signal, not zero.
+    ///
+    /// Zero would read as "this graph has cost nothing", which is exactly the
+    /// wrong conclusion to hand a budget detector.
+    async fn add_graph_spend(
+        &self,
+        _workspace_id: &str,
+        _graph_id: &str,
+        _amount: f64,
+        _ttl_secs: u64,
+    ) -> Option<f64> {
+        None
+    }
+
+    async fn graph_spend(&self, _workspace_id: &str, _graph_id: &str) -> Option<f64> {
+        None
+    }
+
+    /// `false` — nothing to arbitrate, because standalone has no cross-node
+    /// delivery to suppress in the first place.
+    async fn claim_broadcast(&self, _workspace_id: &str, _graph_id: &str, _kind: &str) -> bool {
+        false
+    }
+
+    /// Aggregates what this process has seen of the run.
+    ///
+    /// Under-counts a run split across processes, which is the safe direction:
+    /// the total can only be higher than what is recorded here, so a breach
+    /// reported from this number is always a real one.
+    /// Standalone has no control plane and therefore nobody to review anything.
+    /// Holding a run here would block it with no way to release it.
+    async fn request_loop_review(&self, _loop_run_id: &str, _reason: &str) {}
+
+    async fn incr_reask_attempt(&self, scope: &str, detector_id: &str) -> u32 {
+        let Ok(mut m) = lock(&self.reask_attempts, "reask_attempts") else {
+            // A poisoned lock must not escalate — see the trait doc.
+            return 1;
+        };
+        let n = m.entry(format!("{scope}|{detector_id}")).or_insert(0);
+        *n = n.saturating_add(1);
+        *n
+    }
+
+    async fn reset_reask_attempt(&self, scope: &str, detector_id: &str) {
+        if let Ok(mut m) = lock(&self.reask_attempts, "reask_attempts") {
+            m.remove(&format!("{scope}|{detector_id}"));
+        }
+    }
+
+    async fn action_outcomes(&self, scope: &str) -> Option<HashMap<String, String>> {
+        let m = lock(&self.action_outcomes, "action_outcomes").ok()?;
+        Some(m.get(scope).cloned().unwrap_or_default())
+    }
+
+    async fn record_action_outcome(&self, scope: &str, token: &str, value: &str) -> bool {
+        {
+            let Ok(mut m) = lock(&self.action_outcomes, "action_outcomes") else {
+                return false;
+            };
+            m.entry(scope.to_string())
+                .or_default()
+                .insert(token.to_string(), value.to_string());
+        }
+        self.touch_scope(scope);
+        true
+    }
+
+    async fn context_signatures(
+        &self,
+        workspace_id: &str,
+        graph_id: &str,
+    ) -> Option<Vec<(String, String)>> {
+        let mut store = lock(&self.context_sigs, "context_sigs").ok()?;
+        Some(store.get_all(&format!("{workspace_id}:{graph_id}"), unix_secs()))
+    }
+
+    async fn store_context_signature(
+        &self,
+        workspace_id: &str,
+        graph_id: &str,
+        node_id: &str,
+        value: &str,
+    ) -> bool {
+        let Ok(mut store) = lock(&self.context_sigs, "context_sigs") else {
+            return false;
+        };
+        store.set_if_absent(
+            &format!("{workspace_id}:{graph_id}"),
+            node_id,
+            value.to_string(),
+            unix_secs(),
+        )
+    }
+
+    async fn recorded_node_kind(
+        &self,
+        workspace_id: &str,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Option<String> {
+        let m = lock(&self.node_kinds, "node_kinds").ok()?;
+        let (fields, expires_at) = m.get(&format!("{workspace_id}:{graph_id}"))?;
+        if *expires_at <= unix_secs() {
+            return None;
+        }
+        fields.get(node_id).cloned()
+    }
+
+    async fn record_node_kind(
+        &self,
+        workspace_id: &str,
+        graph_id: &str,
+        node_id: &str,
+        kind: &str,
+    ) {
+        let Ok(mut m) = lock(&self.node_kinds, "node_kinds") else {
+            return;
+        };
+        let now = unix_secs();
+        let key = format!("{workspace_id}:{graph_id}");
+        if !m.contains_key(&key) && m.len() >= crate::context_sig::CTXSIG_MEMORY_GRAPHS {
+            // Expired graphs first, then any: a bounded map, not a cache to
+            // tune — a lost kind only lets one child through unrefused.
+            m.retain(|_, (_, exp)| *exp > now);
+            if m.len() >= crate::context_sig::CTXSIG_MEMORY_GRAPHS {
+                if let Some(victim) = m.keys().next().cloned() {
+                    m.remove(&victim);
+                }
+            }
+        }
+        let entry = m.entry(key).or_insert_with(|| (HashMap::new(), 0));
+        entry.0.insert(node_id.to_string(), kind.to_string());
+        entry.1 = now + crate::node_kind::NODE_KIND_TTL_SECS;
+    }
+
+    async fn loop_review_reason(&self, _loop_run_id: &str) -> Option<String> {
+        None
+    }
+
+    async fn loop_review_cleared(&self, _loop_run_id: &str) -> Option<String> {
+        None
+    }
+
+    async fn admit_rate(
+        &self,
+        key_id: &str,
+        limit: crate::key_limits::RateLimit,
+        minute: i64,
+    ) -> crate::key_limits::RateDecision {
+        use crate::key_limits::{rate_counter_keys, RateDecision, RateLimitKind};
+        let Ok(mut counters) = lock(&self.rate_counters, "rate-counters") else {
+            return RateDecision::Unavailable;
+        };
+        counters.retain(|_, (m, _)| *m >= minute);
+        let (rpm_key, tpm_key) = rate_counter_keys(key_id, minute);
+        if let Some(tpm) = limit.tpm {
+            let used = counters.get(&tpm_key).map_or(0, |(_, n)| *n);
+            if used >= tpm {
+                return RateDecision::Limited {
+                    kind: RateLimitKind::Tokens,
+                    limit: tpm,
+                    used,
+                };
+            }
+        }
+        if let Some(rpm) = limit.rpm {
+            let entry = counters.entry(rpm_key).or_insert((minute, 0));
+            if entry.1 >= rpm {
+                return RateDecision::Limited {
+                    kind: RateLimitKind::Requests,
+                    limit: rpm,
+                    used: entry.1,
+                };
+            }
+            entry.1 += 1;
+        }
+        RateDecision::Admitted
+    }
+
+    async fn add_rate_tokens(&self, key_id: &str, tokens: u64, minute: i64) {
+        if let Ok(mut counters) = lock(&self.rate_counters, "rate-counters") {
+            let (_, tpm_key) = crate::key_limits::rate_counter_keys(key_id, minute);
+            counters.entry(tpm_key).or_insert((minute, 0)).1 += tokens;
+        }
+    }
+
+    async fn add_workflow_spend(&self, loop_run_id: &str, amount: f64) -> Option<f64> {
+        let mut spend = lock(&self.workflow_spend, "workflow-spend").ok()?;
+        let total = spend.entry(loop_run_id.to_string()).or_insert(0.0);
+        *total += amount;
+        Some(*total)
+    }
+
+    async fn set_workflow_budget_if_absent(&self, loop_run_id: &str, budget: f64) -> bool {
+        let Ok(mut budgets) = lock(&self.workflow_budgets, "workflow-budget") else {
+            return false;
+        };
+        if budgets.contains_key(loop_run_id) {
+            return false;
+        }
+        budgets.insert(loop_run_id.to_string(), budget);
+        true
+    }
+
+    /// `None` for the ceiling means "nobody capped this run", never "capped at
+    /// zero" — the latter would refuse every request in an uncapped workflow.
+    async fn workflow_budget(&self, loop_run_id: &str) -> (Option<f64>, Option<f64>) {
+        let spend = lock(&self.workflow_spend, "workflow-spend")
+            .ok()
+            .and_then(|m| m.get(loop_run_id).copied());
+        let budget = lock(&self.workflow_budgets, "workflow-budget")
+            .ok()
+            .and_then(|m| m.get(loop_run_id).copied());
+        (spend, budget)
+    }
+
+    /// `ttl_secs` ignored — chunks are read back within the same request that
+    /// wrote them, and the process boundary already bounds their lifetime.
+    async fn push_session_chunk(
+        &self,
+        session_id: &str,
+        payload: &str,
+        _ttl_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        lock(&self.session_chunks, "session-chunk")?
+            .entry(session_id.to_string())
+            .or_default()
+            .push(payload.to_string());
+        Ok(())
+    }
+
+    async fn pinned_sop_block(&self, scope: &PinScope) -> Option<PinnedSopBlock> {
+        let mut pins = self.sop_pins.lock().ok()?;
+        let key = scope.storage_key();
+        match pins.get(&key) {
+            Some(p) if p.expires_at > Instant::now() => Some(p.value.clone()),
+            // Expired: drop it here rather than growing an unbounded map of
+            // dead entries, since nothing else sweeps this — same precedent
+            // as `cached_response` above.
+            Some(_) => {
+                pins.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn pin_sop_block(
+        &self,
+        scope: &PinScope,
+        block: &PinnedSopBlock,
+        ttl_secs: u64,
+    ) -> PinnedSopBlock {
+        let Ok(mut pins) = self.sop_pins.lock() else {
+            // Poisoned lock: fail toward "my own render", not toward blocking
+            // the request. A single process racing itself is the only
+            // scenario `MemoryStore` needs to handle here at all.
+            return block.clone();
+        };
+        let key = scope.storage_key();
+        // NX semantics: only write if absent (or expired, which reads as
+        // absent). A single-process store still has real concurrent tasks —
+        // two requests in the same session's first turn can both reach this
+        // method before either has written — so this still needs to converge
+        // them on one winner, the same as the Valkey `SET NX` path.
+        if let Some(existing) = pins.get(&key) {
+            if existing.expires_at > Instant::now() {
+                return existing.value.clone();
+            }
+        }
+        pins.insert(
+            key,
+            ExpiringPin {
+                value: block.clone(),
+                expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+            },
+        );
+        block.clone()
+    }
+}
+
+/// Standalone: the control plane wrote nothing, so everything is absent.
+///
+/// Every method here is a constant. That is the finding the spike set out to
+/// test — the control-plane half of the surface needs no second implementation,
+/// only an honest way to say "not present", which is what lets the standalone
+/// build drop Valkey entirely.
+#[derive(Default)]
+pub struct NullControlPlaneCache;
+
+#[async_trait]
+impl ControlPlaneCache for NullControlPlaneCache {
+    async fn bandit_keywords(&self, _workspace_id: &str) -> Option<serde_json::Value> {
+        None
+    }
+
+    async fn active_sop_tier(&self, _workspace_id: &str) -> Option<String> {
+        None
+    }
+
+    /// No control plane, no version: the TTL stays the floor.
+    async fn policy_version(&self, _workspace_id: &str) -> Option<u64> {
+        None
+    }
+
+    /// A standalone proxy has no control plane to have configured a
+    /// workspace-level allowlist — but Wave 6.3 (audit-remediation) gives it
+    /// a LOCAL one instead: `~/.intutic/config.json`'s `allowedModels`, read
+    /// through `local_config::get_allowed_models()` (its own cached parse,
+    /// already normalizing `Some(vec![])` to `None`). `workspace_id` is
+    /// unused deliberately — the local file has no concept of a workspace,
+    /// only of "models this machine may use."
+    async fn allowed_models(&self, _workspace_id: &str) -> Option<Vec<String>> {
+        crate::local_config::get_allowed_models()
+    }
+
+    /// `None`, not `Some(default)` — standalone there is no control plane to be
+    /// authoritative, so `config.yaml` decides.
+    async fn feature_flags(&self, _workspace_id: &str) -> Option<FeatureFlags> {
+        None
+    }
+
+    /// `Unmanaged`, emphatically not `Rejected`. A standalone deployment has no
+    /// `v2:auth:apikey:*` for any token, so returning "not found" here would
+    /// 401 every request — the bug this enum exists to make impossible.
+    /// Spend is still bounded, by `local_spend`'s on-disk daily cap.
+    async fn auth_context(&self, _token: &str) -> ControlPlaneAuth {
+        ControlPlaneAuth::Unmanaged
+    }
+
+    /// `Clear`, never `Unverifiable`. Standalone has no control plane to have
+    /// set a cap, so there is nothing unverifiable about the answer — this is a
+    /// definite "no cap", not a failed lookup. Standalone spend stays bounded
+    /// by `local_spend`'s on-disk daily cap.
+    /// Standalone open core has no control-plane budget keys; `local_spend`'s
+    /// on-disk daily cap bounds spend instead.
+    async fn daily_budget(&self, _workspace_id: &str) -> Option<(f64, Option<f64>)> {
+        None
+    }
+
+    async fn hard_block(&self, _workspace_id: &str) -> HardCapStatus {
+        HardCapStatus::Clear
+    }
+
+    async fn loop_status(&self, _loop_run_id: &str) -> Option<String> {
+        None
+    }
+
+    /// No control plane means no loop registry, so no run to resolve.
+    async fn active_loop_run(
+        &self,
+        _workspace_id: &str,
+        _member_id: Option<&str>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Judging is a control-plane feature; standalone it is never auto-active.
+    /// Explicit in-prompt invocation (`/intutic judge`) is unaffected.
+    async fn auto_judge_active(&self, _scope: JudgeScope, _id: &str) -> bool {
+        false
+    }
+
+    /// No control plane means no break-glass issuer, so no token can be valid.
+    /// Standalone has nothing to break out of — policies come from local config.
+    async fn break_glass_grant(
+        &self,
+        _token: &str,
+        _workspace_id: &str,
+    ) -> Option<BreakGlassGrant> {
+        None
+    }
+
+    async fn transition_baseline(&self, _workspace_id: &str) -> Option<String> {
+        // The standalone store has no control plane behind it, so there is no fitted
+        // model — the built-in table is the whole detector in local/OSS mode. That is
+        // the intended tier boundary, not a gap.
+        None
+    }
+
+    async fn wasm_plugins(&self, _workspace_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn wasm_binary(&self, _sha256: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    async fn predict_gate_threshold(&self, _workspace_id: &str) -> Option<f64> {
+        None
+    }
+
+    async fn token_baseline(
+        &self,
+        _workspace_id: &str,
+        _model: &str,
+        _bucket: &str,
+    ) -> Option<TokenBaseline> {
+        None
+    }
+
+    /// Always empty. Nothing in open core writes `gov:notify:*` — the queues
+    /// are filled by the control plane's corrective-prompt and cron services,
+    /// so standalone is a consumer with no producer.
+    async fn drain_notifications(&self, _scope: NotifyScope, _id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Always `false`. No control plane means nothing ever attests a
+    /// sandbox — returning anything else would make every open-core session
+    /// look sandboxed regardless of reality.
+    async fn is_sandbox_attested(&self, _workspace_id: &str, _session_id: &str) -> bool {
+        false
+    }
+}
+
+/// Seconds since the epoch, for the graph maps' TTLs.
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod null_control_plane_cache_tests {
+    use super::*;
+
+    /// No control plane, no attestation — same fail-closed shape as
+    /// `auto_judge_active` and `break_glass_grant` on this struct: standalone
+    /// has nothing that could have attested a sandbox, so this must never be
+    /// mistaken for "confirmed unattested" carrying different weight than
+    /// "unknown". Both collapse to the same `false`.
+    #[tokio::test]
+    async fn standalone_never_attests_a_sandbox() {
+        let cp = NullControlPlaneCache;
+        assert!(!cp.is_sandbox_attested("ws_1", "ses_1").await);
+    }
+
+    /// Standalone proxies have no control plane to have configured a
+    /// workspace-level approved-models allowlist — but they DO now read a
+    /// LOCAL one (Wave 6.3, audit-remediation): `~/.intutic/config.json`'s
+    /// `allowedModels`, via `local_config::get_allowed_models()`. With no
+    /// config file at all (this test's scratch `HOME` starts empty), that
+    /// stays unrestricted — `None`, never `Some(vec![])`.
+    /// `check_model_allowed` treats both the same way, but the type-level
+    /// distinction matters: an absent config must never be mistaken for
+    /// "configured an allowlist that happens to be empty."
+    ///
+    /// Uses `crate::test_support::HOME_LOCK` and a scratch `HOME`, same as
+    /// `local_config.rs`'s own tests — `allowed_models` now touches the real
+    /// filesystem through that module's cache, so this can no longer run
+    /// against whatever `HOME` happens to be set to in the process that
+    /// runs `cargo test` (a developer's real `~/.intutic/config.json` could
+    /// otherwise make this test's result depend on who's running it).
+    #[tokio::test]
+    // HOME_LOCK is held across the await on purpose: it serialises HOME with
+    // every other test that sets it, for the whole test.
+    #[allow(clippy::await_holding_lock)]
+    async fn standalone_has_no_allowed_models_restriction_with_no_local_config() {
+        let _lock = crate::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "intutic-memory-test-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("HOME", &dir);
+        crate::local_config::reset_cache_for_test();
+
+        let cp = NullControlPlaneCache;
+        assert_eq!(cp.allowed_models("ws_1").await, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: a LOCAL allowlist (config.json, no control plane
+    /// involved at all) is what `NullControlPlaneCache::allowed_models` now
+    /// actually returns when one is configured — this is the enforcement
+    /// this whole build exists to light up.
+    #[tokio::test]
+    // HOME_LOCK is held across the await on purpose: it serialises HOME with
+    // every other test that sets it, for the whole test.
+    #[allow(clippy::await_holding_lock)]
+    async fn standalone_honours_a_configured_local_allowlist() {
+        let _lock = crate::test_support::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "intutic-memory-test-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let intutic_dir = dir.join(".intutic");
+        let _ = std::fs::create_dir_all(&intutic_dir);
+        std::fs::write(
+            intutic_dir.join("config.json"),
+            r#"{"allowedModels": ["claude-3-5-sonnet"]}"#,
+        )
+        .unwrap();
+        std::env::set_var("HOME", &dir);
+        crate::local_config::reset_cache_for_test();
+
+        let cp = NullControlPlaneCache;
+        assert_eq!(
+            cp.allowed_models("ws_1").await,
+            Some(vec!["claude-3-5-sonnet".to_string()])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    /// A store that cannot track graphs must say so, not guess.
+    ///
+    /// The distinction is load-bearing for two detectors. `Some(false)` for
+    /// liveness would orphan every node in every graph; `Some(0.0)` for spend
+    /// would tell a budget detector the graph has cost nothing. Both are the
+    /// wrong answer, and both are what a naive default would produce.
+    #[tokio::test]
+    async fn unknowable_graph_facts_are_none_not_defaults() {
+        let s = MemoryStore::new();
+        assert_eq!(s.is_graph_member("ws", "g", "n").await, None);
+        assert_eq!(s.graph_spend("ws", "g").await, None);
+        assert_eq!(s.add_graph_spend("ws", "g", 1.0, 60).await, None);
+        assert!(s.graph_members("ws", "g").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_budget_is_tracked_without_a_control_plane() {
+        // Open core has no control plane, so nothing wrote the ceiling and this
+        // store returned (None, None) unconditionally — WorkflowBudgetDetector
+        // had no input it could ever act on.
+        let store = MemoryStore::default();
+
+        assert_eq!(store.workflow_budget("lr_1").await, (None, None));
+
+        assert!(store.set_workflow_budget_if_absent("lr_1", 5.0).await);
+        store.add_workflow_spend("lr_1", 2.0).await;
+        store.add_workflow_spend("lr_1", 1.5).await;
+
+        let (spend, budget) = store.workflow_budget("lr_1").await;
+        assert_eq!(budget, Some(5.0));
+        assert_eq!(spend, Some(3.5));
+    }
+
+    #[tokio::test]
+    async fn an_existing_ceiling_is_never_overwritten() {
+        // The control plane's value is the authority; a per-proxy default must
+        // not quietly replace an operator's explicit budget.
+        let store = MemoryStore::default();
+        assert!(store.set_workflow_budget_if_absent("lr_1", 100.0).await);
+        assert!(!store.set_workflow_budget_if_absent("lr_1", 5.0).await);
+        assert_eq!(store.workflow_budget("lr_1").await.1, Some(100.0));
+    }
+
+    #[tokio::test]
+    async fn runs_do_not_share_a_budget() {
+        let store = MemoryStore::default();
+        store.set_workflow_budget_if_absent("lr_1", 5.0).await;
+        store.add_workflow_spend("lr_1", 4.0).await;
+        assert_eq!(store.workflow_budget("lr_2").await, (None, None));
+    }
+}
+
+#[cfg(test)]
+mod scope_bound_tests {
+    use super::*;
+    use crate::store::LocalStore;
+
+    #[tokio::test]
+    async fn the_oldest_seen_scope_is_forgotten_from_every_map_past_the_cap() {
+        let store = MemoryStore::with_scope_cap(3);
+        for i in 0..3 {
+            let scope = format!("ws:member:m:fp:{i:08x}");
+            store
+                .set_session_locked_model(&scope, "claude-haiku-4-5")
+                .await
+                .unwrap();
+            store
+                .record_tool_sequence(&scope, &["Bash".to_string()], 10)
+                .await
+                .unwrap();
+            store
+                .record_calls_and_count_window(&scope, 1, 1_000, 60)
+                .await
+                .unwrap();
+            store.swap_extracted_tool_count(&scope, 1).await;
+        }
+        let first = "ws:member:m:fp:00000000";
+        assert!(store
+            .session_routing(first)
+            .await
+            .unwrap()
+            .locked_model
+            .is_some());
+
+        // The fourth scope pushes the first one out — of all the maps at once.
+        let fourth = "ws:member:m:fp:00000003";
+        store
+            .set_session_locked_model(fourth, "claude-haiku-4-5")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .session_routing(first)
+                .await
+                .unwrap()
+                .locked_model
+                .is_none(),
+            "sessions"
+        );
+        // The scopes that survived are untouched, and re-touching a live scope
+        // evicts nothing.
+        store
+            .set_session_locked_model(fourth, "claude-sonnet-4-5")
+            .await
+            .unwrap();
+        assert!(store
+            .session_routing("ws:member:m:fp:00000001")
+            .await
+            .unwrap()
+            .locked_model
+            .is_some());
+        assert!(store
+            .session_routing("ws:member:m:fp:00000002")
+            .await
+            .unwrap()
+            .locked_model
+            .is_some());
+
+        // The evicted scope's other maps are empty too. Reading them through
+        // the writers re-creates the scope as a NEW one (first-seen order),
+        // which in turn pushes out the next-oldest — that is the FIFO rule,
+        // not a leak.
+        assert!(
+            store
+                .record_tool_sequence(first, &[], 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "tool_sequences"
+        );
+        assert_eq!(
+            store.swap_extracted_tool_count(first, 0).await,
+            0,
+            "extracted_tool_counts"
+        );
+        assert!(
+            store
+                .session_routing("ws:member:m:fp:00000001")
+                .await
+                .unwrap()
+                .locked_model
+                .is_none(),
+            "next-oldest evicted by the re-created scope"
+        );
+    }
+}

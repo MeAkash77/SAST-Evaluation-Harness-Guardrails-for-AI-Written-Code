@@ -1,0 +1,77 @@
+@import "@intutic/theme/css";
+
+/* The docs take colour from @intutic/theme (packages/theme/src/tokens.ts), the
+   same tokens as the dashboard. The theme package keys dark values off `.dark`,
+   the class VitePress toggles, so this file only maps them onto VitePress's own
+   variables. */
+
+:root {
+  /* One family pair across dashboard, docs and website: Geist for text, Geist
+     Mono for code (SIL OFL). The @font-face rules come from the import above
+     and the files from packages/theme/fonts, which the theme build copies to
+     public/fonts; the theme imports VitePress without its bundled Inter. */
+  --vp-font-family-base: var(--font-sans);
+  --vp-font-family-mono: var(--font-mono);
+
+  --vp-c-bg: var(--color-bg-elevated);
+  --vp-c-bg-alt: var(--color-bg-secondary);
+  --vp-c-bg-elv: var(--color-bg-elevated);
+  --vp-c-bg-soft: var(--color-bg-secondary);
+
+  --vp-c-brand-1: var(--color-accent-text);
+  --vp-c-brand-2: var(--color-accent-hover);
+  --vp-c-brand-3: var(--color-accent);
+  --vp-c-brand-soft: var(--color-accent-subtle);
+
+  --vp-c-tip-1: var(--color-success-text);
+  --vp-c-tip-2: var(--color-success-text);
+  --vp-c-tip-3: var(--color-success-fill);
+  --vp-c-tip-soft: var(--color-success-bg);
+
+  --vp-c-warning-1: var(--color-warning-text);
+  --vp-c-warning-soft: var(--color-warning-bg);
+  --vp-c-danger-1: var(--color-error-text);
+  --vp-c-danger-soft: var(--color-error-bg);
+
+  /* Filled buttons use the accent fill in both themes, with white text. */
+  --vp-button-brand-bg: var(--color-accent);
+  --vp-button-brand-border: var(--color-accent);
+  --vp-button-brand-text: var(--color-text-on-accent);
+  --vp-button-brand-hover-bg: var(--color-accent-hover);
+  --vp-button-brand-hover-border: var(--color-accent-hover);
+  --vp-button-brand-hover-text: var(--color-text-on-accent);
+  --vp-button-brand-active-bg: var(--color-accent-hover);
+  --vp-button-brand-active-border: var(--color-accent-hover);
+  --vp-button-brand-active-text: var(--color-text-on-accent);
+}
+
+.dark {
+  --vp-c-bg: var(--color-bg-primary);
+}
+
+/* Feature cards: a border that strengthens on hover, nothing else. */
+.VPFeature {
+  border: 1px solid var(--color-border) !important;
+  transition: border-color var(--duration-fast) var(--ease-out);
+}
+
+.VPFeature:hover {
+  border-color: var(--color-border-hover) !important;
+}
+
+/* Tables on phones.
+ *
+ * VitePress already gives tables `display: block; overflow-x: auto`, so they
+ * never widen the page. But with nothing holding the columns open the table
+ * shrinks to the viewport instead of scrolling, and a five-column reference
+ * table ends up one or two words per line per cell — technically visible,
+ * effectively unreadable.
+ *
+ * A floor on cell width lets the table keep usable proportions and scroll for
+ * the rest. Two-column tables are unaffected: 2 x 8rem still fits. */
+@media (max-width: 640px) {
+  .vp-doc th,
+  .vp-doc td {
+    min-width: 8rem;
+  }
+}

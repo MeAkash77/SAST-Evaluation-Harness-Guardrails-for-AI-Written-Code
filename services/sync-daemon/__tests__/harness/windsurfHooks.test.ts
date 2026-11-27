@@ -1,0 +1,323 @@
+/**
+ * windsurfHooks.test.ts — Cascade-real-payload coverage for the Windsurf
+ * writer (correction, 2026-08-18).
+ *
+ * No dedicated test file existed for this writer before this correction.
+ * `generatedGateBehaviour.test.ts`'s windsurf rows already exercise the
+ * script against the generic Claude-Code-shaped envelope every harness is
+ * driven with (`{tool_name, tool_input: {command}}`) — that coverage stays
+ * valid and is not repeated here. This file exists to prove the thing that
+ * changed: the script now recognizes Cascade's CONFIRMED real payload shape
+ * (`agent_action_name` + `tool_info.*`, not the Cursor-shaped fields this
+ * writer targeted before), and `hooks.json` now registers Cascade's real
+ * event names (`pre_run_command`/`pre_write_code`/`pre_mcp_tool_use`) in
+ * the array-wrapped shape Cascade's schema actually uses — see
+ * windsurfHooks.ts's module doc comment for the full correction record and
+ * sourcing (docs.devin.ai/desktop/cascade/hooks).
+ *
+ * @module
+ */
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import * as node_fs from 'node:fs/promises'
+import { writeFileSync } from 'node:fs'
+import * as node_path from 'node:path'
+import * as node_os from 'node:os'
+import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { DESTRUCTIVE_COMMAND_PATTERNS } from '../../src/harness/protectedPaths.js'
+import { toRulesLine } from '../../src/harness/gateBody.js'
+
+/** Writes a `.rules` fixture the way the daemon does — digest included, so
+ *  the gate's own digest check accepts it. Mirrors
+ *  generatedGateBehaviour.test.ts's `writeRulesFixture`. */
+/** What the Windsurf plugin saves once it has run in an IDE. */
+const CODEIUM_SETTINGS_XML =
+  '<application>\n  <component name="com.codeium.intellij.settings.AppSettingsState">\n' +
+  '    <option name="detectProxy" value="false" />\n  </component>\n</application>\n'
+
+function writeRulesFixture(target: string): string {
+  const lines = DESTRUCTIVE_COMMAND_PATTERNS.map(toRulesLine)
+  const digest = createHash('sha256').update(lines.join('\n')).digest('hex').slice(0, 32)
+  writeFileSync(target, `#digest ${digest}\n#generated ${new Date().toISOString()}\n${lines.join('\n')}\n`)
+  return target
+}
+
+function runScript(
+  scriptPath: string,
+  input: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', [scriptPath], { env, stdio: ['pipe', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (d: string) => { stdout += d })
+    child.stderr.on('data', (d: string) => { stderr += d })
+    child.on('error', reject)
+    child.on('close', (status) => resolve({ status, stdout, stderr }))
+    child.stdin.write(input)
+    child.stdin.end()
+  })
+}
+
+describe('Windsurf hooks writer — Cascade real payload shape', () => {
+  let workspaceRoot: string
+  let home: string
+  let scriptPath: string
+  let auditLog: string
+  let snapshotPath: string
+  let noSnapshotPath: string
+  let env: NodeJS.ProcessEnv
+  const prevHome = process.env.HOME
+
+  beforeAll(async () => {
+    workspaceRoot = await node_fs.mkdtemp(node_path.join(node_os.tmpdir(), 'intutic-windsurf-ws-'))
+    home = await node_fs.mkdtemp(node_path.join(node_os.tmpdir(), 'intutic-windsurf-home-'))
+    // windsurfHooks.ts reads os.homedir() at call time, so setting HOME before
+    // the call is enough.
+    process.env.HOME = home
+    const { writeWindsurfHooks } = await import('../../src/harness/windsurfHooks.js')
+    await writeWindsurfHooks(workspaceRoot, 'http://127.0.0.1:4000', 4000, 'ws_test')
+    scriptPath = node_path.join(workspaceRoot, '.intutic', 'hooks', 'windsurf-check.js')
+    auditLog = node_path.join(workspaceRoot, '.intutic', 'events', 'hook-events.jsonl')
+    snapshotPath = writeRulesFixture(node_path.join(home, 'snapshot.rules'))
+    noSnapshotPath = node_path.join(home, 'no-such.rules')
+    env = { ...process.env, HOME: home, USERPROFILE: home }
+  })
+
+  afterAll(async () => {
+    process.env.HOME = prevHome
+    await node_fs.rm(workspaceRoot, { recursive: true, force: true })
+    await node_fs.rm(home, { recursive: true, force: true })
+  })
+
+  it('registers hooks.json under Cascade\'s real event names, array-wrapped, with no failClosed field', async () => {
+    const config = JSON.parse(
+      await node_fs.readFile(node_path.join(home, '.codeium', 'windsurf', 'hooks.json'), 'utf-8'),
+    )
+    expect(Object.keys(config.hooks).sort()).toEqual(['pre_mcp_tool_use', 'pre_run_command', 'pre_write_code'])
+    for (const entry of Object.values(config.hooks) as unknown[][]) {
+      expect(Array.isArray(entry)).toBe(true)
+      expect(entry[0]).toMatchObject({ command: expect.stringContaining('windsurf-check.js') })
+      expect(entry[0]).not.toHaveProperty('failClosed')
+    }
+    // Cursor's event names must NOT appear — a stray entry under one would
+    // be silently ignored by Cascade (unknown hooks.json keys), but its
+    // presence would misleadingly suggest this writer still believes in it.
+    expect(config.hooks).not.toHaveProperty('beforeShellExecution')
+    expect(config.hooks).not.toHaveProperty('beforeMCPExecution')
+    expect(config.hooks).not.toHaveProperty('beforeFileEdit')
+  })
+
+  it('also writes the JetBrains plugin\'s separate user-level hooks.json (~/.codeium/hooks.json)', async () => {
+    const desktopConfig = JSON.parse(
+      await node_fs.readFile(node_path.join(home, '.codeium', 'windsurf', 'hooks.json'), 'utf-8'),
+    )
+    const jetbrainsConfig = JSON.parse(
+      await node_fs.readFile(node_path.join(home, '.codeium', 'hooks.json'), 'utf-8'),
+    )
+    expect(Object.keys(jetbrainsConfig.hooks).sort()).toEqual(['pre_mcp_tool_use', 'pre_run_command', 'pre_write_code'])
+    // Same script, same config content — only the file location differs.
+    expect(jetbrainsConfig.hooks).toEqual(desktopConfig.hooks)
+  })
+
+  it('blocks pre_run_command reading tool_info.command_line (real Cascade shape, dynamic tier)', async () => {
+    const payload = JSON.stringify({
+      agent_action_name: 'pre_run_command',
+      trajectory_id: 'traj_test',
+      tool_info: { command_line: 'rm -rf /', cwd: workspaceRoot },
+    })
+    const result = await runScript(scriptPath, payload, { ...env, INTUTIC_SNAPSHOT_RULES: snapshotPath })
+    expect(result.status).toBe(2)
+  })
+
+  it('allows pre_run_command with a benign command_line', async () => {
+    const payload = JSON.stringify({
+      agent_action_name: 'pre_run_command',
+      tool_info: { command_line: 'npm test', cwd: workspaceRoot },
+    })
+    const result = await runScript(scriptPath, payload, { ...env, INTUTIC_SNAPSHOT_RULES: snapshotPath })
+    expect(result.status).toBe(0)
+  })
+
+  it('blocks pre_write_code targeting a protected path via tool_info.file_path (floor tier — no snapshot needed)', async () => {
+    const payload = JSON.stringify({
+      agent_action_name: 'pre_write_code',
+      tool_info: {
+        file_path: node_path.join(workspaceRoot, '.intutic', 'hooks', 'windsurf-check.js'),
+        edits: [{ old_string: 'x', new_string: 'y' }],
+      },
+    })
+    const result = await runScript(scriptPath, payload, { ...env, INTUTIC_SNAPSHOT_RULES: noSnapshotPath })
+    expect(result.status).toBe(2)
+  })
+
+  it('allows pre_write_code targeting an ordinary file', async () => {
+    const payload = JSON.stringify({
+      agent_action_name: 'pre_write_code',
+      tool_info: { file_path: node_path.join(workspaceRoot, 'src', 'index.ts'), edits: [] },
+    })
+    const result = await runScript(scriptPath, payload, { ...env, INTUTIC_SNAPSHOT_RULES: noSnapshotPath })
+    expect(result.status).toBe(0)
+  })
+
+  it('composes mcp__<server>__<tool> from tool_info.mcp_server_name/mcp_tool_name (pre_mcp_tool_use)', async () => {
+    await node_fs.rm(auditLog, { force: true })
+    const payload = JSON.stringify({
+      agent_action_name: 'pre_mcp_tool_use',
+      trajectory_id: 'traj_test',
+      tool_info: {
+        mcp_server_name: 'github',
+        mcp_tool_name: 'create_issue',
+        mcp_tool_arguments: { owner: 'acme', repo: 'demo', title: 'bug' },
+      },
+    })
+    const result = await runScript(scriptPath, payload, { ...env, INTUTIC_SNAPSHOT_RULES: noSnapshotPath })
+    expect(result.status).toBe(0)
+    const lines = (await node_fs.readFile(auditLog, 'utf-8')).trim().split('\n').filter(Boolean)
+    const allowed = lines.map((l) => JSON.parse(l)).find((e) => e.event === 'tool_allowed')
+    expect(allowed?.toolName).toBe('mcp__github__create_issue')
+  })
+
+  it('still recognizes the generic Claude-Code-shaped envelope (fallback preserved)', async () => {
+    // generatedGateBehaviour.test.ts drives every harness writer with this
+    // exact shape — proving it still works here is proving that adding the
+    // real Cascade fields did not regress the existing generic coverage.
+    const payload = JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'rm -rf /' } })
+    const result = await runScript(scriptPath, payload, { ...env, INTUTIC_SNAPSHOT_RULES: snapshotPath })
+    expect(result.status).toBe(2)
+  })
+
+  it('refuses an envelope with none of the recognized fields', async () => {
+    const result = await runScript(scriptPath, JSON.stringify({ nonsense: true }), {
+      ...env,
+      INTUTIC_SNAPSHOT_RULES: noSnapshotPath,
+    })
+    expect(result.status).toBe(2)
+    expect(result.stderr).toContain('unrecognised PreToolUse payload')
+  })
+})
+
+describe('Windsurf hooks writer — JetBrains proxy config wiring', () => {
+  it('writeWindsurfHooks itself reaches configureJetBrainsWindsurfProxy when a JetBrains product is installed', async () => {
+    const workspaceRoot = await node_fs.mkdtemp(node_path.join(node_os.tmpdir(), 'intutic-windsurf-jb-ws-'))
+    const home = await node_fs.mkdtemp(node_path.join(node_os.tmpdir(), 'intutic-windsurf-jb-home-'))
+    const prevHome = process.env.HOME
+    const prevPlatform = process.platform
+    try {
+      process.env.HOME = home
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
+      const optionsDir = node_path.join(home, 'Library', 'Application Support', 'JetBrains', 'GoLand2026.1', 'options')
+      await node_fs.mkdir(optionsDir, { recursive: true })
+      // The plugin's own settings file is what marks it as set up in this IDE.
+      await node_fs.writeFile(node_path.join(optionsDir, 'CodeiumSettings.xml'), CODEIUM_SETTINGS_XML, 'utf-8')
+
+      const { writeWindsurfHooks } = await import('../../src/harness/windsurfHooks.js')
+      await writeWindsurfHooks(workspaceRoot, 'http://127.0.0.1:4000', 4000, 'ws_test')
+
+      const codeiumXml = await node_fs.readFile(node_path.join(optionsDir, 'CodeiumSettings.xml'), 'utf-8')
+      expect(codeiumXml).toContain('<option name="detectProxy" value="true" />')
+      const proxyXml = await node_fs.readFile(node_path.join(optionsDir, 'proxy.settings.xml'), 'utf-8')
+      expect(proxyXml).toContain('<option name="PROXY_PORT" value="4000" />')
+    } finally {
+      process.env.HOME = prevHome
+      Object.defineProperty(process, 'platform', { value: prevPlatform, configurable: true })
+      await node_fs.rm(workspaceRoot, { recursive: true, force: true })
+      await node_fs.rm(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Windsurf hooks writer — merges into the user\'s files', () => {
+  let workspaceRoot: string
+  let home: string
+  const prevHome = process.env.HOME
+  // The settings path follows these; unset, it stays inside the temporary home.
+  const prevXdg = process.env.XDG_CONFIG_HOME
+  const prevAppData = process.env.APPDATA
+
+  beforeAll(async () => {
+    workspaceRoot = await node_fs.mkdtemp(node_path.join(node_os.tmpdir(), 'intutic-windsurf-merge-ws-'))
+    home = await node_fs.mkdtemp(node_path.join(node_os.tmpdir(), 'intutic-windsurf-merge-home-'))
+    delete process.env.XDG_CONFIG_HOME
+    delete process.env.APPDATA
+  })
+
+  afterAll(async () => {
+    process.env.HOME = prevHome
+    if (prevXdg !== undefined) process.env.XDG_CONFIG_HOME = prevXdg
+    if (prevAppData !== undefined) process.env.APPDATA = prevAppData
+    await node_fs.rm(workspaceRoot, { recursive: true, force: true })
+    await node_fs.rm(home, { recursive: true, force: true })
+  })
+
+  it('keeps the user\'s settings and hooks, points the proxy at the real proxy port, and does not stack on re-run', async () => {
+    const userDir = node_path.join(home, '.codeium', 'windsurf')
+    await node_fs.mkdir(userDir, { recursive: true })
+    const { windsurfSettingsPath } = await import('../../src/harness/windsurfHooks.js')
+    const settingsPath = windsurfSettingsPath(process.platform, process.env, home)
+    await node_fs.mkdir(node_path.dirname(settingsPath), { recursive: true })
+    await node_fs.writeFile(settingsPath, JSON.stringify({ 'editor.fontSize': 15, 'http.proxyAuthorization': null }))
+    await node_fs.writeFile(
+      node_path.join(userDir, 'hooks.json'),
+      JSON.stringify({ hooks: { pre_run_command: [{ command: 'my-audit.sh' }], post_cascade_response: [{ command: 'notify.sh' }] } }),
+    )
+
+    process.env.HOME = home
+    const { writeWindsurfHooks } = await import('../../src/harness/windsurfHooks.js')
+    await writeWindsurfHooks(workspaceRoot, 'http://127.0.0.1:4000', 4000, 'ws_test')
+    await writeWindsurfHooks(workspaceRoot, 'http://127.0.0.1:4000', 4000, 'ws_test')
+
+    const settings = JSON.parse(await node_fs.readFile(settingsPath, 'utf-8'))
+    expect(settings['editor.fontSize']).toBe(15)
+    expect(settings['http.proxy']).toBe('http://127.0.0.1:4000')
+    expect(settings['codeium.proxy']).toBe('http://127.0.0.1:4000')
+
+    const hooks = JSON.parse(await node_fs.readFile(node_path.join(userDir, 'hooks.json'), 'utf-8')).hooks
+    expect(hooks.post_cascade_response).toEqual([{ command: 'notify.sh' }])
+    expect(hooks.pre_run_command[0]).toEqual({ command: 'my-audit.sh' })
+    expect(hooks.pre_run_command).toHaveLength(2)
+    expect(hooks.pre_run_command[1].command).toContain('windsurf-check.js')
+  })
+
+  it('leaves a settings.json that is not plain JSON untouched', async () => {
+    const { writeWindsurfHooks, windsurfSettingsPath } = await import('../../src/harness/windsurfHooks.js')
+    const settingsPath = windsurfSettingsPath(process.platform, process.env, home)
+    const jsonc = '{\n  // my proxy\n  "http.proxy": "http://corp-proxy:3128",\n}\n'
+    await node_fs.writeFile(settingsPath, jsonc)
+
+    process.env.HOME = home
+    await writeWindsurfHooks(workspaceRoot, 'http://127.0.0.1:4000', 4000, 'ws_test')
+
+    expect(await node_fs.readFile(settingsPath, 'utf-8')).toBe(jsonc)
+  })
+
+  it('writes the proxy keys into the settings file Windsurf reads, not ~/.codeium/windsurf', async () => {
+    const fresh = await node_fs.mkdtemp(node_path.join(node_os.tmpdir(), 'intutic-windsurf-fresh-home-'))
+    try {
+      process.env.HOME = fresh
+      const { writeWindsurfHooks, windsurfSettingsPath } = await import('../../src/harness/windsurfHooks.js')
+      await writeWindsurfHooks(workspaceRoot, 'http://127.0.0.1:4000', 4000, 'ws_test')
+      const settings = JSON.parse(await node_fs.readFile(windsurfSettingsPath(process.platform, process.env, fresh), 'utf-8'))
+      expect(settings['http.proxy']).toBe('http://127.0.0.1:4000')
+      await expect(node_fs.access(node_path.join(fresh, '.codeium', 'windsurf', 'settings.json'))).rejects.toThrow()
+    } finally {
+      process.env.HOME = home
+      await node_fs.rm(fresh, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('windsurfSettingsPath', () => {
+  it('is VS Code\'s user settings location under the Windsurf product name', async () => {
+    const { windsurfSettingsPath } = await import('../../src/harness/windsurfHooks.js')
+    expect(windsurfSettingsPath('darwin', {}, '/Users/u')).toBe('/Users/u/Library/Application Support/Windsurf/User/settings.json')
+    expect(windsurfSettingsPath('linux', {}, '/home/u')).toBe('/home/u/.config/Windsurf/User/settings.json')
+    expect(windsurfSettingsPath('linux', { XDG_CONFIG_HOME: '/xdg' }, '/home/u')).toBe('/xdg/Windsurf/User/settings.json')
+    expect(windsurfSettingsPath('win32', { APPDATA: '/c/Users/u/AppData/Roaming' }, '/c/Users/u')).toBe(
+      node_path.join('/c/Users/u/AppData/Roaming', 'Windsurf', 'User', 'settings.json'),
+    )
+  })
+})

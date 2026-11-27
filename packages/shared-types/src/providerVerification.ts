@@ -1,0 +1,275 @@
+/**
+ * Provider credential verification (model catalog & cohort wizard).
+ *
+ * Pure, network-free description of how to check whether a credential works —
+ * the cheapest authenticated call each provider's own API exposes. Two
+ * different executors run the same probe spec because a credential crosses a
+ * trust boundary differently depending on who holds it at verification time:
+ *
+ * - `tools/cli/src/lib/providerProbe.ts` — the CLI legitimately holds a raw
+ *   key locally before it is ever sent anywhere, and probes with it directly.
+ * - The control plane — probes a credential
+ *   already stored in Valkey, server-side, so the raw value never has to
+ *   leave the control plane a second time.
+ *
+ * Neither executor lives in this package (no network calls here — shared-types
+ * is pure data and types, consumed by both the CLI and the control plane).
+ * This module only describes WHAT to request; each executor decides HOW to
+ * make that request in its own runtime.
+ *
+ * Deliberately, no probe here targets `/v1/chat/completions` —
+ * The control plane treats
+ * every fetch call to that literal URL shape as a judge/generation call
+ * requiring classification. A verification probe is neither; it must not add
+ * a site to that census.
+ *
+ * @module
+ */
+
+import { buildCloudVerificationProbe } from './cloudProbe.js'
+
+/**
+ * Strip trailing `/` characters, without a regex. `endpoint`/`apiBase` are
+ * workspace-provisioned credential fields — CodeQL correctly flagged the
+ * original `.replace(/\/+$/, '')` as a polynomial-regex risk on uncontrolled
+ * input (this module is a pure function with no length bound of its own;
+ * the server-side 512-char cap in `providerCredentials.ts` is a different
+ * layer, not a guarantee this function can rely on). A plain index walk is
+ * linear by construction, with no backtracking to worry about.
+ */
+function stripTrailingSlashes(s: string): string {
+  let end = s.length
+  while (end > 0 && s[end - 1] === '/') end--
+  return s.slice(0, end)
+}
+
+export interface ProviderProbeRequest {
+  url: string
+  method: 'GET' | 'POST'
+  headers: Record<string, string>
+  /** Present only for POST probes (the cloud token and STS calls). */
+  body?: string
+  /** A provider-specific reading of the answer; `classifyProbeResponse` otherwise. */
+  classify?: (status: number, headers: { get(name: string): string | null }) => ProbeVerdict
+  /** What a `valid` answer proves, when it is narrower than "the credential works". */
+  validDetail?: string
+  /** Decided without a request (a key that cannot be used at all); nothing is sent. */
+  localVerdict?: ProbeVerdict
+}
+
+/**
+ * Build the cheapest authenticated request that proves a credential works,
+ * or `null` if this provider has no such probe defined yet.
+ *
+ * `fields` is the provider's credential field map exactly as stored — the
+ * same shape `PROVIDER_REGISTRY`'s `ProviderCredentialField.key`s describe
+ * (`providers.ts`), e.g. `{ apiKey: '...' }` for Anthropic, `{ apiKey, endpoint }`
+ * for Azure OpenAI.
+ *
+ * Bedrock and Vertex AI return `null` here: their probe is signed per
+ * request, which takes WebCrypto and is asynchronous — see
+ * `buildVerificationProbeAsync`, which every executor calls. A caller seeing
+ * `null` from that should say "cannot verify automatically," not fail the
+ * credential.
+ */
+export function buildVerificationProbe(
+  provider: string,
+  fields: Record<string, string>,
+): ProviderProbeRequest | null {
+  switch (provider) {
+    case 'anthropic': {
+      const apiKey = fields.apiKey
+      if (!apiKey) return null
+      // Listing models is the cheapest authenticated call Anthropic has: it
+      // spends no tokens, and the answer says which models the key reaches.
+      // 1000 is the page-size ceiling, enough for the whole catalog in one call.
+      return {
+        url: 'https://api.anthropic.com/v1/models?limit=1000',
+        method: 'GET',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+      }
+    }
+
+    case 'openai': {
+      const apiKey = fields.apiKey
+      if (!apiKey) return null
+      return {
+        url: 'https://api.openai.com/v1/models',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}` },
+      }
+    }
+
+    case 'mistral': {
+      const apiKey = fields.apiKey
+      if (!apiKey) return null
+      return {
+        url: 'https://api.mistral.ai/v1/models',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}` },
+      }
+    }
+
+    case 'openrouter': {
+      const apiKey = fields.apiKey
+      if (!apiKey) return null
+      return {
+        url: 'https://openrouter.ai/api/v1/models',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}` },
+      }
+    }
+
+    case 'deepseek': {
+      const apiKey = fields.apiKey
+      if (!apiKey) return null
+      return {
+        url: 'https://api.deepseek.com/v1/models',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}` },
+      }
+    }
+
+    case 'cohere': {
+      const apiKey = fields.apiKey
+      if (!apiKey) return null
+      return {
+        url: 'https://api.cohere.com/v1/models',
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}` },
+      }
+    }
+
+    case 'gemini': {
+      const apiKey = fields.apiKey
+      if (!apiKey) return null
+      return {
+        url: `https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=${encodeURIComponent(apiKey)}`,
+        method: 'GET',
+        headers: {},
+      }
+    }
+
+    case 'azure_openai': {
+      const apiKey = fields.apiKey
+      const endpoint = fields.endpoint ? stripTrailingSlashes(fields.endpoint) : undefined
+      if (!apiKey || !endpoint) return null
+      return {
+        url: `${endpoint}/openai/models?api-version=2024-02-01`,
+        method: 'GET',
+        headers: { 'api-key': apiKey },
+      }
+    }
+
+    case 'ollama': {
+      const apiBase = fields.apiBase ? stripTrailingSlashes(fields.apiBase) : undefined
+      if (!apiBase) return null
+      // Ollama has no API key by default — this checks reachability, not
+      // authentication. A 200 here means "something is listening," which is
+      // the most this provider's shape lets a probe promise.
+      return {
+        url: `${apiBase}/api/tags`,
+        method: 'GET',
+        headers: {},
+      }
+    }
+
+    case 'bedrock':
+    case 'vertex_ai':
+      return null
+
+    default:
+      return null
+  }
+}
+
+export type ProbeVerdict = 'valid' | 'invalid' | 'unknown'
+
+/** `body[listKey][].{idKey}` values that are non-empty strings. */
+function pluck(body: unknown, listKey: string, idKey: string): string[] | null {
+  if (typeof body !== 'object' || body === null) return null
+  const list = (body as Record<string, unknown>)[listKey]
+  if (!Array.isArray(list)) return null
+  const ids: string[] = []
+  for (const entry of list) {
+    const id = typeof entry === 'object' && entry !== null ? (entry as Record<string, unknown>)[idKey] : undefined
+    if (typeof id === 'string' && id.length > 0) ids.push(id)
+  }
+  return ids
+}
+
+/**
+ * The model ids in a provider's list-models answer (the body a `valid`
+ * verification probe got back), deduplicated and sorted; `null` when this
+ * provider's probe does not list the models a request can name, or the body
+ * is not the expected shape.
+ *
+ * Azure OpenAI's probe lists base models, while a request names a deployment,
+ * so its list would mislead; Bedrock and Vertex AI probe identity, not models.
+ */
+export function parseProviderModels(provider: string, body: unknown): string[] | null {
+  let ids: string[] | null
+  switch (provider) {
+    case 'anthropic':
+    case 'openai':
+    case 'mistral':
+    case 'openrouter':
+    case 'deepseek':
+      ids = pluck(body, 'data', 'id')
+      break
+    case 'gemini':
+      // Gemini names a model `models/gemini-2.5-pro`; requests use the bare id.
+      ids = pluck(body, 'models', 'name')?.map((n) => (n.startsWith('models/') ? n.slice('models/'.length) : n)) ?? null
+      break
+    case 'cohere':
+    case 'ollama':
+      ids = pluck(body, 'models', 'name')
+      break
+    default:
+      return null
+  }
+  if (!ids) return null
+  return [...new Set(ids.filter((id) => id.length > 0))].sort()
+}
+
+/**
+ * The probe for any provider: a signed cloud probe for Bedrock and Vertex AI
+ * (`cloudProbe.ts`), the plain request description otherwise.
+ */
+export async function buildVerificationProbeAsync(
+  provider: string,
+  fields: Record<string, string>,
+  now: Date = new Date(),
+): Promise<ProviderProbeRequest | null> {
+  return (await buildCloudVerificationProbe(provider, fields, now)) ?? buildVerificationProbe(provider, fields)
+}
+
+/** The verdict for a probe's answer: the probe's own reading when it has one. */
+export function classifyProbe(
+  probe: ProviderProbeRequest,
+  status: number,
+  headers?: { get(name: string): string | null },
+): ProbeVerdict {
+  return probe.classify
+    ? probe.classify(status, headers ?? { get: () => null })
+    : classifyProbeResponse(status)
+}
+
+/**
+ * Classify a probe's HTTP response. Deliberately narrow about what counts as
+ * "invalid": only 401/403 mean the credential itself is wrong. A 429
+ * (rate-limited) or 5xx (upstream trouble) still proves the key is
+ * authenticated — reporting either as invalid would tell an operator to
+ * re-enter a working key. `unknown` covers both cases plus a request that
+ * never got a response at all (network error, timeout) — callers should
+ * treat `unknown` as "could not verify," not as a failure, and let the
+ * operator proceed.
+ */
+export function classifyProbeResponse(httpStatus: number): ProbeVerdict {
+  if (httpStatus >= 200 && httpStatus < 300) return 'valid'
+  if (httpStatus === 401 || httpStatus === 403) return 'invalid'
+  return 'unknown'
+}

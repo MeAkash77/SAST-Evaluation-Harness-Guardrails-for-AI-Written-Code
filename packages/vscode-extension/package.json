@@ -1,0 +1,69 @@
+{
+  "name": "@intutic/vscode-extension",
+  "displayName": "Intutic Governance Extension",
+  "description": "AI Governance Control Plane for VS Code / Cursor workspaces",
+  "version": "3.2.3",
+  "private": true,
+  "publisher": "intutic",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "intutic.connect",
+        "title": "Intutic: Connect to workspace"
+      },
+      {
+        "command": "intutic.status",
+        "title": "Intutic: Show daemon status"
+      },
+      {
+        "command": "intutic.openTraces",
+        "title": "Intutic: Open trace viewer"
+      },
+      {
+        "command": "intutic.openSops",
+        "title": "Intutic: Browse active SOPs"
+      },
+      {
+        "command": "intutic.openIncidents",
+        "title": "Intutic: View governance incidents"
+      },
+      {
+        "command": "intutic.openWasmRules",
+        "title": "Intutic: View WASM rule bundles"
+      }
+    ],
+    "configuration": {
+      "title": "Intutic",
+      "properties": {
+        "intutic.controlPlaneUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The base URL of the control plane the SOP, incident and WASM panels read (e.g. `http://localhost:3001`). Leave empty to use `INTUTIC_CONTROL_PLANE_URL`, then the URL in `~/.intutic/credentials.json` that `intutic login` writes. There is no default."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "typecheck": "tsc -p ./ --noEmit && tsc -p tsconfig.test.json",
+    "test": "tsc -p ./ && node --test test/*.test.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@intutic/shared-types": "workspace:*",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5"
+  }
+}

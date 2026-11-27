@@ -1,0 +1,983 @@
+/**
+ * workspaceSettings.ts — Per-workspace MCP governance configuration.
+ *
+ * Stored as a JSONB column in `workspaces.settings`. Read by the sync-daemon
+ * on every poll cycle and propagated to `~/.intutic/env/runtime.env` so that
+ * proxy processes and hook scripts pick up changes without restarting.
+ *
+ * WS-5 — Q1 (fail behavior), Q2 (proxy mode), Q3 (bypass enforcement)
+ *
+ * @module
+ */
+
+import type { McpProxyFailBehavior, McpProxyMode, BypassEnforcementTier } from './enums.js'
+import type { SsoGroupPolicy } from './attenuation.js'
+import type { McpBudgetSettings } from './mcpBudgets.js'
+import type { PiiDetectorSettings } from './piiDetectors.js'
+import type { UpstreamRetrySettings } from './upstreamRetry.js'
+import type { InterventionMode } from './policy.js'
+
+// Re-export so callers only need one import
+export type { McpProxyFailBehavior, McpProxyMode, BypassEnforcementTier }
+
+/**
+ * The MCP governance proxy's anomaly detectors, by id. The proxy's own
+ * `DETECTOR_BASE_DISPOSITION` (packages/mcp-proxy/src/anomaly/index.ts) is
+ * typed against this list, so a detector added there without being added
+ * here fails to compile, and `mcpAnomalyOverrides` cannot name one that does
+ * not exist.
+ */
+export const MCP_ANOMALY_DETECTOR_IDS = [
+  'consecutive_repeat',
+  'ping_pong_cycle',
+  'landmark_cycle',
+  'tool_diversity_collapse',
+  'code_as_action',
+  'tool_poisoning',
+  'dlp_escalation',
+] as const
+export type McpAnomalyDetectorId = (typeof MCP_ANOMALY_DETECTOR_IDS)[number]
+
+/**
+ * Per-workspace MCP governance settings.
+ *
+ * All fields are optional on the wire — missing fields are filled in from
+ * DEFAULT_WORKSPACE_SETTINGS by the control-plane GET handler and the
+ * sync-daemon before writing runtime.env.
+ */
+/** BYOC trace-storage configuration (mirrors the control plane's WorkspaceByocConfig). */
+export interface ByocStorageConfig {
+  provider: 'gcs' | 's3' | 'disabled'
+  bucketName?: string
+  prefix?: string
+  projectId?: string
+  region?: string
+  accessKeyId?: string
+  secretAccessKey?: string
+  credentials?: string
+  mode?: 'mirror' | 'primary'
+}
+
+export interface WorkspaceSettings {
+  /**
+   * Whether developers' local markdown vaults (Obsidian/Logseq/Foam) may feed
+   * the `/fix` command's Memory context on their machines.
+   *
+   * Enforced by the proxy at connect time via the sync channel. Vault content
+   * never reaches the control plane either way — this governs only whether
+   * the local search runs at all. Personal notes injected into prompts are a
+   * memory-poisoning surface (OWASP agentic T1), which is why the switch is a
+   * workspace policy rather than purely personal preference.
+   */
+  allowLocalMemoryVaults: boolean
+
+  /**
+   * Days of SSO inactivity after which a member's API keys stop authenticating.
+   *
+   * `null` disables the gate. Defaults to 30 days. SCIM provisioning was removed,
+   * so nothing reconciles membership against the identity provider: without this,
+   * removing a developer at the IdP stops their dashboard login but not their
+   * agents, because API-key auth never consults SSO. Setting it makes IdP
+   * removal expire the keys on its own.
+   *
+   * Opt-in on purpose — a CI key belongs to a member who may never log in
+   * interactively, and enabling this globally would break those pipelines.
+   */
+  ssoKeyMaxIdleDays: number | null
+
+  /**
+   * ISO timestamp of when `ssoKeyMaxIdleDays` was switched on, set by the settings
+   * endpoint. The gate grants one full window from this point before it refuses
+   * anything, so enabling it ramps rather than cutting off members who have no
+   * recorded SSO login yet. Cleared when the gate is turned off.
+   */
+  ssoKeyGateEnabledAt: string | null
+
+  /**
+   * Tools only members of named identity-provider groups may run, and tools
+   * only an on-behalf-of token may call (`SsoGroupPolicySchema`). Absent: no
+   * group restriction; `null` in a settings write clears it, and is never
+   * stored. Snake-case because the gates and the policy responses have always
+   * read it under this key. Every gate decides with `evaluateSsoGroupClearance`;
+   * see `ssoGroupClearance.ts`.
+   */
+  sso_group_policy?: SsoGroupPolicy | null
+
+  /**
+   * The action (`off`, `redact`, `block`) of each PII detector this workspace
+   * governs centrally (`PiiDetectorSettingsSchema`). The LLM proxy and the
+   * MCP proxy apply it to the workspace's traffic as the baseline; a
+   * machine's own detector config may only tighten it (`effectivePiiActions`).
+   * Absent, or a detector left out: each machine's own config applies. `null`
+   * in a settings write clears it, and is never stored.
+   */
+  piiDetectors?: PiiDetectorSettings | null
+
+  /**
+   * Keep tool-call argument values in the sampled replay contexts the LLM
+   * proxy attaches to traces (`context_snapshot`, `WASM_CONTEXT_SNAPSHOT_RATE`).
+   * Absent or `false`, the default: each call keeps its name and its
+   * arguments' top-level keys and size, never their values. `true`: the
+   * values are kept, with secrets, card numbers, IBANs, SSNs, email addresses
+   * and phone numbers redacted, so `POST /api/v1/wasm-rules/:id/replay` can
+   * replay a rule that reads `tool_calls[].arguments`. The proxy reads it from
+   * `/api/v1/auth/key-context`.
+   */
+  storeToolArguments?: boolean
+
+  /**
+   * How the LLM proxy retries a provider call that failed before any response
+   * reached the client, and the ordered fallback targets it tries when those
+   * retries run out (`UpstreamRetrySettingsSchema`). Each field overrides the
+   * proxy's own config.yaml value; absent fields keep it. The proxy reads it
+   * from `/api/v1/auth/key-context`. `null` in a settings write clears it, and
+   * is never stored.
+   */
+  upstreamRetry?: UpstreamRetrySettings | null
+
+  /**
+   * Bring-your-own-cloud trace storage. Optional — absent means Intutic-managed
+   * storage. Previously accessed only through `as unknown as` casts; typed here
+   * so the settings UI and the control plane share one shape.
+   */
+  byocStorage?: ByocStorageConfig
+
+  /**
+   * What the MCP governance proxy does when the Intutic control plane is
+   * unreachable during a tool call interception attempt.
+   *
+   * - `'open'`   (default): pass the tool call through + emit a warning event
+   * - `'closed'`: block the tool call with a user-visible MCP error message:
+   *     "Governance check failed — Intutic control plane unreachable.
+   *      Tool call blocked by workspace policy."
+   *
+   * Applies to 8/19 harnesses (those with MCP proxy injection — 9 config
+   * paths across 8 harnesses, see sync-daemon mcpAutoWrite.ts).
+   * The other harnesses have no MCP proxy to fail, so this does not reach them.
+   */
+  mcpProxyFailBehavior: McpProxyFailBehavior
+
+  /**
+   * MCP proxy deployment model.
+   *
+   * - `'per-session'` (default): a new proxy process is spawned per
+   *   MCP connection. Policy is fetched from control plane at startup with a
+   *   60s in-process TTL.
+   * - `'daemon'` (active): a long-lived proxy daemon shares its policy cache
+   *   across all MCP sessions. Requires macOS notarization.
+   *
+   * The sync-daemon writes this value through verbatim to
+   * ~/.intutic/env/runtime.env (lib/runtimeEnv.ts) and the MCP proxy honours
+   * it: with `'daemon'` set, policy lookups go through the daemon's Unix
+   * socket. Caveat: daemon health telemetry is not reported — the
+   * health-snapshot route was removed and the dashboard flag is hardcoded off.
+   */
+  mcpProxyMode: McpProxyMode
+
+  /**
+   * How aggressively the sync-daemon defends harness config files against
+   * manual edits (bypass attempts).
+   *
+   * - `'rewrite'`    (default): chokidar drift watcher detects edits within ~1s
+   *   and immediately rewrites the config. Also fires a `config_tamper`
+   *   governance incident.
+   * - `'immutable'`  (opt-in, macOS only): after writing, sets `chflags uchg`
+   *   on the config file. Direct edits fail immediately. The flag is cleared
+   *   before the next sync write.
+   * - `'alert-only'`: drift triggers a governance incident but does NOT rewrite
+   *   the config. For teams that want audit logs without enforced reversion.
+   */
+  bypassEnforcementTier: BypassEnforcementTier
+  /** Feature flags for platform capabilities (Phase 5+) */
+  featureFlags?: {
+    ff_bandit_routing?: boolean
+    /**
+     * Run the router and record the model it would have picked, while every
+     * request is still served with the model it asked for. Read by the proxy
+     * from `workspace:feature_flags:{ws}`; the cost posture presets set it.
+     */
+    ff_shadow_routing?: boolean
+    ff_response_cache_exact?: boolean
+    ff_response_cache_semantic?: boolean
+    /** Phase 5 — MetaClaw prompt evolution engine (Enterprise only) */
+    ff_metaclaw_evolution?: boolean
+    /**
+     * Evaluate every detector, record what it would have done, and allow the
+     * request anyway. Read by the proxy from `workspace:feature_flags:{ws}`.
+     *
+     * Declaring it here is not enough on its own — the PUT schema in
+     * `routes/workspace.ts` must list it too, because that `z.object` strips
+     * unknown keys. This flag and `ff_metaclaw_evolution` above were both once
+     * declared here and omitted there, so neither could be stored until both
+     * were added to it.
+     */
+    ff_shadow_enforcement?: boolean
+    /**
+     * Let a high-confidence SkillOpt config-edit suggestion auto-apply
+     * instead of waiting for human review. Mirrored into Valkey
+     * (`ff:{workspaceId}:skillopt_auto_apply`) by `persistAndSyncSettings`,
+     * since `skillOptService.autoApplyIfEnabled` needs a hot-path read.
+     */
+    ff_skillopt_auto_apply?: boolean
+    /**
+     * Promote `destructive.sql_drop` from `warn` to `block` on the sync
+     * daemon's hook-gate path (Wave 7, audit-remediation). Read by
+     * `GET /api/v1/policy/resolve` (`routes/evaluate.ts`), which surfaces it
+     * as `sqlDropStrictBlock` on the response; the sync daemon's
+     * `buildSnapshotRules` (`services/sync-daemon/src/lib/policySnapshot.ts`)
+     * applies it as a per-rule override on the next sync cycle — independent
+     * of `DESTRUCTIVE_TIER_SEVERITY`, the evidence-gated promotion ramp that
+     * governs the eight block-severity `DESTRUCTIVE_COMMAND_PATTERNS` entries.
+     * `destructive.sql_drop` was never part of that ramp (its own static
+     * definition is `severity: 'warn'`, not `'block'`, so the ramp's ternary
+     * never reaches it) — its rationale is a genuinely different one
+     * (the gate cannot distinguish a dev DSN from a production one; the MCP
+     * path already blocks, because the proxy CAN make that distinction).
+     * This flag exists for a workspace that wants the hook path to match the
+     * MCP path anyway, accepting the dev-DSN false-positive risk explicitly.
+     * `false` by default; `true` in the `strict` security posture preset
+     * (`posturePresets.ts`) — never auto-promoted by traffic evidence the
+     * way the block-pattern ramp is.
+     */
+    ff_sql_drop_strict_block?: boolean
+  }
+
+
+  /**
+   * Whether to automatically delete local skills/rules segments that fail
+   * security audits (leakage of secrets or unsafe wildcard command patterns).
+   * Defaults to `false`.
+   */
+  enableLocalSkillAuditDelete?: boolean
+
+  /**
+   * Phase S3. Whether `intutic skill audit` should AUTOMATICALLY run the
+   * opt-in Cisco `skill-scanner` integration (`tools/cli/src/lib/ciscoScanner.ts`)
+   * alongside native scanning, when the `skill-scanner` binary happens to be
+   * on PATH. Off by default — a workspace that never configured this must
+   * not start shelling out to an external tool it never asked for.
+   *
+   * This is distinct from `--engine cisco` (an explicit, per-invocation
+   * request that fails loudly if the binary is absent): this setting gates
+   * a graceful, best-effort AUTO-run — when true but the binary is absent,
+   * the CLI logs an info-level skip and continues with native scanning
+   * only, exactly the "opt-in but gracefully degrading" contract this
+   * integration promises throughout.
+   *
+   * No Valkey projection, following the exact precedent
+   * `enableLocalSkillAuditDelete` sets immediately above: the CLI reads
+   * this straight off the synced `settings` object via `fetchConfig`, and
+   * nothing else needs a hot-path read of it.
+   */
+  ciscoSkillScannerEnabled?: boolean
+
+  /**
+   * Configurable trigger keywords for classifying bandit task types.
+   */
+  banditKeywords?: {
+    testing?: string[]
+    deployment?: string[]
+    review?: string[]
+    debugging?: string[]
+  }
+
+  /**
+   * Container-image provenance policy, enforced at the gate before a deploy
+   * runs. Off unless explicitly enabled — a workspace that never configured
+   * this must not start refusing deploys because a default changed.
+   *
+   * The control plane has no filesystem, so it can only verify images written
+   * into the tool call itself. `unverifiableAction` decides what happens to a
+   * `kubectl apply -f manifest.yaml`, and defaults to `allow`: refusing every
+   * file-based apply would refuse the correct ones too, and a control that
+   * broad gets switched off. See imageProvenanceService.ts.
+   */
+  imageProvenance?: {
+    enabled?: boolean
+    /** Refuse any image not pinned to an `@sha256:` digest. */
+    requireDigest?: boolean
+    /** Registry prefixes that may be pulled from. Empty means any. */
+    allowedRegistries?: string[]
+    /** `repository -> approved digests`. Empty means any digest satisfies pinning. */
+    approvedDigests?: Record<string, string[]>
+    unverifiableAction?: 'allow' | 'warn' | 'block'
+  }
+
+  /**
+   * Whether an APPROVED `review_before` decision may let the *matching retried
+   * call* through the local gate, instead of only recording the decision.
+   *
+   * Off (undefined/false) by default. Approving a decision — `intutic decision
+   * approve`, `POST /api/v1/decisions/:id/review` or the Slack card, one code
+   * path — always records it; this flag governs a separate, additive effect:
+   * when true, approving a decision tied to a
+   * `review_before` hold writes a short-lived, exact-match bypass entry
+   * (workspace + SOP rule + normalised tool name + hashed target/command) to
+   * Valkey, synced to `.intutic/hooks/approved-bypasses.jsonl` and consulted by
+   * the gate immediately before it would otherwise block on that rule. It never
+   * relaxes the rule itself, never matches fuzzily, and never outlives
+   * {@link reviewHoldBypassTtlMinutes}.
+   */
+  reviewHoldBypassEnabled?: boolean
+
+  /**
+   * Minutes an approved `review_before` bypass stays valid, when
+   * {@link reviewHoldBypassEnabled} is true. Defaults to 10 when the feature is
+   * on but this is unset; capped at 60 by the settings PUT schema — a bypass is
+   * meant to let one already-reviewed retry through, not to stand up a lasting
+   * exemption.
+   */
+  reviewHoldBypassTtlMinutes?: number
+
+  /**
+   * Held loop runs (`review_before:` on a whole run, reviewed with `intutic
+   * loop review`). With `requireDistinctApprover` true, the member who started
+   * a run cannot approve or reject it; another OWNER, ADMIN or EM must. Off by
+   * default: the person who ran the agent is usually best placed to judge its
+   * change manifest, and a small team must not be locked out of its own
+   * deploys. Break-glass requests always need a second person, whatever this
+   * says. Stored under the snake_case key the reader
+   * (`requiresDistinctApprover` in loopGovernanceService.ts) uses.
+   */
+  loop_review?: {
+    requireDistinctApprover?: boolean
+    /**
+     * Completing a loop run as `SUCCEEDED` needs a passing verification of
+     * its latest state: with no verification, a failed or
+     * unverifiable one, or traces newer than it, `POST /loops/:id/complete`
+     * answers 409 (`E_LOOP_NOT_VERIFIED`, `E_LOOP_UNVERIFIABLE`,
+     * `E_LOOP_VERIFY_STALE`), and 503 `GOVERNANCE_UNAVAILABLE` when the
+     * lookup fails. `FAILED` is never gated. Off by default: `intutic loop
+     * exec` from before this setting completes without verifying, and those
+     * runs would otherwise stay ACTIVE.
+     */
+    requireVerifiedCompletion?: boolean
+  }
+
+  /**
+   * Reversibility lanes closed for every agent role: each
+   * listed class's action tokens are held for a person's approval, through
+   * the hold, decision and bypass path. `irreversible` is `publish`,
+   * `destroy`, `force_push` and `payment`; `reversible_wide` is `deploy`,
+   * `release`, `db_write`, `http_post`, `migrate` and `prod_write`. A SOP's
+   * `open_actions:` cannot reopen a token this closes. Unset closes nothing.
+   */
+  closedLanes?: Array<'irreversible' | 'reversible_wide'>
+
+  /**
+   * The learning edge: hold a `reversible_wide` action whose
+   * revert or rejection rate, over `windowDays`, is at least `threshold`, once
+   * it has `minExecutions` executions and `minReversals` reversals. `off`
+   * (the default) computes and shows the rates and holds nothing; `shadow`
+   * records what would be held; `enforce` holds.
+   */
+  revertLane?: {
+    mode: 'off' | 'shadow' | 'enforce'
+    /** Default 0.25. */
+    threshold?: number
+    /** Default 20. */
+    minExecutions?: number
+    /** Default 3. */
+    minReversals?: number
+    /** Default 30. */
+    windowDays?: number
+  }
+
+  /**
+   * Central egress-enforcement posture, distributed to this workspace's proxies
+   * One of `'off'` | `'monitor'` | `'enforce'`. When set, the
+   * sync-daemon writes it to `.intutic/hooks/egress-policy.json` and the proxy
+   * hot-reloads it, so an admin sets the mode once here rather than in each
+   * developer's local config. Undefined leaves the proxy on its local config /
+   * `INTUTIC_EGRESS_MODE` — central management is additive, never a silent
+   * override of a deployment that never opted in.
+   */
+  egressMode?: 'off' | 'monitor' | 'enforce'
+
+  /**
+   * Central egress allow policy: exact hosts, `.suffix` domains, or CIDRs the
+   * proxy permits in `enforce`/`monitor` mode, distributed alongside
+   * {@link egressMode}. UNIONed with the proxy's local allow entries so a
+   * developer's local infra allowances are never dropped by a central list.
+   */
+  egressAllow?: string[]
+
+  /**
+   * Approved-models allowlist: model ids the proxy will accept for this
+   * workspace's completions. Distributed to the proxy's control-plane cache
+   * under `workspace:allowed_models:{workspaceId}` (mirrors the `egressAllow`
+   * distribution pattern above).
+   *
+   * Absent or empty means UNRESTRICTED — matches `egressAllow`'s own
+   * backward-compatible default, so a workspace that never configured this
+   * must not start refusing completions because a default changed.
+   */
+  allowedModels?: string[]
+
+  /**
+   * The models smart routing may choose between for this workspace.
+   * Distributed to the proxy under `workspace:routing_candidates:{workspaceId}`
+   * (same pattern as `allowedModels` above). Absent or empty means the proxy's
+   * own configured pool. Either way the proxy narrows the pool further to the
+   * models this workspace can actually reach: a provider it holds a
+   * credential for, the `allowedModels` allowlist, and the models a verified
+   * credential's provider listed.
+   */
+  routingCandidates?: string[]
+
+  /**
+   * Additive MCP server allowlist: server names the MCP governance proxy
+   * (`packages/mcp-proxy`) will proxy for this workspace, matched against
+   * the `--server-name` identity threaded through by
+   * `services/sync-daemon/src/harness/mcpAutoWrite.ts`'s `wrapWithProxy`.
+   * Delivered to the proxy the same way `mcpAllowedTools` already is — via
+   * `PolicyClient.absorbCuration` (`packages/mcp-proxy/src/policy.ts`),
+   * fed from `GET /api/v1/sop/rules` (the control plane
+   * sops.ts`).
+   *
+   * Absent or empty means UNRESTRICTED — the exact same convention as
+   * `allowedModels` above: a workspace that never configured this must not
+   * start refusing every MCP server because a default changed.
+   */
+  mcpAllowedServers?: string[]
+
+  /**
+   * What the MCP governance proxy does with a server the workspace has not
+   * approved in its MCP server registry. `allow` (the default, and what an
+   * absent value means) lets every server through that is not explicitly
+   * blocked; `deny` refuses every server until an OWNER or ADMIN approves it,
+   * and a server the proxy has not seen before lands in the registry as a
+   * candidate awaiting that decision. A blocked server is refused under both.
+   * Delivered to the proxy with the registry decisions (`mcpRegistry` on
+   * `GET /api/v1/sop/rules` and `GET /api/v1/policy/resolve`).
+   */
+  mcpDefaultPolicy?: 'allow' | 'deny'
+
+  /**
+   * What the MCP governance proxy does when a prompt-injection pattern
+   * matches: `warn` reports it and lets the call (or result) through, `block`
+   * refuses the call or withholds the result. Delivered with the MCP policy
+   * and wins over the proxy's local `INTUTIC_MCP_INJECTION_ACTION`; absent
+   * leaves the local setting (default `warn`) in force.
+   */
+  mcpInjectionAction?: 'warn' | 'block'
+
+  /**
+   * The MCP proxy's anomaly detectors: `enforce` lets each act up to its own
+   * ceiling, `warn` reports without blocking, `off` skips them. Delivered with
+   * the MCP policy and wins over `INTUTIC_MCP_ANOMALY_MODE`; absent leaves the
+   * local setting (default `enforce`) in force.
+   */
+  mcpAnomalyMode?: 'enforce' | 'warn' | 'off'
+
+  /**
+   * Per-detector overrides for the MCP proxy's anomaly detectors, by
+   * detector id. A value can only demote a detector below its own ceiling,
+   * never promote it. Merged per detector over `INTUTIC_MCP_ANOMALY_OVERRIDES`,
+   * this setting winning.
+   */
+  mcpAnomalyOverrides?: Partial<Record<McpAnomalyDetectorId, 'steer' | 'reask' | 'kill' | 'off'>>
+
+  /**
+   * Workspace-supplied prompt-injection regex sources for the MCP governance
+   * proxy, on top of its hardcoded floor. Delivered with the rest of
+   * the MCP curation; the proxy compiles them and drops one that does not.
+   * Absent or empty means the floor alone.
+   */
+  mcpInjectionPatterns?: string[]
+
+  /**
+   * Limits on MCP tool calls per hour or per day — per server, per tool, per
+   * member, or per member on one server (`mcpBudgets.ts`). Delivered with the
+   * MCP policy; the MCP proxy counts calls in Valkey and refuses one that
+   * would go over a limit, naming the budget and when it resets. Absent means
+   * no limits.
+   */
+  mcpBudgets?: McpBudgetSettings
+
+  /**
+   * The plan's daily spend cap (`workspaces.daily_spend_cap_usd`, set from the
+   * plan) as a hard block: with `enforcement_mode: 'hard'` AND
+   * `workspace_hard_cap_enabled: true`, the control plane checks the day's
+   * spend every five minutes and, once it is over the cap, the proxy refuses
+   * every request with `OVERAGE_HARD_CAP_EXCEEDED` until midnight UTC
+   * (`billingService.enforceOverageCap`). Either one absent or off: no block.
+   * Separate from the workspace budget caps (`PUT /api/v1/budget`).
+   */
+  enforcement_mode?: 'soft' | 'hard'
+  workspace_hard_cap_enabled?: boolean
+
+  /**
+   * What happens when a server's tool set changes and the change scores high
+   * risk (`mcpToolRisk.ts`). `notify` (the default, and what an absent value
+   * means) records the change and sends `mcp.server.tool_change_risk`;
+   * `hold` also returns the server to the approval queue, where the MCP proxy
+   * refuses it under either default policy until an owner or admin approves
+   * it again.
+   */
+  mcpHighRiskToolChange?: 'notify' | 'hold'
+
+  /**
+   * Negotiated per-token rates, by model id, in USD per 1k tokens.
+   * The `model_pricing` table is LIST price; a workspace paying below list
+   * had every savings figure skewed by the difference. Where a model is
+   * listed here it is priced at these rates in the routing shadow-savings
+   * report; anything else falls back to list. Absent or empty means list
+   * for everything.
+   */
+  contractedRates?: Record<string, { inputCostPer1k: number; outputCostPer1k: number }>
+
+  /**
+   * Whether agents in this workspace must run inside a sandbox.
+   * - `'off'` (default): `intutic exec` runs on the host as before.
+   * - `'warn'`: an un-sandboxed `intutic exec` runs but prints a warning.
+   * - `'require'`: `intutic exec` refuses to run un-sandboxed and tells the
+   *   developer to add `--sandbox`.
+   *
+   * Enforced client-side by the CLI (the natural point — only it knows whether
+   * `--sandbox` was passed), the same layer as the harness-config controls. A
+   * server-side attestation (the proxy refusing traffic that cannot prove it
+   * originated in a sandbox) is a stronger follow-on, noted in the LLD.
+   * `undefined` leaves it off; open core, which has no control plane to read
+   * this from, is therefore never affected.
+   */
+  sandboxRequirement?: 'off' | 'warn' | 'require'
+
+  /**
+   * Promotes REPEATED anomaly findings within one session into enforcement
+   * (HIJACK steers with a corrective card, KILL blocks outright) — on top
+   * of ordinary per-trace detection, which always runs regardless of this
+   * setting. See `anomalyEnforcementService.ts` for the full mechanism:
+   * off by default and a single false positive can never trigger it, only
+   * a sustained pattern within one session can.
+   *
+   * Stored under the snake_case key `anomaly_enforcement`, not
+   * `anomalyEnforcement` — deliberately inconsistent with every other
+   * field here, because that key is already the load-bearing contract
+   * `anomalyEnforcementService.ts` (and its tests) read and write
+   * directly; renaming it to match this file's camelCase convention would
+   * be a breaking migration for every already-stored workspace setting,
+   * for no behavioral benefit.
+   *
+   * This is the wire/stored shape, not the resolved one — the read side
+   * additionally floors `minRepeats` at 2 (a workspace cannot configure
+   * its way to blocking on a single finding) and falls back `action` to
+   * `HIJACK` for anything other than exactly `'KILL'`. The PUT schema
+   * mirrors that floor as a 400 at write time, so an operator who tries a
+   * lower value is told now rather than discovering later that it was
+   * silently clamped.
+   */
+  anomaly_enforcement?: {
+    enabled?: boolean
+    minRepeats?: number
+    minConfidence?: number
+    action?: 'HIJACK' | 'KILL'
+    /** Categories eligible for promotion. Empty/absent means all of them. */
+    categories?: string[]
+  }
+
+  /**
+   * Server-side trajectory monitoring mode (parallel monitoring).
+   * Read by the control plane's
+   * `getWorkspaceMonitorMode` on every `/trajectory/analyze` call:
+   *
+   * - `'ACTIVE'`:  a CRITICAL/INTERVENE verdict can escalate into the
+   *   anomaly-enforcement occurrence counter (KILL/HIJACK promotion) in
+   *   addition to alerting.
+   * - `'PASSIVE'` (default): trajectories are analyzed and alerts are
+   *   recorded/dispatched, but nothing ever escalates to enforcement.
+   * - `'OFF'`:     trajectory analysis is skipped entirely for the workspace
+   *   (capability-miss production still runs — it is a separate feature).
+   *
+   * Stored under the snake_case key `trajectory_monitor_mode`, not
+   * `trajectoryMonitorMode` — deliberately inconsistent with this file's
+   * camelCase convention, following the exact precedent
+   * {@link WorkspaceSettings.anomaly_enforcement} documents below: that
+   * snake_case key is already the load-bearing contract the reading service
+   * consumes from raw jsonb, and renaming it would be a breaking migration
+   * for every already-stored workspace setting for no behavioral benefit.
+   *
+   * CONSTRAINT: the entry in {@link DEFAULT_WORKSPACE_SETTINGS} MUST stay
+   * `'PASSIVE'`, byte-for-byte matching `getWorkspaceMonitorMode`'s own
+   * absent-key fallback. The enforcement path reads the raw jsonb and applies
+   * its own fallback; the default here only affects GET/display resolution —
+   * if the two ever diverge, the UI would show a different mode than the one
+   * enforcement actually runs under.
+   */
+  trajectory_monitor_mode?: 'ACTIVE' | 'PASSIVE' | 'OFF'
+
+  /**
+   * What an agent is told when a call is refused on workspace policy, for the
+   * whole workspace: `TRANSPARENT` names the rule and its reason, `OPAQUE`
+   * refuses the same calls with one generic sentence while audit records keep
+   * the rule, and `SILENT_LOG` lets the local hook gates run a call a workspace
+   * rule would block and report it as `tool_would_block`.
+   *
+   * Every surface resolves it through
+   * The control plane: the stored value
+   * when it is one of the modes, `TRANSPARENT` otherwise. It is the only
+   * source of the mode.
+   */
+  interventionMode?: InterventionMode
+
+  /**
+   * Additive MCP tool allowlist, enforced by the MCP governance proxy
+   * (`packages/mcp-proxy`) and served to it by
+   * The control plane (both the `/sop/rules`
+   * and `/policy/resolve` projections). Empty/absent means UNRESTRICTED —
+   * the same convention as {@link mcpAllowedServers} below, whose doc
+   * comment has referenced this field as its sibling since it was written.
+   * Was settable via the PUT schema but never declared here — the inverse
+   * of the usual both-places defect (schema-only instead of type-only),
+   * caught by the settingsKeyParity gate.
+   */
+  mcpAllowedTools?: string[]
+
+  /**
+   * Per-tool `tools/list` description overrides, curated by an operator and
+   * substituted by the MCP governance proxy before descriptions reach the
+   * model. Delivered alongside {@link mcpAllowedTools} via
+   * `lib/mcpCuration.ts`. Absent means no overrides. Declared here for the
+   * same reason as `mcpAllowedTools` immediately above.
+   */
+  mcpToolDescriptionOverrides?: Record<string, string>
+
+  /**
+   * Governed decisions log: whether the sync-daemon writes a bounded,
+   * auto-maintained record of GOVERNANCE decisions (adjudications,
+   * approved/rejected decisions, SOP-related settings changes) as context
+   * files the coding agent's harness reads — `.intutic/DECISIONS.md` (the
+   * full bounded record) plus a marker-delimited section injected into the
+   * `claude-code` harness's own regenerated config file. See
+   * The control plane's
+   * `GET /api/v1/workspace/decisions-digest` and
+   * `services/sync-daemon/src/lib/decisionsDigest.ts`.
+   *
+   * Deliberately narrow: this is governance-decision records only, never
+   * conversational memory or general context management (this repo pivoted
+   * away from that harness product — see this repo's own CLAUDE.md history).
+   *
+   * Off (undefined/false) by default — per the standing rule elsewhere in
+   * this file (see {@link imageProvenance}, {@link reviewHoldBypassEnabled}):
+   * a workspace that never configured this must not start seeing new files
+   * written into its tree, and a growing context file is token spend the
+   * product must not silently impose on every workspace.
+   */
+  decisionsLogEnabled?: boolean
+
+  /**
+   * Opt-in LLM-based semantic analysis of skill files (Phase S5),
+   * on top of the always-on deterministic `scanSkillContent` pattern scan.
+   * When true:
+   * - The CLI (`intutic skill audit`) attaches the FULL content of a
+   *   `SKILL.md` file (capped at 64 KiB) to its `/skills/report` entries —
+   *   never bundled scripts, which stay S2/S3/S4's domain.
+   * - The control plane judges that content once per distinct sha256 (a
+   *   30-day Valkey marker skips re-judging unchanged content), subject to
+   *   a per-workspace daily judge-call cap
+   *   (`SEMANTIC_SKILL_JUDGE_DAILY_CAP`), and strips `content` from what it
+   *   persists — only the verdict (`'clean' | 'suspicious' | 'malicious' |
+   *   'unjudged'`) is stored, never the judged text.
+   *
+   * Off (undefined/false) by default, per the standing rule elsewhere in
+   * this file: full skill content transiting the control plane is a real
+   * privacy/cost tradeoff a workspace must opt into, not one a default
+   * change should impose. See `apps/docs/guide/skill-scanning.md`'s
+   * "Semantic analysis (optional)" section for the full transit/retention
+   * statement.
+   */
+  semanticSkillAnalysisEnabled?: boolean
+
+  /**
+   * Opt-in VirusTotal hash lookup for skill-bundled SCRIPTS (Phase S4).
+   * When true, and only when a `connector_credentials` row for
+   * provider `'virustotal'` is also stored, `POST .../skills/report`
+   * fire-and-forget enqueues any reported script sha256 hashes for a
+   * `GET /api/v3/files/{sha256}` lookup — never an upload, never SKILL.md
+   * prose, see `virusTotalService.ts`'s own doc comment for the full
+   * hash-only doctrine. Off by default, per the standing rule elsewhere in
+   * this file: a workspace that never configured this must not start
+   * sending script hashes to a third party because a default changed.
+   *
+   * Distinct from, and narrower than, this product's standing decline of a
+   * global MCP-server-reputation/VirusTotal integration — see
+   * `apps/docs/guide/mcp-governance.md` for
+   * that separate decision, which this setting does not reverse.
+   */
+  virusTotalSkillLookupEnabled?: boolean
+
+  /**
+   * Upload the content of harness config files, not only their hashes.
+   *
+   * `intutic connect` captures each recorded harness's rules file (the list is
+   * `HARNESS_FILES` in `@intutic/sync-daemon`). Off, it uploads the file's
+   * path, the SHA-256 of its redacted text, its size, the harness and the
+   * time: the config history records what changed and when, and its hash
+   * chain stays verifiable. On, it also uploads the text, with credential-
+   * shaped strings replaced by `[redacted]` before it leaves the machine,
+   * which is what config diffs and SkillOpt's config-edit suggestions need.
+   *
+   * Off by default: file content leaving developer machines is a privacy
+   * choice a workspace makes, not one a default makes for it. The control
+   * plane refuses a body sent while this is off.
+   */
+  configBodyUpload?: boolean
+
+  /**
+   * Fraction of ingested traces that receive the two heavier, LLM-adjacent
+   * security probes — `traceIngestClassifier.classifyTraceAtIngest`'s
+   * baseline/history-derived anomaly checks and `llmProbeService`'s
+   * output probe (Wave 7, audit-remediation). `1.0` (every trace) is the
+   * default and matches today's unconditional behavior exactly — setting
+   * this field at all is the opt-in, not any particular value.
+   *
+   * Exists to turn an informal "spot-check 1-in-N traces" practice into a
+   * config answer instead of a second, undocumented detection lane a
+   * workspace has no visibility into or control over. `0` disables both
+   * probes entirely (still runs the always-on deterministic checks
+   * elsewhere in the ingest path — this field only gates these two).
+   * Clamped to `[0, 1]` at the read site; an out-of-range stored value
+   * (there is no PUT-time validation preventing one) is treated as `1.0`,
+   * never as `0` — a malformed setting must not silently blind detection.
+   */
+  securityProbeSampleRate?: number
+
+  /**
+   * Whether corrective governance cards accumulate adoption labels in
+   * `governance_card_labels` — the corrective-card dataset.
+   *
+   * OPT-IN: false unless an OWNER or ADMIN turns it on (migration 242 turned it
+   * off for every workspace that existed before). The data is used only to
+   * improve Intutic's own self-hosted judge models, and never for training
+   * without a policy update and fresh consent.
+   *
+   * When true, every corrective card queued for this workspace writes a row
+   * (card snapshot + queued_at), the proxy's delivery marker sets
+   * delivered_at, and the label sweep infers ADOPTED/NOT_ADOPTED from the
+   * session's subsequent traces unless a human has already ruled. Human labels
+   * (`label_source='human'`) always win over auto labels and are weighted
+   * higher when the dataset is used.
+   *
+   * When false, nothing writes to the dataset: no row is created, the label
+   * sweep neither records delivery nor labels, and the human labeling route
+   * refuses. Rows collected while it was on are kept. Card generation,
+   * queueing and delivery are UNCHANGED either way: the setting governs the
+   * dataset, not governance itself.
+   */
+  governanceCardLabelingEnabled: boolean
+
+  /**
+   * Upload this workspace's decide log: whether the sync
+   * daemon sends the decisions its machine's gates logged
+   * (`~/.intutic/logs/decide-*.jsonl`) to `POST /api/v1/decide/events`.
+   * What goes is counts, probabilities and hashes: per rule, the rule ref and
+   * hash, the model id and digest, each answer's probability and value, the
+   * outcome and the mode. Never the question text, never the state sent.
+   *
+   * Off by default: decision records leaving developer machines is a choice
+   * a workspace makes. With it off nothing new leaves a machine, and the
+   * control plane refuses an upload.
+   */
+  decideLogUploadEnabled?: boolean
+
+  /**
+   * Also upload each decision's arguments excerpt: the call's arguments as
+   * the gate logged them, after redaction and cut to 2 KB. Only read when
+   * {@link decideLogUploadEnabled} is on. Off by default; the daemon drops
+   * the excerpt before sending while it is off, and the control plane drops
+   * one it receives anyway. Excerpts are cleared after 30 days.
+   */
+  decideLogUploadArgs?: boolean
+
+  /**
+   * Let the daily decide calibration job promote a candidate calibration
+   * itself once it meets every mark of the decide exit rule: a
+   * passing pre-registered eval run, the adversarial report and 200 shadow
+   * evaluations. Promotion pins the model digest and lets a
+   * `rollout: enforce` rule enforce.
+   *
+   * Off by default: a named OWNER, ADMIN or EM promotes through
+   * `POST /api/v1/decide/calibrations/:calibrationId/promote`. Turning it on
+   * removes only that person (mark 6), never a measured mark.
+   */
+  decideAutoPromote?: boolean
+}
+
+/**
+ * Default workspace settings.
+ * Applied when a workspace has no explicit settings (new workspaces)
+ * or when a setting key is missing from the stored JSONB.
+ */
+export const DEFAULT_WORKSPACE_SETTINGS: WorkspaceSettings = {
+  mcpProxyFailBehavior: 'open',
+  allowLocalMemoryVaults: true,
+  // ON by default. Without it, removing a developer at the identity provider stops
+  // their dashboard login but not their agents, and nothing reconciles membership.
+  // 30 days is long enough that an ordinary working month keeps a key alive, and
+  // short enough that an offboarded developer's agents stop within a sprint. Set to
+  // null to disable. Automation keys are exempt (api_keys.is_service_account), and
+  // the gate only applies to workspaces that actually have an SSO provider.
+  ssoKeyMaxIdleDays: 30,
+  ssoKeyGateEnabledAt: null,
+  mcpProxyMode:         'per-session',
+  bypassEnforcementTier: 'rewrite',
+  featureFlags: {
+    ff_bandit_routing: false,
+    ff_response_cache_exact: false,
+    ff_response_cache_semantic: false,
+    ff_metaclaw_evolution: false,
+    // Off by default, and the proxy resolves an absent flag to false as well —
+    // an unreachable flag service must never silently disable enforcement.
+    ff_shadow_enforcement: false,
+    ff_skillopt_auto_apply: false,
+    // Off by default — see the field doc. The `strict` security posture
+    // preset turns it on; nothing else does.
+    ff_sql_drop_strict_block: false,
+  },
+  enableLocalSkillAuditDelete: false,
+  // Off by default — see the field doc above. A workspace must explicitly
+  // opt in before the CLI shells out to any externally-installed tool.
+  ciscoSkillScannerEnabled: false,
+  // Off by default — full skill content transiting the control plane for
+  // semantic judging is opt-in. See the field doc for the full statement.
+  semanticSkillAnalysisEnabled: false,
+  banditKeywords: {
+    testing: ['test', 'spec', 'assert', 'vitest', 'jest', 'unittest'],
+    deployment: ['deploy', 'release', 'kubernetes', 'docker', 'gke', 'pipeline', 'ci/cd'],
+    review: ['review', 'audit', 'lint', 'eslint', 'pr'],
+    debugging: ['fix', 'bug', 'issue', 'error', 'crash', 'debug'],
+  },
+  // Off, and `enabled` must be literally true to turn it on. A workspace that
+  // never configured image provenance must not begin refusing deploys.
+  imageProvenance: {
+    enabled: false,
+    requireDigest: true,
+    allowedRegistries: [],
+    approvedDigests: {},
+    unverifiableAction: 'allow',
+  },
+  // Off by default — approving a review_before decision is observation-only
+  // until a workspace opts in. See the field doc for what turning it on does.
+  reviewHoldBypassEnabled: false,
+  // Only load-bearing once reviewHoldBypassEnabled is true; the value here is
+  // what "enabled but unset" resolves to.
+  reviewHoldBypassTtlMinutes: 10,
+  // Off by default, as the reader's fallback is: see the field doc.
+  loop_review: { requireDistinctApprover: false, requireVerifiedCompletion: false },
+  // Off: the rates are computed and shown, nothing is held. See the field doc.
+  revertLane: { mode: 'off' },
+  // Off by default — see the field doc for why a growing auto-written
+  // context file must be opt-in.
+  decisionsLogEnabled: false,
+  // MUST match getWorkspaceMonitorMode's absent-key fallback in
+  // trajectoryAnalysisService.ts exactly ('PASSIVE'): the enforcement path
+  // reads the raw jsonb with its own fallback, so this default is display
+  // resolution only — a different value here would make the UI show a mode
+  // enforcement does not actually run under. See the field doc.
+  trajectory_monitor_mode: 'PASSIVE',
+  // What the resolver gives a workspace that has not set it. See the field doc.
+  interventionMode: 'TRANSPARENT',
+  // Off by default — mirrors anomalyEnforcementService.ts's own DISABLED
+  // default exactly, so a workspace that never configures this sees the
+  // identical values whether resolved here or read directly from the DB.
+  anomaly_enforcement: {
+    enabled: false,
+    minRepeats: 3,
+    minConfidence: 0.8,
+    action: 'HIJACK',
+    categories: [],
+  },
+  // Off by default — see the field doc for the hash-only doctrine and why
+  // this must never turn on for a workspace that never configured it.
+  virusTotalSkillLookupEnabled: false,
+  // Off by default — see the field doc: hashes and metadata only.
+  configBodyUpload: false,
+  // Off by default — opt-in, see the field doc. Never gates card delivery itself.
+  governanceCardLabelingEnabled: false,
+  // Off by default — decision records stay on the machine unless the
+  // workspace opts in. See the field docs.
+  decideLogUploadEnabled: false,
+  decideLogUploadArgs: false,
+  // Off by default — a named member promotes a decide calibration.
+  decideAutoPromote: false,
+  // 1.0 = every trace, matching the unconditional behavior this knob
+  // replaces exactly. See the field doc for what a lower value gates.
+  securityProbeSampleRate: 1.0,
+}
+
+/**
+ * Merge partial stored settings with defaults.
+ * Ensures callers always receive a complete WorkspaceSettings object.
+ */
+export function resolveWorkspaceSettings(
+  stored: Partial<WorkspaceSettings> | null | undefined
+): WorkspaceSettings {
+  return {
+    ...DEFAULT_WORKSPACE_SETTINGS,
+    ...(stored ?? {}),
+  }
+}
+
+// ─── Loop, lane and revert-lane settings readers ─────────────────────────────────────────
+
+/** `revertLane` with every field filled in. */
+export interface RevertLaneSettings {
+  mode: 'off' | 'shadow' | 'enforce'
+  threshold: number
+  minExecutions: number
+  minReversals: number
+  windowDays: number
+}
+
+/** What an unset `revertLane`, and each unset or invalid field, resolves to. */
+export const REVERT_LANE_DEFAULTS: RevertLaneSettings = { mode: 'off', threshold: 0.25, minExecutions: 20, minReversals: 3, windowDays: 30 }
+
+function settingsRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/** `loop_review.requireVerifiedCompletion` off stored (or resolved) settings: false unless it is literally true. */
+export function readRequireVerifiedCompletion(settings: unknown): boolean {
+  const lr = settingsRecord(settings) ? settings.loop_review : undefined
+  return settingsRecord(lr) && lr.requireVerifiedCompletion === true
+}
+
+/** `closedLanes`, its closable classes only, in `irreversible`, `reversible_wide` order; undefined when unset. */
+export function readClosedLanes(settings: unknown): Array<'irreversible' | 'reversible_wide'> | undefined {
+  const raw = settingsRecord(settings) ? settings.closedLanes : undefined
+  if (!Array.isArray(raw)) return undefined
+  return (['irreversible', 'reversible_wide'] as const).filter((c) => raw.includes(c))
+}
+
+/**
+ * `revertLane` with its defaults filled in. An unknown mode is `off`; a field
+ * out of range takes its default (threshold in (0, 1], counts whole and at
+ * least 1, the window 1 to 180 days, the reversals' retention).
+ */
+export function readRevertLane(settings: unknown): RevertLaneSettings {
+  const raw = settingsRecord(settings) ? settings.revertLane : undefined
+  if (!settingsRecord(raw)) return { ...REVERT_LANE_DEFAULTS }
+  const num = (v: unknown, d: number, ok: (n: number) => boolean) => (typeof v === 'number' && Number.isFinite(v) && ok(v) ? v : d)
+  return {
+    mode: raw.mode === 'shadow' || raw.mode === 'enforce' ? raw.mode : 'off',
+    threshold: num(raw.threshold, REVERT_LANE_DEFAULTS.threshold, (n) => n > 0 && n <= 1),
+    minExecutions: num(raw.minExecutions, REVERT_LANE_DEFAULTS.minExecutions, (n) => Number.isInteger(n) && n >= 1),
+    minReversals: num(raw.minReversals, REVERT_LANE_DEFAULTS.minReversals, (n) => Number.isInteger(n) && n >= 1),
+    windowDays: num(raw.windowDays, REVERT_LANE_DEFAULTS.windowDays, (n) => Number.isInteger(n) && n >= 1 && n <= 180),
+  }
+}
+
+/**
+ * Read `securityProbeSampleRate` off already-resolved settings, clamped to
+ * the safe (unblinded) side of any bad value. The PUT schema in
+ * `routes/workspace.ts` bounds new writes to `[0, 1]`, but this also covers
+ * a value written before that bound existed, or one that reached the row by
+ * a path other than that route (a script, a fixture) — `NaN`, `undefined`,
+ * negative or `>1` all resolve to `1.0`. Only a genuine finite value in
+ * range is trusted to lower the sample rate.
+ */
+export function resolveSecurityProbeSampleRate(settings: WorkspaceSettings): number {
+  const rate = settings.securityProbeSampleRate
+  if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > 1) return 1.0
+  return rate
+}

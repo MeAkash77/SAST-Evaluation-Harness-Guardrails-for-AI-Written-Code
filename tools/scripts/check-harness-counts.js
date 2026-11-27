@@ -1,0 +1,363 @@
+#!/usr/bin/env node
+/**
+ * Every published harness-count claim must match the real enum.
+ *
+ * `services/sync-daemon/__tests__/harness/generatedGateBehaviour.test.ts`
+ * already asserts `GATES ∪ NO_GATE` covers every `HarnessType` member, so the
+ * code side has never drifted — there is no registry to build here. What
+ * drifted was prose: six sites once claimed 39, 40 or 41 by hand, and the
+ * harness-security-matrix's 42 data rows against a 41-member enum looked
+ * like an off-by-one until you read row 29's own Notes cell (Anthropic
+ * Managed Agents — a deliberate, documented, no-`HarnessType` exception, not
+ * a bug).
+ *
+ * `packages/shared-types/src/enums.ts` exports two numbers precisely so no
+ * doc ever has to state one by hand again:
+ *   - `HARNESS_COUNT` — the real total (`Object.keys(HarnessType).length`).
+ *   - `HARNESS_HEADLINE_COUNT` — `HARNESS_COUNT` minus harnesses with a
+ *     confirmed, currently-open TECH_DEBT support gap, safe for
+ *     marketing/headline copy.
+ *
+ * This gate reads `enums.ts` as text (not compiled output — every sibling
+ * `check-*.js` in this chain does the same, so the gate needs no build step
+ * to run) and independently recomputes both numbers, then checks every
+ * targeted doc claim and the matrix's row count against them.
+ *
+ * A right count can still hide a missing harness: a page for one harness and
+ * a stray row for another add up. So every `HarnessType` value must also have
+ * its own `apps/docs/integrations/<slug>.md` page (PAGE_SLUGS where the slug
+ * differs from the value), and its own named row in the matrix: the bolded
+ * name in the row's second cell must be the page's title (ROW_NAMES where it
+ * is not).
+ *
+ * Exit 1 on any mismatch or on any file it cannot read.
+ */
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
+import { join, dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// The repo root: the first argument that is neither a flag nor --website's
+// path, else this checkout.
+const positional = process.argv.slice(2).filter((a, i, all) => !a.startsWith('--') && all[i - 1] !== '--website')
+const ROOT = positional[0] ? resolve(positional[0]) : join(dirname(fileURLToPath(import.meta.url)), '..', '..')
+const ENUMS_TS = join(ROOT, 'packages/shared-types/src/enums.ts')
+const MATRIX = join(ROOT, 'apps/docs/reference/harness-security-matrix.md')
+
+function fail(msg) {
+  console.error(`[FAIL] ${msg}`)
+  process.exit(1)
+}
+
+if (!existsSync(ENUMS_TS)) fail(`${ENUMS_TS} is missing.`)
+const enumsSrc = readFileSync(ENUMS_TS, 'utf8')
+
+// Isolate the `HarnessType = { ... } as const` object body so member-shaped
+// lines elsewhere in the file (other enums) cannot be counted by accident.
+const bodyMatch = enumsSrc.match(/export const HarnessType = \{([\s\S]*?)\n\} as const/)
+if (!bodyMatch) {
+  fail(`could not find "export const HarnessType = { ... } as const" in ${ENUMS_TS}.`)
+}
+const harnessBody = bodyMatch[1]
+// One member per `KEY: 'value'` line — comments, blank lines and multi-line
+// doc blocks in between are not members.
+const memberLines = harnessBody
+  .split('\n')
+  .filter((l) => /^\s*[A-Z][A-Z0-9_]*:\s*'[^']+',?\s*(\/\/.*)?$/.test(l))
+const realCount = memberLines.length
+
+if (realCount < 30 || realCount > 60) {
+  fail(
+    `counted ${realCount} HarnessType members from ${ENUMS_TS} — that is ` +
+      'outside a sane range, so the parsing regex above likely broke. Fix the ' +
+      'regex rather than the range.',
+  )
+}
+
+// Cross-check against the file's own exported HARNESS_COUNT/HARNESS_HEADLINE_COUNT
+// declarations, so a hand-edit to either constant that disagrees with the real
+// member count — or with its own exclusion list — is caught here rather than
+// only at the doc sites below.
+if (!enumsSrc.includes('export const HARNESS_COUNT = Object.keys(HarnessType).length')) {
+  fail(`${ENUMS_TS} no longer defines HARNESS_COUNT as Object.keys(HarnessType).length.`)
+}
+const headlineMatch = enumsSrc.match(
+  /export const HARNESS_HEADLINE_COUNT =\s*\n?\s*HARNESS_COUNT - \[([^\]]*)\]\.length/,
+)
+if (!headlineMatch) {
+  fail(`could not find HARNESS_HEADLINE_COUNT's exclusion list in ${ENUMS_TS}.`)
+}
+const exclusionCount = headlineMatch[1].split(',').filter((s) => s.trim().length > 0).length
+const headlineCount = realCount - exclusionCount
+
+/** HarnessType values whose integration page has another slug. */
+const PAGE_SLUGS = {
+  'agent-framework': 'microsoft-agent-framework',
+  'agentcore-runtime': 'agentcore',
+  'trueforge-server': 'trueforge',
+}
+
+/** HarnessType values whose matrix row is not named by their page's title. */
+const ROW_NAMES = {
+  codex: 'Codex CLI',
+  antigravity: 'Antigravity',
+  strands: 'Strands Agents',
+  'trueforge-server': 'TrueForge Server',
+}
+
+const memberValues = memberLines.map((l) => l.match(/'([^']+)'/)[1])
+
+// ── Matrix row count ────────────────────────────────────────────────────
+if (!existsSync(MATRIX)) fail(`${MATRIX} is missing.`)
+const matrixText = readFileSync(MATRIX, 'utf8')
+const rowLines = matrixText.match(/^\| \d+ \|.*$/gm) ?? []
+const dataRows = rowLines
+// Rows explicitly documented as carrying no HarnessType (the Anthropic
+// Managed Agents precedent) are additive, not part of the enum-backed count.
+// Anchored on "carries no `HarnessType`" specifically, not the broader
+// "no `HarnessType`" phrase — a row can legitimately MENTION a different,
+// non-row sub-concept that has no HarnessType (AWS Bedrock AgentCore's
+// Gateway, inside the enum-backed `agentcore-runtime` row) without the ROW
+// ITSELF being an exception.
+const documentedExceptions = rowLines.filter((l) => l.includes('carries no `HarnessType`')).length
+const enumBackedRows = dataRows.length - documentedExceptions
+if (enumBackedRows !== realCount) {
+  fail(
+    `${MATRIX} has ${dataRows.length} data row(s), ${documentedExceptions} ` +
+      `documented as carrying no HarnessType (${enumBackedRows} enum-backed), ` +
+      `but HarnessType has ${realCount} member(s). Either a row is missing/extra, ` +
+      `or a genuinely-undocumented no-HarnessType row needs the same "no ` +
+      "\`HarnessType\`\" Notes-column phrasing the Anthropic Managed Agents row uses.",
+  )
+}
+
+// ── One page and one named row per harness ──────────────────────────────
+// Letters and digits only, lower-cased: "Open-WebUI" is the "Open WebUI" page.
+const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '')
+const rowNames = new Set(
+  rowLines.map((l) => (l.split('|')[2] ?? '').match(/\*\*([^*]+)\*\*/)?.[1]).filter(Boolean).map(norm),
+)
+// The front matter's title, else the first heading.
+const pageTitle = (text) => {
+  const frontMatter = text.startsWith('---\n') ? text.slice(4, text.indexOf('\n---', 4)) : ''
+  return (frontMatter.match(/^title:\s*(.+)$/m)?.[1] ?? text.match(/^#\s+(.+)$/m)?.[1] ?? '').replace(/<Badge[^>]*\/>/g, '').trim()
+}
+const coverageFailures = []
+for (const value of memberValues) {
+  const slug = PAGE_SLUGS[value] ?? value
+  const page = join(ROOT, 'apps/docs/integrations', `${slug}.md`)
+  if (!existsSync(page)) {
+    coverageFailures.push(`HarnessType '${value}' has no apps/docs/integrations/${slug}.md` + (PAGE_SLUGS[value] ? '' : ' (add it, or map the value in PAGE_SLUGS)'))
+    continue
+  }
+  const name = ROW_NAMES[value] ?? pageTitle(readFileSync(page, 'utf8'))
+  if (!name) coverageFailures.push(`apps/docs/integrations/${slug}.md has no title to name '${value}'s matrix row by`)
+  else if (!rowNames.has(norm(name))) {
+    coverageFailures.push(`HarnessType '${value}' has no "**${name}**" row in ${MATRIX} (or name it in ROW_NAMES)`)
+  }
+}
+if (coverageFailures.length) {
+  for (const f of coverageFailures) console.error(`[FAIL] ${f}`)
+  process.exit(1)
+}
+
+// ── Gate-kind counts ─────────────────────────────────────────────────────
+// How many harnesses each kind of gate covers is prose too: the docs said
+// "native hook gates in 19" for a day after Continue, whose hooks never fire,
+// moved to the proxy-governed set. gateKind.ts is where each harness's kind is
+// decided (gateKind.test.ts holds it to the gate registry): a harness in none
+// of its sets is hook-gated.
+const GATE_KIND = join(ROOT, 'packages/shared-types/src/gateKind.ts')
+if (!existsSync(GATE_KIND)) fail(`${GATE_KIND} is missing.`)
+const gateKindSrc = readFileSync(GATE_KIND, 'utf8')
+function gateSet(name) {
+  const m = new RegExp(`export const ${name}\\b[^=]*= new Set\\(\\[([\\s\\S]*?)\\]\\)`).exec(gateKindSrc)
+  if (!m) fail(`could not find ${name} in ${GATE_KIND}.`)
+  return new Set([...m[1].matchAll(/HarnessType\.([A-Z0-9_]+)/g)].map((x) => x[1]))
+}
+const sdkGated = gateSet('SDK_GATED_HARNESSES').size
+const otherKinds = new Set(
+  ['SDK_GATED_HARNESSES', 'NO_GATE_HARNESSES', 'DELEGATED_GATE_HARNESSES', 'BRIDGE_GATED_HARNESSES'].flatMap((n) => [...gateSet(n)]),
+)
+const hookGated = realCount - otherKinds.size
+const ungated = realCount - hookGated - sdkGated
+// A gate of its own: a hook, an SDK or a bridge gate — everything but the
+// no-gate and delegated sets. "36 of the 43" is this number.
+const ownGate = realCount - new Set(['NO_GATE_HARNESSES', 'DELEGATED_GATE_HARNESSES'].flatMap((n) => [...gateSet(n)])).size
+// What the sync daemon writes for: every harness but the bridge-gated ones,
+// which `intutic init` cannot detect (TrueForge run as its own server).
+const daemonSupported = realCount - gateSet('BRIDGE_GATED_HARNESSES').size
+const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve']
+const asNumber = (s) => (/^\d+$/.test(s) ? Number(s) : NUMBER_WORDS.indexOf(s.toLowerCase()))
+// Each pattern only matches a phrasing that states the count of one kind.
+const GATE_KIND_PATTERNS = [
+  // "native hooks in N" too: compare/index.md said "native hooks in 19" while
+  // the pattern only knew "hook gates", so the stale count passed.
+  [/native (?:pre-execution )?hook(?:s| gates) in \*{0,2}(\d+)\b/gi, hookGated, 'hook-gated'],
+  [/\b(\d+) install as native hook gates\b/gi, hookGated, 'hook-gated'],
+  [/in-process SDK gates in \*{0,2}(\d+)\b/gi, sdkGated, 'SDK-gated'],
+  [/\b(\d+) SDK-gated frameworks\b/gi, sdkGated, 'SDK-gated'],
+  [/\bthe other (\w+) are governed through\b/gi, ungated, 'neither hook- nor SDK-gated'],
+  [/\bharness for the other (\w+)\b/gi, ungated, 'neither hook- nor SDK-gated'],
+  // "In 36 of the 43 supported harnesses, each tool call passes through a
+  // policy gate", "gates inside 36 of its 43": the harnesses with a gate of
+  // their own. Not after "hook gates"/"hooks", which state the hook count.
+  [/(?<!hook gates\s)(?<!hooks\s)\b(?:[Ii]n|inside)\s+\*{0,2}(\d+)\*{0,2}\s+of\s+(?:the|its)\s+\*{0,2}\d+\*{0,2}\s+supported\s+harnesses\b/g, ownGate, 'gated by a hook, SDK or bridge gate of their own'],
+  [/\bdaemon supports\s+\*{0,2}(\d+)\*{0,2}\s+of\b/gi, daemonSupported, 'written for by the sync daemon (all but the bridge-gated)'],
+]
+
+// ── Doc claims ───────────────────────────────────────────────────────────
+// Deliberately narrow patterns, not a generic "any number near the word
+// harness" scan — this codebase also states auto-detection subset counts
+// ("40 of Intutic's 41") that are correct and must NOT be flagged as if they
+// were total-count claims. Each pattern below only matches a phrasing that
+// is actually asserting the total (or headline) count.
+// `\*{0,2}` around each number tolerates markdown bold (`**41**`) — the same
+// convention check-detector-coverage-claims.js's own pattern uses for the
+// identical reason.
+// Interview-audit closeout Wave 5: the five-file list this gate used to check
+// left ~19 hand-stated counts unwatched (an integrations page said 38, a
+// guide said 18, four compare pages said 41 where the headline is 39). Every
+// docs page, both READMEs and the sandbox guide are read now, and the patterns
+// cover the phrasings those sites actually used. "other N harnesses" (an
+// integration page counting the rest) is N = count − 1.
+const CLAIM_PATTERNS = [
+  /\*{0,2}(\d+)\*{0,2}\s+supported\s+harness(?:es)?\b/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+harness\s+adapters?\b/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+harness\s+integrations\b/gi,
+  /Intutic\s+(?:currently\s+)?supports\s+\*{0,2}(\d+)\*{0,2}\s+(?:AI\s+agent\s+)?harnesses\b/gi,
+  /works?\s+with\s+\*{0,2}(\d+)\*{0,2}\s+(?:coding\s+)?agents?\b/gi,
+  /(?:for\s+)?all\s+\*{0,2}(\d+)\*{0,2}\s+harnesses\b/gi,
+  /(?:across|over)\s+\*{0,2}(\d+)\*{0,2}\s+(?:supported\s+)?harnesses\b/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+harnesses\s+out-of-the-box\b/gi,
+  /\b(\d+)\s+Harness(?:es)?\b(?=\s*(?:<!--|$))/gm,
+  // Phrasings the audit after the 43rd harness found unwatched: "each of 39
+  // harnesses", "39 harnesses, from …", "39 AI coding agents/harnesses",
+  // "41 agent harnesses", "39 coding-agent harnesses", "39 out-of-the-box,
+  // harness-native adapters" and "supports [39 harnesses](…)".
+  /each\s+of\s+(?:the\s+|its\s+|Intutic's\s+)?\*{0,2}(\d+)\*{0,2}\s+harnesses\b/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+harnesses,/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+AI\s+coding\s+(?:agents|harnesses)\b/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+(?:AI\s+)?agent\s+harnesses\b/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+coding-agent\s+harnesses\b/gi,
+  /\*{0,2}(\d+)\*{0,2}\s+out-of-the-box\b/gi,
+  /supports\s+\[\*{0,2}(\d+)\*{0,2}\s+harnesses\]/gi,
+  // Phrasings the 2026-10-14 audit found unwatched: "43 supported agent
+  // tools", "covers 43 harnesses", the matrix's "43 harnesses + 1 …", and the
+  // total in "36 of the 43 supported harnesses" / "42 of Intutic's 43 harness
+  // adapters" (the subset is checked by GATE_KIND_PATTERNS).
+  /\*{0,2}(\d+)\*{0,2}\s+supported\s+agent\s+tools\b/gi,
+  /\bcovers\s+\*{0,2}(\d+)\*{0,2}\s+(?:supported\s+)?harnesses\b/gi,
+  /\b(\d+)\s+harnesses\s+\+/g,
+  /\b\d+\*{0,2}\s+of\s+(?:the\s+|its\s+|Intutic's\s+)\*{0,2}(\d+)\*{0,2}\s+(?:supported\s+)?harness(?:es|\s+adapters)\b/gi,
+]
+const OTHER_PATTERN = /other\s+\*{0,2}(\d+)\*{0,2}\s+harnesses\b/gi
+
+function walkMarkdown(dir, out = []) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === '.vitepress' || entry.name === 'node_modules' || entry.name === 'public') continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) walkMarkdown(full, out)
+    else if (entry.name.endsWith('.md')) out.push(full)
+  }
+  return out
+}
+
+const TARGET_FILES = [
+  ...walkMarkdown(join(ROOT, 'apps/docs')),
+  join(ROOT, 'README.md'),
+  join(ROOT, 'services/sync-daemon/README.md'),
+]
+// Enterprise-only files: this script is mirrored to the public repo, where
+// `docs/` does not exist. Checked when present, skipped (and said so) when
+// not — a missing enterprise-only file is not an assertion failure there.
+const OPTIONAL_FILES = [join(ROOT, 'docs/guides/sandbox_and_policy_gates.md')]
+for (const file of OPTIONAL_FILES) {
+  if (existsSync(file)) TARGET_FILES.push(file)
+  else console.log(`[SKIP] ${file} is not in this checkout (enterprise-only).`)
+}
+
+let offences = 0
+let checked = 0
+
+function checkClaim(file, claimed, quoted, expected) {
+  checked += 1
+  if (!expected.includes(claimed)) {
+    console.error(
+      `[FAIL] ${file}: claims ${claimed} harnesses ("${quoted.trim()}"), but ` +
+        `HARNESS_COUNT=${realCount} and HARNESS_HEADLINE_COUNT=${headlineCount} ` +
+        `(accepted here: ${expected.join(' or ')}).`,
+    )
+    offences += 1
+  }
+}
+
+function checkKindClaim(file, claimed, quoted, expected, kind) {
+  checked += 1
+  if (claimed !== expected) {
+    console.error(
+      `[FAIL] ${file}: says ${claimed} harnesses are ${kind} ("${quoted.trim()}"), but ` +
+        `packages/shared-types/src/gateKind.ts makes it ${expected}.`,
+    )
+    offences += 1
+  }
+}
+
+for (const file of TARGET_FILES) {
+  if (!existsSync(file)) fail(`${file} is missing — this gate asserted nothing for it.`)
+  const text = readFileSync(file, 'utf8')
+  for (const pattern of CLAIM_PATTERNS) {
+    for (const m of text.matchAll(pattern)) {
+      checkClaim(file, Number(m[1]), m[0], [realCount, headlineCount])
+    }
+  }
+  for (const m of text.matchAll(OTHER_PATTERN)) {
+    checkClaim(file, Number(m[1]), m[0], [realCount - 1, headlineCount - 1])
+  }
+  for (const [pattern, expected, kind] of GATE_KIND_PATTERNS) {
+    for (const m of text.matchAll(pattern)) checkKindClaim(file, asNumber(m[1]), m[0], expected, kind)
+  }
+}
+
+// ── Website markers (opt-in: --website <checkout>) ──────────────────────
+//
+// The marketing site keeps its counts between
+// `<!-- HARNESS_COUNT:sync -->N<!-- /HARNESS_COUNT:sync -->` markers; nothing
+// ever read them until this mode. Every marker must carry the headline count.
+const websiteFlag = process.argv.indexOf('--website')
+if (websiteFlag !== -1) {
+  const site = process.argv[websiteFlag + 1]
+  if (!site) fail('--website needs a path to the intutic-website checkout.')
+  const index = join(site, 'index.html')
+  if (!existsSync(index)) fail(`${index} is missing.`)
+  const html = readFileSync(index, 'utf8')
+  const markers = [...html.matchAll(/<!-- HARNESS_COUNT:sync -->\s*(\d+)[^<]*<!-- \/HARNESS_COUNT:sync -->/g)]
+  if (markers.length === 0) fail(`${index} has no HARNESS_COUNT:sync markers — this mode asserted nothing.`)
+  for (const m of markers) checkClaim(index, Number(m[1]), m[0], [headlineCount])
+  const WEBSITE_KINDS = [
+    [/<strong>Native hook gates<\/strong> \((\d+)/g, hookGated, 'hook-gated'],
+    [/<strong>SDK-gated frameworks<\/strong> \((\d+)/g, sdkGated, 'SDK-gated'],
+    [/\b(\d+) frameworks gated in-process\b/g, sdkGated, 'SDK-gated'],
+  ]
+  for (const [pattern, expected, kind] of WEBSITE_KINDS) {
+    for (const m of html.matchAll(pattern)) checkKindClaim(index, Number(m[1]), m[0], expected, kind)
+  }
+  console.log(`[PASS] website: ${markers.length} HARNESS_COUNT:sync marker(s) in ${index} carry ${headlineCount}.`)
+}
+
+if (checked === 0) fail('no harness-count claim was checked. This gate asserted nothing.')
+
+if (offences > 0) {
+  console.error(
+    `\nHARNESS_COUNT/HARNESS_HEADLINE_COUNT (packages/shared-types/src/enums.ts) are the ` +
+      'source of truth. Update the prose to match, or use the correct constant if the ' +
+      'claim is meant to be marketing-safe (headline) rather than the full count.',
+  )
+  process.exit(1)
+}
+
+console.log(
+  `[PASS] harness counts: HARNESS_COUNT=${realCount}, HARNESS_HEADLINE_COUNT=${headlineCount}, ` +
+    `${hookGated} hook-gated and ${sdkGated} SDK-gated, ` +
+    `matrix has ${dataRows.length} row(s) (${documentedExceptions} documented no-HarnessType ` +
+    `exception(s)), every harness has a page and a named row, ${checked} doc claim(s) checked.`,
+)

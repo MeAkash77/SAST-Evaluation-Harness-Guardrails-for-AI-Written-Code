@@ -1,0 +1,619 @@
+# Configuration Reference <Badge type="tip" text="Open-Core" />
+
+Environment variables, workspace settings, and proxy configurations for the Intutic platform.
+
+---
+
+## 1. Environment Variables
+
+### Proxy
+
+The proxy (`intutic-proxy`) reads these at startup unless a row says otherwise.
+
+#### Core
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `CONFIG_PATH` | `config.yaml` in the working directory | The [`config.yaml`](#_4-proxy-config-yaml-intutic-settings) to load. The container image sets `/etc/intutic/proxy-config.yaml` |
+| `PORT` | `4000` | The port the proxy listens on |
+| `INTUTIC_PROXY_BIND` | `127.0.0.1`; `0.0.0.0` with `INTUTIC_GATEWAY_REQUIRE_VK` and in the container image | The addresses the proxy listens on: one IP address, or several separated by commas. The default answers only this machine. Open it for clients elsewhere: `0.0.0.0` for every interface, or a list such as `127.0.0.1,172.17.0.1` to add the Docker bridge for an `intutic exec --sandbox` on Linux (Docker Desktop reaches loopback already). Keep a loopback address in the list when Windsurf or Cursor traffic is intercepted. A `CONNECT` from another machine is refused unless the listener is open and the request carries an Intutic key in `Proxy-Authorization` (`Bearer vk_…`, or the key as the proxy URL's user name) that the control plane accepts. A value that is not an IP address stops the proxy at startup |
+| `RUST_LOG` | `intutic_proxy=info,tower_http=info` | Log filter, in `tracing` syntax (`intutic_proxy=debug`, `warn`, …) |
+| `CONTROL_PLANE_URL` | unset | Unset, the proxy runs **standalone**: no control plane, and rules, budgets and allowlists come from local files. Set to a control plane's address, it runs **managed**: Valkey becomes required (startup fails if it cannot connect, rather than accepting requests unauthenticated), and every request is checked against the workspace's policy first, failing closed (`403 policy_denied`) when the check fails or times out unless `intutic_settings.policy.fail_closed` is `false` |
+| `VALKEY_URL` | `redis://127.0.0.1:6379` | Valkey for the auth and budget cache, bandit state and the response cache. Standalone, the proxy tries it for 1.5 seconds and runs without it if it does not answer. With Valkey but no control plane, requests are handled exactly as standalone: a request's own provider key passes through, and for a virtual key (`vk_…`) the provider key in the proxy's environment is used upstream. A Valkey that requires a password takes it in the URL (`redis://user:password@host:6379`); the proxy masks the password when it logs the URL |
+| `INTUTIC_STANDALONE` | unset | `1` or `true`: run standalone without probing for Valkey. Refused together with `CONTROL_PLANE_URL` |
+| `INTUTIC_CHAOS_PLAN` | unset | Set only by [`intutic chaos run`](/guide/chaos-engineering) on the proxy it starts for a repetition: the faults to inject, base64url-encoded JSON. A value that does not decode refuses to start the proxy |
+| `INTUTIC_CHAOS_EVENTS` | unset | Set with `INTUTIC_CHAOS_PLAN`: the file the proxy appends the run's fault, usage and plan events to. An unopenable path refuses to start the proxy |
+| `INTUTIC_WORKSPACE_ID` | unset | The workspace for requests that do not name one (no `x-workspace-id` header and no workspace in the key). Also the workspace a centrally distributed egress policy file must name to be loaded |
+| `INTUTIC_REGION` | unset | A region code (`eu`, …). Rewrites the hosted control plane's policy-check address to that region's control plane (`api.<region>.…`), and the in-cluster `control-plane.intutic.svc` to `control-plane.intutic-<region>.svc`. Any other address is left alone |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Export traces and metrics over OTLP/gRPC to this collector. Unset, nothing is exported. See [OpenTelemetry](/guide/opentelemetry) |
+| `OTEL_SERVICE_NAME` | `intutic-proxy` | The service name on exported traces and metrics |
+
+#### Provider upstreams and keys
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `UPSTREAM_URL` | unset | One upstream for every provider, such as a LiteLLM gateway. A provider's own variable below takes precedence. See [Standalone](/integrations/standalone) |
+| `INTUTIC_UPSTREAM_WIRE` | `model` | How a request's upstream is chosen. `model`: from the model name, as described below this table; a request whose route the chosen provider does not serve is translated (an OpenAI-format request for a Claude, Bedrock, Vertex AI or Gemini model) or refused with 400 `unsupported_route`. `passthrough`: every request on `/v1/messages`, `/v1/chat/completions` and `/v1/responses` goes unchanged, in the format it arrived in, to the upstream for that format: `UPSTREAM_URL`, or `ANTHROPIC_UPSTREAM_URL` for `/v1/messages` and `OPENAI_UPSTREAM_URL` for the other two when set. Use it behind a gateway that serves every route for every model it routes, such as LiteLLM, so its own model names (`qwen3-coder` on `/v1/messages`, `vertex/claude-opus-4-1` on `/v1/chat/completions`) reach it as sent. A request with an Intutic key (`vk_…`) uses the key for that format's provider (`ANTHROPIC_API_KEY` on `/v1/messages`, `OPENAI_API_KEY` otherwise, or the workspace's own); a caller's own key is passed through. The Gemini API's `/v1beta` route is not passed through. Any other value stops the proxy at startup |
+| `ANTHROPIC_UPSTREAM_URL` | `https://api.anthropic.com` | Where requests for Anthropic models go |
+| `OPENAI_UPSTREAM_URL` | `https://api.openai.com` | Where requests for OpenAI models go |
+| `GEMINI_UPSTREAM_URL` | `https://generativelanguage.googleapis.com` | Where requests for Gemini models go. A `gemini-*` model asked for on `/v1/messages`, `/v1/chat/completions` or `/v1/responses` is translated to the Gemini API's `generateContent`, with the requested model and the Gemini key in `x-goog-api-key`. Requests on the Gemini API's own `/v1beta` route are not supported |
+| `MISTRAL_UPSTREAM_URL` | `https://api.mistral.ai` | Where requests for Mistral models go |
+| `OPENROUTER_UPSTREAM_URL` | `https://openrouter.ai/api` | Where requests for OpenRouter models go |
+| `DEEPSEEK_UPSTREAM_URL` | `https://api.deepseek.com` | Where requests for DeepSeek models go |
+| `TYPESAFE_API_KEY`, `FASTINO_API_KEY` | unset | The decision-model provider key the proxy uses for a [decision call](/guide/decision-traffic) made with an Intutic key (`vk_…`) when the workspace has not provisioned its own TypeSafe or Fastino key. Same rules as the provider keys below |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY` | unset | The provider key the proxy uses when a caller authenticates with an Intutic key (`vk_…`) and the workspace has not provisioned its own key for that provider. A caller that sends its own provider key uses that key, and the proxy sends it to that provider only, never to the control plane. A gateway with `INTUTIC_GATEWAY_REQUIRE_PROVISIONED_KEY` set refuses instead of falling back |
+| `ENCRYPTION_KEY` | unset | Opens the workspace provider keys a control plane stores encrypted in Valkey: the same value the control plane has. Without it, the proxy never sends an encrypted value upstream: it treats the key as not provisioned and logs why. A key the proxy captures from a request is stored encrypted when this is set. With Valkey, the proxy announces the ids of the keys it holds (none, without this), and the control plane encrypts stored keys only once every running proxy holds its key |
+| `ENCRYPTION_KEY_PREVIOUS` | unset | While `ENCRYPTION_KEY` is being rotated: the key it replaces, or several separated by commas. Values sealed under them still open |
+
+The proxy picks the provider from the model name, so these are the only way to point a first-party provider somewhere else; `INTUTIC_UPSTREAM_WIRE=passthrough` picks it from the route instead. For a single upstream used by every provider, see [Standalone](/integrations/standalone).
+
+#### Cloud providers
+
+Models named `bedrock/…`, `vertex/…` and `azure/…` go to AWS Bedrock, Google Vertex AI and Azure OpenAI. A request with an Intutic key uses the credential the workspace provisioned (Settings → Provider Keys); otherwise, and for any other caller, the proxy uses [`intutic_settings.providers`](#cloud-providers-intutic-settings-providers) and then these variables. See [AWS Bedrock](/integrations/aws-bedrock), [Google Vertex AI](/integrations/google-vertex-ai) and [Azure OpenAI](/integrations/azure-openai).
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `AWS_REGION`, `AWS_DEFAULT_REGION` | unset | The Bedrock region. Required for Bedrock unless `providers.bedrock.region` is set |
+| `AWS_BEARER_TOKEN_BEDROCK` | unset | A Bedrock API key. Unset, requests are SigV4-signed with the AWS credential chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`, static keys in the shared credentials file (`AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE`), an IAM Identity Center profile in the config file (`AWS_CONFIG_FILE`, the sign-in `aws sso login` cached), a profile that assumes a role (`role_arn` with `source_profile` or `credential_source`; MFA profiles are refused), web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN`), container credentials (ECS, EKS Pod Identity), then the EC2 instance role (`AWS_EC2_METADATA_DISABLED=true` skips it) |
+| `GOOGLE_CLOUD_PROJECT`, `ANTHROPIC_VERTEX_PROJECT_ID` | unset | The Vertex AI project. Required for Vertex AI unless `providers.vertex.project` is set |
+| `GOOGLE_CLOUD_LOCATION`, `CLOUD_ML_REGION` | `global` | The Vertex AI location (`global`, `us`, `eu`, or a region such as `us-east5`) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | unset | A service-account or `authorized_user` key file, or a workload identity federation configuration (`external_account`). Unset, Application Default Credentials continue with gcloud's `application-default` login, then the metadata server (Compute Engine, Google Kubernetes Engine Workload Identity, Cloud Run) |
+| `AZURE_OPENAI_ENDPOINT` | unset | The Azure OpenAI or Azure AI Foundry resource, `https://<resource>.openai.azure.com` or `https://<resource>.services.ai.azure.com` |
+| `AZURE_OPENAI_API_KEY` | unset | The resource's API key. Without one, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` sign in to Microsoft Entra ID with client credentials |
+| `GCE_METADATA_HOST` | `metadata.google.internal` | The Google metadata server Application Default Credentials ask for a token when no key file is found |
+| `IDENTITY_ENDPOINT`, `IDENTITY_HEADER` | set by Azure App Service | With `providers.azure.managed_identity`, the managed identity endpoint to ask for a token; unset, the instance metadata service is asked |
+
+#### Rules, budgets and memory
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_SOPS_DIR` | unset | Absolute path to a directory of `.md` SOP files, read like `.intutic/sops`: the files directly in it and one folder down. Overrides the default search, which walks up from the proxy's working directory looking for `.intutic/sops`. Set this when the proxy does not run beside a workspace — a container, or a shared gateway. A blank value counts as unset. A path that is set but is not a directory is **not** silently replaced by the walk: the proxy reports it and loads no SOPs, so a typo cannot be answered with policy from somewhere else. When the resolved SOP set is empty the proxy warns at startup, naming each control that is consequently inactive — including when the directory exists but is empty, which enforces exactly as much as no directory at all. The bundled Kubernetes manifests set this to `/etc/intutic-sops` and mount the `proxy-sops` ConfigMap there; see [SOPs → where the proxy looks](/guide/sops#where-the-proxy-looks-for-sops). |
+| `INTUTIC_WASM_DIR` | `~/.intutic/wasm` | The local WASM rule directory; takes precedence over `intutic_settings.wasm_local_dir` |
+| `INTUTIC_DISABLE_REGO_RULES` | unset | `1`: refuse [Rego rules](/guide/rego-policies) (OPA builds) at load, from the rules directory and the control plane. Native WASM rules are unaffected. The MCP proxy reads it too |
+| `INTUTIC_WASM_MANIFEST_ROOT` | unset (off) | The directory WASM rules may read files from: when a tool call names a manifest (`kubectl apply -f k8s/deploy.yaml`), the proxy reads that file under this root and hands its contents to the rule. Unset, rules see only the path. `~/` is expanded |
+| `WASM_CONTEXT_SNAPSHOT_RATE` | `0.05` | The fraction of requests (0–1) whose rule-evaluation context is attached to the trace, so a new rule can be replayed against real traffic before it ships. The context holds the request's tool calls — each one's name and its arguments' top-level keys and size, not the argument values unless the workspace sets [`storeToolArguments`](/reference/workspace-settings) — tool names and descriptions, DLP finding names and session counters, not the message text. Every string in it is redacted for secrets and all five PII detectors, email and phone included. Traces go to the control plane when one is connected, and to `~/.intutic/logs` otherwise. `0` turns it off |
+| `INTUTIC_LOCAL_BUDGET_ENFORCE` | on | `0`, `false` or `no`: keep counting spend against the [local daily cap](/guide/budgets#local-daily-cap) but stop refusing requests over it |
+| `INTUTIC_LOCAL_VAULTS` | unset | `off` turns off the local notes-vault search `/fix` uses. With a control plane, the sync daemon sets it from the workspace's policy |
+| `OFFLINE_PRICING_PATH` | the bundled price list | A JSON price list to use for cost estimates instead of the one built in. A file that does not parse is logged and ignored |
+| `JUDGE_FINALIZE_DEADLINE_MS` | `5000` | How long the end of a judged streamed response may wait for the judge before the client gets its final event. `0` or a negative value waits as long as the judge takes |
+
+#### Egress control
+
+The proxy decides what to do with each `CONNECT` it receives when clients use it as their HTTPS proxy: AI provider hosts are decrypted and governed; other hosts follow the egress policy. Cloud model endpoints (AWS Bedrock, Vertex AI, Azure OpenAI) are not intercepted, because a Bedrock request's signature covers its body; agents reach them governed through the proxy's own routes with a [`bedrock/`, `vertex/` or `azure/` model name](#cloud-providers), and a direct connection to them follows the egress policy like any other host.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_EGRESS_MODE` | `off` (or `intutic_settings.egress.mode`) | `off` tunnels every other host. `monitor` tunnels them but logs and counts the ones `enforce` would refuse. `enforce` refuses any host not on the allow list. Any other value stops the proxy at startup with an error naming the three; the mode in force is logged at startup and shown at `GET /intutic/egress` |
+| `INTUTIC_EGRESS_ALLOW` | none | Comma-separated hosts (`example.com`), suffixes (`.example.com`) and IP ranges (`10.0.0.0/8`) to allow, added to `intutic_settings.egress.allow` |
+| `INTUTIC_EGRESS_POLICY_FILE` | `~/.intutic/hooks/egress-policy.json` | The central egress policy the sync daemon writes for the workspace. Its mode overrides the local one and its allow list is added to the local list. A missing, corrupt or other-workspace file is ignored |
+| `INTUTIC_EGRESS_RELOAD_SECS` | `30` | How often the central policy file is re-read |
+| `INTUTIC_EXTRA_AI_HOSTS` | none | Comma-separated hosts to treat as AI providers (decrypted and governed), such as an internal model gateway |
+
+#### Shared gateway
+
+Settings for a proxy deployed as a shared or self-hosted gateway.<!-- ENTERPRISE_ONLY_START --> See [Self-hosted gateway](/external/self-hosted-gateway) and [On-prem judge](/external/on-prem-judge).<!-- ENTERPRISE_ONLY_END -->
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_GATEWAY_REQUIRE_VK` | `false` | `true`: accept only Intutic keys (`vk_…`); any other bearer is refused with `401` |
+| `INTUTIC_GATEWAY_REQUIRE_PROVISIONED_KEY` | `false` | `true`: refuse (`402`) a workspace that has not provisioned its own provider key instead of using the gateway's. `paid`: only for workspaces on a paid plan |
+| `INTUTIC_GATEWAY_ID` | unset | The gateway's id (`gw_…`) from registration. With `INTUTIC_GATEWAY_TOKEN` and `CONTROL_PLANE_URL`, turns on heartbeats |
+| `INTUTIC_GATEWAY_TOKEN` | unset | The gateway token (`gwk_…`) from registration |
+| `INTUTIC_GATEWAY_ORG_ID` | unset | Set by Intutic on a managed gateway cell dedicated to one organization: the organization it serves |
+| `INTUTIC_GATEWAY_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between heartbeats |
+| `INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS` | `30` | Days between automatic token rotations; `0` turns rotation off |
+| `INTUTIC_GATEWAY_TOKEN_STATE_FILE` | unset | A file where a rotated token is kept, so a restart does not fall back to the original |
+| `INTUTIC_GATEWAY_K8S_SECRET_NAME` | unset | In Kubernetes, the Secret a rotated token is written back to |
+| `INTUTIC_GATEWAY_K8S_SECRET_KEY` | `INTUTIC_GATEWAY_TOKEN` | The key in that Secret |
+| `INTUTIC_GATEWAY_LOCAL_JUDGE` | `false` | `true`: judge responses with your own model server instead of the control plane's, so content stays on your infrastructure. Deprecated since 3.0, removed in 4.0, like the five below |
+| `LITELLM_LOCAL_URL` | `http://litellm:4000` | The local judge's model server. Its host is allowed as self-hosted; a hosted decision API is refused |
+| `LITELLM_LOCAL_API_KEY` | unset | Bearer token for it, when it has one |
+| `LITELLM_LOCAL_JUDGE_MODEL` | none (required) | The judge model's name on that server |
+| `LITELLM_LOCAL_TYPED_JUDGE_MODEL` | `LITELLM_LOCAL_JUDGE_MODEL` | A separate model for the two typed questions |
+| `INTUTIC_GATEWAY_LOCAL_JUDGE_TYPED_LO`, `INTUTIC_GATEWAY_LOCAL_JUDGE_TYPED_HI` | unset | The band, in log-odds. With both set, the judge is the decide rule `local-judge` with the band `{no_below: σ(LO), yes_at: σ(HI)}`: below `LO` is `COMPLIANT`, at or above `HI` a `VIOLATION`, between them `AMBIGUOUS`. `HI` must be above 0. Without a band the free-text verdict decides (deprecated) |
+
+The local judge's `local-judge` rule holds its state to `INTUTIC_DECIDE_MAX_RESPONSE_STATE_BYTES`, as the gateway's `on: response` rules do ([Decide rules](#decide-rules)).
+
+#### Decide rules
+
+The engine the proxy asks its SOPs' [decide rules](/guide/decide#at-the-gateway) on, read once when the proxy starts: `~/.intutic/decide/engine.json` in the proxy's home directory (which `intutic decide configure` writes), overridden by these. With no model the engine is not configured, and an enforcing decide rule refuses with `GOVERNANCE_UNAVAILABLE`. Pins are read from `~/.intutic/decide/evals/` in the same home directory, and `~/.intutic/decide/disabled` runs every rule as shadow.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_DECIDE_ENGINE_URL` | `url` in `engine.json`, else `http://127.0.0.1:11434` | The self-hosted engine. A hosted decision API, or a host that is not loopback, private or listed below, is refused, and the engine is unavailable |
+| `INTUTIC_DECIDE_ADAPTER` | `adapter` in `engine.json`, else `logprobs` | `logprobs`, `systemone` or `decisions` |
+| `INTUTIC_DECIDE_MODEL` | `model` in `engine.json`; none otherwise | The model the engine serves |
+| `INTUTIC_DECIDE_TIMEOUT_MS` | `timeoutMs` in `engine.json`, else `5000` | Per-call timeout |
+| `INTUTIC_DECIDE_PARALLEL` | `parallel` in `engine.json`, else `1` for Ollama and `8` otherwise | Most engine requests in flight at once |
+| `INTUTIC_DECIDE_API_KEY` | unset | The engine's key, if it needs one. Never logged |
+| `INTUTIC_DECIDE_MODEL_DIGEST` | unset | The weights digest, for a server that cannot report one. Pins are keyed by it |
+| `INTUTIC_SELF_HOSTED_DECISION_HOSTS` | unset | Comma list of host names (or `.suffix`es) the engine may run on besides loopback and private addresses |
+| `INTUTIC_DECIDE_BUDGET_MS` | `7300` | How long one tool call's decide rules, or one response's, may take, in milliseconds. A rule its engine cannot answer within it is unavailable, which refuses an enforcing rule |
+| `INTUTIC_DECIDE_MAX_RESPONSE_STATE_BYTES` | `32768` | The most bytes an `on: response` rule's state (the SOP text and the response) may hold, 1 to 1048576. A larger one is never truncated: the rule is unknown, which is `AMBIGUOUS`. A tool call's state keeps its own 16,384-byte limit. A value out of range leaves the engine unavailable |
+
+#### Connected services
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `EMBEDDING_GENERATOR_URL` | `http://localhost:8085/v1/embeddings` | The OpenAI-compatible embeddings endpoint the semantic response cache uses |
+| `TURBOVEC_URL` | `http://localhost:8083` | The base address of the vector index the semantic cache searches |
+
+### CLI
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `CONTROL_PLANE_URL` | unset | Set when `intutic start` runs, the proxy it starts is managed (see above) |
+| `INTUTIC_CONTROL_PLANE_URL` | a workspace's `init --dev` setting, else the URL a control-plane login saved; none otherwise (this release has no default control plane) | The control plane every command talks to. A `--control-plane-url` or `--dev` flag takes precedence |
+| `INTUTIC_DEV` | unset | `1`: talk to a local control plane at `http://localhost:3001` instead of the saved or hosted one. `INTUTIC_CONTROL_PLANE_URL` takes precedence |
+| `VALKEY_URL` | `redis://127.0.0.1:6379` | Passed to the proxy the CLI starts |
+| `INTUTIC_PROXY_URL` | `http://localhost:4000` | The proxy `intutic exec` points agents at. Its port is the one `intutic start` (without `--port`) runs the proxy on, the one `intutic budget` and `intutic doctor` probe, and the one Windsurf's proxy setting points at. `PORT` is not read for this |
+| `INTUTIC_SNAPSHOT_RULES` | `~/.intutic/hooks/policy-snapshot.rules` | Where the CLI writes the policy snapshot the hook gate reads |
+| `INTUTIC_APPROVED_BYPASSES` | `~/.intutic/hooks/approved-bypasses.jsonl` | The approved-bypass list the hook gates read, which `intutic chaos run` copies into each repetition with the snapshot |
+| `INTUTIC_WASM_DIR` | `~/.intutic/wasm` | Where `intutic policy install` puts WASM rules |
+| `INTUTIC_OPA_BIN` | `opa` on the `PATH` | The OPA binary `intutic rules build` compiles Rego with |
+| `N8N_URL` | `http://localhost:5678` | The n8n instance `intutic init` looks for |
+| `N8N_API_TOKEN` | unset | Its API key |
+| `INTUTIC_FC_KERNEL` | none (required) | For `intutic exec --sandbox firecracker`: the guest kernel image |
+| `INTUTIC_FC_ROOTFS` | none (required) | The guest root filesystem |
+| `INTUTIC_FC_TAP` | `tap-intutic` | The TAP device |
+| `INTUTIC_FC_HOST_IP` | `172.16.0.1` | The host's address on it |
+| `INTUTIC_FC_GUEST_IP` | `172.16.0.2` | The guest's address |
+| `INTUTIC_FC_PREFIX` | `30` | The network's prefix length |
+| `INTUTIC_FC_VCPUS` | `1` | Guest vCPUs |
+| `INTUTIC_FC_MEM` | `512` | Guest memory, in MiB |
+| `INTUTIC_GRAPH_ID` | unset (a new graph) | Set by `intutic exec` on the agent it starts, and read by a nested `intutic exec`: the [agent graph](/guide/graph-guardrails) the agent belongs to |
+| `INTUTIC_NODE_ID` | unset | Likewise: the agent that ran the nested `intutic exec`, which becomes its parent |
+| `INTUTIC_DEPTH` | `0` | Likewise: how deep in the graph that agent is |
+| `INTUTIC_LOOP_BASE_COMMIT` | the commit `intutic loop start` recorded, else `HEAD` | The ref `intutic loop verify` diffs the run's changes against when `--base` is not given |
+| `INTUTIC_DECIDE_ENGINE_URL` | `url` in `~/.intutic/decide/engine.json`, else `http://127.0.0.1:11434` | The self-hosted engine `intutic decide` asks (and the gates that call `intutic decide check`). Overrides `engine.json` |
+| `INTUTIC_DECIDE_ADAPTER` | `adapter` in `engine.json`, else `logprobs` | `logprobs`, `systemone` or `decisions` |
+| `INTUTIC_DECIDE_MODEL` | `model` in `engine.json`; none otherwise | The model the engine serves. With none, the engine is not configured and enforcing decide rules refuse their tools |
+| `INTUTIC_DECIDE_TIMEOUT_MS` | `timeoutMs` in `engine.json`, else `5000` | Per-call timeout |
+| `INTUTIC_DECIDE_PARALLEL` | `parallel` in `engine.json`, else `1` for Ollama and `8` otherwise | Most engine requests in flight at once |
+| `INTUTIC_DECIDE_API_KEY` | unset | The engine's key, if it needs one. Read from the environment only: never written to `engine.json`, never logged |
+| `INTUTIC_DECIDE_MODEL_DIGEST` | unset | The weights digest, for a server that cannot report one (any engine but Ollama). Pins are keyed by it |
+| `INTUTIC_SELF_HOSTED_DECISION_HOSTS` | unset | Comma list of host names (or `.suffix`es) the engine may run on besides loopback and private addresses. Hosted decision APIs are refused whatever this says |
+| `INTUTIC_DECIDE_MAX_RESPONSE_STATE_BYTES` | `32768` | The most bytes an `on: response` rule's state (its rule text and the response) may hold, 1 to 1048576; a larger one makes the rule unknown, never truncated. A tool call's state keeps its 16,384-byte limit |
+
+<!-- ENTERPRISE_ONLY_START -->
+`intutic connect` also passes `ANTHROPIC_API_KEY` from its own environment to the proxy it starts.
+It downloads the proxy that talks to a control plane from this version's release, `intutic-proxy-connected-<platform>`, and verifies it against `checksums.json`; if that fails it builds the proxy with `cargo run --features control-plane`.
+<!-- ENTERPRISE_ONLY_END -->
+
+### Gate SDK
+
+Read by `@intutic/gate`. The MCP daemon and the Python `intutic-clawde` gate read `INTUTIC_API_KEY` too.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_API_KEY` | from a control-plane login | The workspace key (`vk_…`) |
+| `INTUTIC_WORKSPACE_ID` | from a control-plane login | The workspace |
+| `INTUTIC_CONTROL_PLANE_URL` | none (this release has no default control plane) | The control plane |
+| `INTUTIC_PROXY_URL` | `http://localhost:4000` | The proxy the Vercel AI SDK helper points models at |
+| `INTUTIC_SESSION_ID` | none | The session id reported with each verdict. `GateClient.fromEnv()` throws without it or a `sessionId`; the OpenAI Agents and dsh installers generate one |
+| `INTUTIC_SNAPSHOT_RULES` | `~/.intutic/hooks/policy-snapshot.rules` | The local policy snapshot |
+| `INTUTIC_GUARD_DISABLE` | unset | `1` turns the local snapshot guard off |
+| `INTUTIC_DECIDE_BUDGET_MS` | `7300` | How long the decide tier, or one `decide()` call that passes no `budgetMs`, may spend, in milliseconds; the Python gate reads it too. A rule its engine cannot answer within it is unavailable, which refuses an enforcing rule. A rule the engine's p95 (which `intutic doctor` stores) says cannot fit is not asked: an enforcing one escalates |
+
+`decide()` finds its engine in `~/.intutic/decide/engine.json`, which `INTUTIC_DECIDE_ENGINE_URL`, `INTUTIC_DECIDE_ADAPTER`, `INTUTIC_DECIDE_MODEL`, `INTUTIC_DECIDE_TIMEOUT_MS` and `INTUTIC_DECIDE_PARALLEL` override. The key is `INTUTIC_DECIDE_API_KEY`, a weights digest for a server that cannot report one `INTUTIC_DECIDE_MODEL_DIGEST`, and `INTUTIC_SELF_HOSTED_DECISION_HOSTS` lists host names the engine's self-hosted guard allows.
+
+### Sync daemon
+
+Read when Intutic writes harness files: by `intutic gates install`, and by the sync daemon on a control plane.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `CONFIG_CAPTURE_INTERVAL` | `5` | Capture the harness rules files for the config history every this many polls (a poll is 30 seconds by default) |
+| `INTUTIC_SKIP_GLOBAL_HOOKS` | unset | Any value: do not write Intutic's hooks and deny rules into `~/.claude/settings.json`; the project's `.claude/settings.json` is still written |
+
+The hook gates it writes read `INTUTIC_SNAPSHOT_RULES`, `INTUTIC_APPROVED_BYPASSES`, `INTUTIC_GUARD_DISABLE` and, under `intutic chaos run`, `INTUTIC_CHAOS_PLAN` and `INTUTIC_CHAOS_EVENTS`, as the CLI and the gate SDK do.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_APPROVED_PLANS` | `~/.intutic/hooks/approved-plans.jsonl` | The approved-plans cache the hook gates read for `plan_approval:` ([scope and plan](/reference/harness-security-matrix#scope-and-plan)) |
+| `INTUTIC_OUTCOME_STATE_DIR` | `~/.intutic/hooks/state/outcomes` | Where the hook gates keep each session's test outcomes for `requires_before: action:run_tests[ok]` ([post-tool outcome](/reference/harness-security-matrix#post-tool-outcome)) |
+
+### MCP proxy / MCP daemon
+
+Read by the MCP proxy (`intutic-mcp-proxy`) and the MCP daemon (`intutic-mcp-daemon`). The proxy reads most of its settings from the environment first, then from `~/.intutic/env/runtime.env`; [MCP governance](/guide/mcp-governance#configuration-reference) has the full rules.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_EVENTS_FILE` | `~/.intutic/events/hook-events.jsonl` | The local file every MCP event is also appended to |
+| `INTUTIC_MCP_FAIL_OPEN` | `true` | `false`: a check that cannot complete refuses the call. The workspace's `mcpProxyFailBehavior` wins once the proxy has loaded it |
+| `INTUTIC_MCP_INJECTION_ACTION` | `warn` | `block`: refuse a call, or withhold a result, that matches a prompt-injection pattern |
+| `INTUTIC_MCP_ANOMALY_MODE` | `enforce` | `warn` reports anomaly findings without blocking; `off` skips detection |
+| `INTUTIC_MCP_ANOMALY_OVERRIDES` | none | A JSON object of anomaly detector id → `steer`, `reask`, `kill` or `off`, capped at each detector's ceiling |
+| `INTUTIC_MCP_DLP_DETECTORS` | none | A JSON object of PII detector id → `off`, `redact` or `block`; it may only make the workspace's setting stricter |
+| `INTUTIC_MCP_SESSION_SCOPE` | derived | The session scope sibling proxies share their anomaly window under |
+| `INTUTIC_VALKEY_URL` | none (`VALKEY_URL` is also read) | The Valkey sibling proxies share their anomaly window and call-budget counters through |
+| `INTUTIC_WASM_DIR` | `~/.intutic/wasm` | The local WASM rule directory, ahead of runtime.env's `INTUTIC_WASM_LOCAL_DIR` |
+| `INTUTIC_WASM_MANIFEST_ROOT` | unset (off) | The directory WASM rules may read files from, as for the proxy |
+| `INTUTIC_DISABLE_REGO_RULES` | unset | `1`: refuse Rego rules at load |
+| `INTUTIC_CHAOS_PLAN` | unset | Set by `intutic chaos run`: the fault plan the proxy injects |
+| `INTUTIC_CHAOS_EVENTS` | unset | Set with it: the file each injected fault is recorded in |
+| `MCP_DAEMON_SOCKET` | `~/.intutic/mcp-proxy.sock` | The MCP daemon's Unix socket, for the daemon and the proxies that call it |
+| `MCP_DAEMON_POLICY_TTL_MS` | `300000` | How long the daemon serves a cached policy before refetching it |
+| `MCP_DAEMON_MAX_CACHE_ENTRIES` | `500` | Workspaces kept in the daemon's policy cache |
+| `MCP_DAEMON_STATUS_REPORT_MS` | `60000` | How often the daemon reports its status and the MCP servers it found |
+| `MCP_DAEMON_TELEMETRY_FLUSH_MS` | `1000` | How often the daemon flushes the events it batched to the control plane |
+| `INTUTIC_POLICY_SNAPSHOT` | `~/.intutic/hooks/verified/policy-snapshot.json` | The verified policy snapshot the daemon seeds its cache from at start |
+| `REDIS_URL` | `redis://localhost:6379` | The daemon's Valkey when `VALKEY_URL` is unset |
+
+Both also read `INTUTIC_API_KEY`, `INTUTIC_WORKSPACE_ID` and `INTUTIC_CONTROL_PLANE_URL` (the daemon: `CONTROL_PLANE_URL`), and the daemon exports traces to `OTEL_EXPORTER_OTLP_ENDPOINT` under the service name `OTEL_SERVICE_NAME` (default `mcp-daemon`). The remote-bridge headers (`INTUTIC_REMOTE_HEADERS`) are on [MCP governance](/guide/mcp-governance#configuration-reference).
+
+### Clawde SDK
+
+Read by the TypeScript `@intutic/clawde-sdk` and the Python `intutic-clawde` client.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_BASE_URL` | `http://localhost:4000` | The proxy the client sends model calls to, when `baseUrl` (`base_url`) is not passed |
+| `INTUTIC_DEBUG` | unset | `true`: log retries and circuit-breaker trips to the console |
+| `GIT_BRANCH` | unset | The branch reported with each call when the sync daemon is not running |
+| `PD_INCIDENT_ID` | unset | A PagerDuty incident reported with each call, likewise |
+| `INTUTIC_DECIDE_BUDGET_MS` | `7300` | Milliseconds `decide()` may spend on one call, when `budgetMs` (`budget_ms`) is not passed. The engine comes from the same configuration as the Gate SDK's `decide()` |
+
+They also read `INTUTIC_CONTROL_PLANE_URL`, `INTUTIC_WORKSPACE_ID` and `INTUTIC_SESSION_ID`; the Python gate reads the Gate SDK's variables above, and the TypeScript client the agent-graph variables `intutic exec` sets (`INTUTIC_GRAPH_ID`, `INTUTIC_NODE_ID`, `INTUTIC_DEPTH`). Without the sync daemon, the CI run id comes from the variable GitHub Actions, Buildkite or CircleCI sets. See [Clawde SDK](/reference/clawde-sdk).
+
+### AgentCore interceptor
+
+Read by the [AgentCore Gateway interceptor Lambda](/integrations/agentcore), besides `INTUTIC_CONTROL_PLANE_URL` and `INTUTIC_API_KEY`, which it requires.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `INTUTIC_TIMEOUT_MS` | `3000` | The control-plane call timeout |
+| `INTUTIC_FAIL_OPEN` | `false` | `true`: allow tool calls when the control-plane check itself fails |
+| `AGENTCORE_GATEWAY_ID` | unset | Attached to requests for log correlation; never affects the verdict |
+
+### TrueForge bridge
+
+Read by the [TrueForge server bridge](/integrations/trueforge#server-mode-standalone-hosted), besides `INTUTIC_API_KEY`, `INTUTIC_WORKSPACE_ID` and `INTUTIC_CONTROL_PLANE_URL`.
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `TRUEFORGE_BASE_URL` | none (required) | The TrueForge server |
+| `TRUEFORGE_API_KEY` | unset | Its bearer token, when the server has OIDC configured |
+| `TRUEFORGE_SESSION_IDS` | unset (discover) | Comma-separated session ids to watch |
+| `TRUEFORGE_RECONNECT_DELAY_MS` | `2000` | The wait before re-subscribing to a dropped turn stream |
+
+<!-- ENTERPRISE_ONLY_START -->
+### Control plane
+
+These configure the control plane in hosted and Self-host deployments.
+
+| Variable | Required? | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `DATABASE_URL` | ✅ | — | Postgres connection string |
+| `JWT_SECRET` | ✅ | — | Secret for signing session tokens. At least 32 characters: `openssl rand -hex 32` |
+| `ENCRYPTION_KEY` | ✅ | — | Key for encrypting stored credentials and tokens: `openssl rand -hex 32`. The proxy needs the same value to open stored provider keys. See [Stored credentials](/security#stored-credentials) |
+| `ENCRYPTION_KEY_PREVIOUS` | ❌ | — | Only while rotating `ENCRYPTION_KEY`: the key it replaces (several separated by commas). Stored credentials sealed under it still open, and the control plane re-encrypts provider keys under `ENCRYPTION_KEY` when it starts. See [Rotate the encryption key](/guide/self-host#rotate-the-encryption-key) |
+| `APP_URL` | Self-host | — | The dashboard's address; links in emails and invitations point here. Its origin is the one browser origin allowed to call the API with credentials (CORS) |
+| `COMPANY_POSTAL_ADDRESS` | ❌ | — | The sender's postal address, in the footer of promotional email (the onboarding sequence) next to its unsubscribe link, as CAN-SPAM requires. Line breaks are kept. Unset, promotional email is not sent and the control plane logs `promotional_email_config_missing` at start-up and `email_postal_address_missing` for each skipped send. Never filled in by default |
+| `CORS_ALLOWED_ORIGINS` | ❌ | — | Further exact browser origins allowed to call the API with credentials, separated by commas (`https://admin.example.com`). No wildcards. Unless `NODE_ENV` is `production`, the local dashboard dev servers (`http://localhost:3000`, `:5173` and the like) are allowed as well |
+| `API_BASE_URL` | Self-host | `http://localhost:3001` | The API's public address. Identity providers send users back here, so it builds the OIDC redirect URI (`/api/v1/auth/sso/callback`), the SAML ACS URL (`/api/v1/auth/saml/acs`) and the SCIM base URL |
+| `OIDC_CALLBACK_URL` | ❌ | built from `API_BASE_URL` | The full OIDC redirect URI, when users reach the API at a different address |
+| `SAML_ACS_URL` | ❌ | built from `API_BASE_URL` | The full SAML ACS URL, likewise |
+| `SAML_SP_ENTITY_ID` | ❌ | `<API_BASE_URL>/saml/metadata` | The service-provider entity id for SAML providers that do not set their own |
+| `TRACE_SIGNING_PRIVATE_KEY` | ❌ | — | Ed25519 PKCS#8 PEM. Signs the Merkle root sealed over each loop run's execution traces; the public half is served at `/.well-known/intutic-trace-signing.json`. Unset means roots are still sealed and re-derivable, just unattributable to this deployment by a third party. |
+| `TRACE_SIGNING_RETIRED_KEYS` | ❌ | — | Previously-active PEMs, any number of them, separated by newlines or commas or not at all (whole armoured blocks are matched). **Never used to sign** — they are published in the JWKS and used to verify roots sealed before a rotation, selected by the key id recorded on each root. Set this when you rotate `TRACE_SIGNING_PRIVATE_KEY`; without it, every root signed by the outgoing key becomes permanently unverifiable. A malformed entry here is logged and skipped rather than fatal, so one stale PEM cannot empty the JWKS. |
+| `PORT` | ❌ | `3001` | HTTP port for the control plane API |
+| `VALKEY_URL` | ❌ | `redis://localhost:6379` | Valkey for the auth cache, rate limits and the traces the proxies publish. Use a `rediss://` address for a Valkey that requires TLS |
+| `VALKEY_TLS` | ❌ | `false` | `true`: connect the main Valkey client over TLS |
+| `JWT_EXPIRY_SECONDS` | ❌ | `900` | Lifetime of a session access token and of the session cookie that carries it |
+| `REFRESH_TOKEN_EXPIRY_DAYS` | ❌ | `30` | Lifetime of a refresh token and of the `HttpOnly` refresh cookie |
+| `LITELLM_PROXY_URL` | ❌ | — | The LiteLLM endpoint for model calls (judges, probes, extraction). Takes precedence over `LITELLM_ADMIN_BASE_URL` |
+| `LITELLM_ADMIN_BASE_URL` | ❌ | `http://localhost:4000` | The LiteLLM endpoint when `LITELLM_PROXY_URL` is unset |
+| `INTUTIC_SIGNUP_ALLOWLIST` | ❌ | — | Makes self sign-up invite-only: comma-separated `domain` (that exact domain, not its subdomains) or `name@domain` entries, case-insensitive. Set, sign-up (email, org, and a first GitHub or Google sign-in) refuses any other address with 403 `SIGNUP_CLOSED`, and `GET /api/v1/deployment` reports `signupOpen: false`; set but empty admits no one. Invites, SCIM, SSO and sign-in are unaffected. Unset, sign-up is open wherever `INTUTIC_SELF_SERVE_SIGNUP` is `true`. A Self-host deployment has no sign-up either way. Entries match the typed address, which signup does not verify |
+| `LITELLM_PLATFORM_KEY` | ❌ | — | Scoped LiteLLM virtual key for judge/probe/generation calls — NOT LiteLLM's own admin secret, which this service never holds. See the key-rotation runbook for how it's minted. |
+| `INTUTIC_DECIDE` | ❌ | `off` | The server switch for decide rules. `off`: `GET /api/v1/policy/resolve` serves none, so connected gates evaluate none. `shadow`: every served rule is stamped shadow, and connected gates stop enforcing decide rules on their next snapshot poll (30 seconds by default); use it to roll back. `on`: rules are served as written, and a rule still enforces only with `rollout: enforce` and an active calibration. Any other value reads as `shadow`. Restart the control plane after changing it |
+| `INTUTIC_DECIDE_WORKSPACES` | ❌ | — | Comma-separated workspace ids `INTUTIC_DECIDE` applies to; every other workspace is `off`. Unset applies it to every workspace |
+| `DECIDE_EVENTS_RETENTION_DAYS` | ❌ | `90` | Days uploaded decide decisions are kept. The table is partitioned by UTC day, and the daily retention sweep drops each day once it is older. Argument excerpts are cleared after `JUDGE_REVIEW_EXCERPT_RETENTION_DAYS` (30) |
+| `DECIDE_EVENTS_MAX_ROWS_PER_WORKSPACE_DAY` | ❌ | `50000` | The most uploaded decide decisions stored for one workspace in one UTC day. Past it, `POST /api/v1/decide/events` refuses the rest of that day's rows, counts them in its answer (`overBudget`) and logs `decide_events_budget_exceeded` |
+
+The control plane refuses to start when `JWT_SECRET` or `ENCRYPTION_KEY` is
+missing, shorter than 32 characters or a template value (`changeme`, `secret`,
+`password`, `REPLACE_WITH_…`, `your-…`, `xxx…` and the like), or when one of
+these is a template value: `SLACK_ENCRYPTION_KEY`, `SLACK_SIGNING_SECRET`,
+`STRIPE_WEBHOOK_SECRET`, `INTUTIC_ADMIN_TOKEN`, or the password in
+`DATABASE_URL`, `MIGRATION_DATABASE_URL` or `BACKGROUND_DATABASE_URL`. The
+error names the variable, never its value. The check is skipped when
+`NODE_ENV` is `test` or `development`.
+
+---
+<!-- ENTERPRISE_ONLY_END -->
+
+## 2. Local Sandbox Development Stack
+
+The open-source workstation components run against a lightweight, local Valkey cache service.
+
+```bash
+# Start the local development Valkey service
+docker compose up -d
+
+# Valkey port mapping:
+# Valkey: 6379
+```
+
+### Test stack
+
+To execute the unit and integration tests under isolated conditions, spin up the test compose file:
+
+```bash
+# Start isolated test services
+docker compose -f docker-compose.test.yml up -d
+
+# Valkey test port mapping:
+# Valkey-test: 6380
+```
+
+---
+
+## 3. Workspace Settings
+
+Workspaces are the top-level organizational unit. Each workspace has:
+
+| Setting | Type | Description |
+|---------|------|-------------|
+| Workspace ID | `ws_*` | Auto-generated unique identifier |
+| Name | string | Human-readable workspace name |
+| Plan | enum | `free`, `free_trial`, `enterprise_trial`, `self_serve`, `biz_org`, `ent_adv` (Enterprise), `ent_lic` (Self-host) |
+| `allowedModels` | string[] | Approved-models allowlist. Absent or empty means unrestricted. Enforced by the proxy at request time — a request naming a model outside this list is rejected before it reaches a provider. See [Settings → Security → Approved Models](/guide/settings#approved-models) |
+| `allowedModels` (standalone) | string[] | The same allowlist for a proxy with no control plane, read from `~/.intutic/config.json` (`allowed_models` accepted as an alias) on a 60-second cache. Same absent-or-empty-means-unrestricted rule. See [Settings → Standalone allowlist](/guide/settings#standalone-allowedmodels-in-intutic-config-json) |
+| `maxDailyBudgetUsd` (standalone) | number | The proxy's [local daily cap](/guide/budgets#local-daily-cap), read from the same file on the same cache. Defaults to `10` |
+| `upstreamRetry` | object | The workspace's [retries and fallbacks](/guide/intelligent-routing#retries-and-fallbacks): `enabled`, `maxAttempts`, `initialBackoffMs`, `maxBackoffMs`, `budgetMs`, `onStatus` and `fallbacks`, each overriding the proxy's `routing.retry` / `routing.fallbacks` value. Absent fields keep the proxy's value; `null` clears it |
+
+
+<!-- ENTERPRISE_ONLY_START -->
+## Workspace Roles (RBAC)
+
+| Role | Access Level |
+|------|-------------|
+| `OWNER` | Full control — billing, settings, member management |
+| `ADMIN` | Manage SOPs, members, budgets |
+| `EM` | Engineering Manager — view reports, manage budgets |
+| `DEVELOPER` | Use agents, view own traces |
+| `VIEWER` | Read-only access to dashboard |
+
+Hierarchy: `OWNER` > `ADMIN` > `EM` > `DEVELOPER` > `VIEWER`
+<!-- ENTERPRISE_ONLY_END -->
+
+## Budget Tiers
+
+Each session carries a budget tier label: `JUNIOR` (the default), `SENIOR`, `STAFF` or `PRINCIPAL`. It is shown with the session and sets no spending limit; spend is limited by the workspace caps and by budgets on virtual keys and members (see [Budgets](/guide/budgets#setting-up-budget-limits)).
+
+## Execution Modes
+
+Each session also carries an execution-mode label, shown with the session. It records how the session was opened and changes no enforcement.
+
+| Mode | Description |
+|------|-------------|
+| `STANDARD` | The default |
+| `SANDBOX` | Opened by `intutic exec --sandbox` |
+| `HOOK_NATIVE` | A harness's own session, recorded from its hook events |
+| `PROXY` | A session the proxy recorded for requests that named none |
+
+## ID Conventions
+
+IDs the control plane mints are a short prefix, an underscore and 21 random characters (`ws_V1StGXR8_Z5jdHi6B-myT`). The common prefixes:
+
+| Prefix | Entity |
+|--------|--------|
+| `ws_` | Workspace |
+| `mbr_` | Member |
+| `sp_` | SOP |
+| `key_` | API key record |
+| `ses_` | Session, when the control plane opens it; a harness's own session id is kept as sent |
+
+Trace ids are UUIDs the proxy assigns. An API key itself starts `vk_` and is not in this format.
+
+---
+
+## 4. Proxy `config.yaml` (`intutic_settings`)
+
+The proxy reads a LiteLLM-shaped `config.yaml` (path from `CONFIG_PATH`). Every key is optional, and keys the proxy does not know are ignored.
+
+Of LiteLLM's own keys, only `model_list` does anything here, and two things: when it is non-empty, a `routing.candidate_models` entry it does not name (as `model_name` or `litellm_params.model`) is dropped at startup; and an entry whose `litellm_params.model` names a cloud model (`bedrock/…`, `vertex/…` or `vertex_ai/…`, `azure/…`) makes its `model_name` an alias for it, so a client asking for `claude-sonnet-4-5` can be served from Bedrock without changing what it sends. Other entries do not route; first-party upstreams and keys come from the [environment](#provider-upstreams-and-keys).
+
+```yaml
+model_list:
+  - model_name: claude-sonnet-4-5-20250929
+    litellm_params:
+      model: bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+```
+
+`litellm_params.api_key`, `litellm_params.api_base` and `general_settings` (including `master_key` and `database_url`) are ignored: the proxy does not authenticate callers with a master key.
+
+Intutic's options live under `intutic_settings`:
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `wasm_local_dir` | string | `~/.intutic/wasm` | Directory scanned for locally installed WASM rules. `INTUTIC_WASM_DIR` takes precedence |
+| `workflow.default_budget_usd` | number | none | A spend ceiling applied to any loop run that arrives without one, so the workflow budget detector can fire without a control plane. Unset leaves runs uncapped |
+| `commands.non_blocking` | boolean | `false` | `true`: `/fix` adds its synthesis to your prompt and forwards the turn to the model instead of answering locally |
+| `memory.enabled` | boolean | `true` | Search local notes vaults (Obsidian, Logseq, Foam) for `/fix` |
+| `memory.vaults` | string[] | none | Vault directories to search; a vault found above the working directory is searched as well |
+| `response_gate.enabled` | boolean | `true` | Refuse a tool call in the model's response that the role's deny list forbids, before the client can run it |
+| `response_gate.fail_closed` | boolean | `true` | When a deny list applies and the response will not parse, refuse it rather than forward it unchecked |
+| `response_gate.continue_after_refusal` | boolean | `false` | After refusing a call on a non-streaming response, ask the model to carry on without it, up to twice per request, instead of ending the agent's turn. Each continuation is another billed call. Streams, the Responses API and Gemini still end the turn |
+| `response_injection_snippet.enabled` | boolean | `true` | Keep a short, DLP-scrubbed excerpt around a prompt-injection pattern found in a response, so a finding can be reviewed |
+| `response_injection_snippet.window_bytes` | number | `200` | The excerpt's width, capped by the proxy |
+
+### Cloud providers (`intutic_settings.providers`)
+
+Where Bedrock, Vertex AI and Azure OpenAI requests go when no workspace credential applies. Each value falls back to the [environment variable](#cloud-providers) beside it. A secret is never written into this file: secret fields take an environment reference, `os.environ/NAME`, and a literal value stops the proxy at startup. Unknown keys are refused too, so a misspelt setting cannot be silently ignored.
+
+```yaml
+intutic_settings:
+  providers:
+    bedrock:
+      region: us-east-1
+    vertex:
+      project: my-project
+      location: global
+    azure:
+      endpoint: https://my-resource.openai.azure.com
+      api_key: os.environ/AZURE_OPENAI_API_KEY
+```
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `bedrock.region` | string | `AWS_REGION` | The AWS region |
+| `bedrock.api_key` | env ref | `AWS_BEARER_TOKEN_BEDROCK` | A Bedrock API key; without one, the AWS credential chain signs requests |
+| `bedrock.runtime_endpoint` | URL | `https://bedrock-runtime.<region>.amazonaws.com` | The Bedrock Runtime endpoint, such as a VPC interface endpoint |
+| `bedrock.mantle_endpoint` | URL | `https://bedrock-mantle.<region>.api.aws` | The endpoint for Claude Opus 4.7 and later |
+| `vertex.project` | string | `GOOGLE_CLOUD_PROJECT` | The Google Cloud project |
+| `vertex.location` | string | `global` | The location |
+| `vertex.credentials_file` | path | Application Default Credentials | A service-account or `authorized_user` key file |
+| `vertex.endpoint` | URL | by location | The API endpoint, such as a Private Service Connect address |
+| `azure.endpoint` | URL | `AZURE_OPENAI_ENDPOINT` | The resource URL |
+| `azure.api_key` | env ref | `AZURE_OPENAI_API_KEY` | The resource's API key |
+| `azure.tenant_id`, `azure.client_id` | string | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` | Microsoft Entra ID client credentials, with `client_secret` |
+| `azure.client_secret` | env ref | `AZURE_CLIENT_SECRET` | The Entra ID client secret |
+| `azure.managed_identity` | boolean | `false` | Authenticate with the host's managed identity (App Service, or the instance metadata service on VMs and AKS); `client_id` picks a user-assigned identity |
+
+### Policy check (`intutic_settings.policy`)
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `control_plane_url` | string | `CONTROL_PLANE_URL` | Where the pre-request policy check goes. `CONTROL_PLANE_URL` takes precedence |
+| `fail_closed` | boolean | `true` | Refuse the request (`403 policy_denied`) when the check fails or cannot be reached. `false` lets it through. It does not cover a [custom rule that reaches no verdict](/guide/wasm-rules#when-a-rule-reaches-no-verdict), which refuses with `403 GOVERNANCE_UNAVAILABLE` either way: an agent can cause that by padding its input |
+| `timeout_ms` | number | `3000` | How long the check may take |
+
+### DLP (`intutic_settings.dlp`)
+
+`enabled`, `scan_input`, `scan_output`, `stream_holdback_bytes`, custom `patterns` and the PII `detectors`: see [Policies › Enforcement](/guide/policies#enforcement).
+
+### Egress (`intutic_settings.egress`)
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `mode` | string | `off` | `off`, `monitor` or `enforce`; any other value stops the proxy at startup. `INTUTIC_EGRESS_MODE` takes precedence. See [Egress control](#egress-control) |
+| `allow` | string[] | none | Hosts, `.suffixes` and IP ranges to allow; `INTUTIC_EGRESS_ALLOW` adds to it |
+
+### Decision traffic (`intutic_settings.decision_traffic`) {#decision-traffic}
+
+Customer calls to decision models on `/v1/systemone` and `/v1/decisions`. See [Decision Traffic](/guide/decision-traffic).
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `mode` | string | `enforce` | `enforce` refuses a call to an unpinned model (`403 policy_denied`); `shadow` forwards it and logs `would_refuse_unpinned` |
+| `allow_unpinned` | boolean | `false` | Admit a model with no pinned version, such as `jev-latest` or `jev-preview` |
+| `floors` | map | none | The lowest acceptable top probability per question name, `*` for every question, each between 0 and 1 (another value stops the proxy at startup). A question answered below its floor is named in `x-intutic-decision-abstain` |
+| `consequential_models` | string[] | none | Models whose every call is answered with `x-intutic-decision-requires-human: 1` |
+| `systemone_upstream` | URL | `UPSTREAM_URL`, else `https://api.typesafe.ai` | Where `/v1/systemone` calls go |
+| `decisions_upstream` | URL | `UPSTREAM_URL`, else `https://api.openai.com` | Where `/v1/decisions` calls go |
+
+### Gateway (`intutic_settings.gateway`)
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `require_vk` | boolean | `false` | As `INTUTIC_GATEWAY_REQUIRE_VK`, which takes precedence |
+| `require_provisioned_key` | boolean | `false` | As `INTUTIC_GATEWAY_REQUIRE_PROVISIONED_KEY=true` |
+| `provisioned_key_paid_only` | boolean | `false` | With `require_provisioned_key`, apply it to paid workspaces only (`INTUTIC_GATEWAY_REQUIRE_PROVISIONED_KEY=paid`) |
+| `local_judge` | boolean | `false` | As `INTUTIC_GATEWAY_LOCAL_JUDGE`. Deprecated since 3.0, removed in 4.0 |
+
+### Tool-output compaction (`intutic_settings.snip_compactor`)
+
+Shrinks long tool output in non-streamed JSON responses after the DLP scan, and records the bytes saved on the trace.
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `enabled` | boolean | `true` | Master switch |
+| `max_tool_output_tokens` | number | `8192` | Truncate text longer than this (estimated at 4 characters a token) |
+| `collapse_repetitions_above` | number | `3` | Collapse a line repeated more than this many times |
+| `import_dedup` | boolean | `true` | Drop repeated import lines |
+| `stack_trace_dedup` | boolean | `true` | Collapse repeated stack frames |
+| `whitespace_normalize` | boolean | `true` | Collapse runs of blank space |
+| `json_max_array_items` | number | `3` | Keep this many items of a JSON array and summarize the rest |
+| `json_max_string_value_chars` | number | `20` | Cut longer JSON string values… |
+| `json_entropy_threshold` | number | `0.85` | …unless they look like identifiers (entropy above this, 0–1), which are kept whole |
+| `code_skeleton_enabled` | boolean | `true` | Reduce long code blocks to their signatures, types and imports |
+| `code_skeleton_min_lines` | number | `10` | The shortest block that is reduced |
+| `code_skeleton_incremental_cache` | boolean | `false` | Reuse the reduction of an identical block on the same thread |
+
+### Model Routing (`intutic_settings.routing`)
+
+Contextual bandit routing picks a model per request via Thompson sampling over a candidate pool. It is experimental and opt-in: nothing is routed until `enabled` or `mode: shadow` (standalone) or the workspace's `ff_bandit_routing` flag turns it on. See [Intelligent Model Routing](/guide/intelligent-routing#which-models-a-request-can-be-routed-to) for which candidates a request can reach.
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `enabled` | boolean | — | Enables bandit routing in standalone mode. Unset defers to the control plane; standalone, unset routes only under `mode: shadow` |
+| `candidate_models` | string[] | `claude-sonnet-5-5`, `gpt-4.1`, `gemini-3.8-flash` | Candidate model pool for Thompson sampling. A request is routed only when its model is a candidate or a dated snapshot or `-latest` alias of one; others bypass the bandit entirely. A workspace's `routingCandidates` setting replaces this list for that workspace. Each request only chooses among the candidates it can reach: one its format can be translated to, that the allowlists admit, within budget, with a credential, and listed by the workspace's key when that key's models are known. With a non-empty `model_list`, names it does not list are dropped at startup |
+| `mode` | string | `enforce` | `enforce` serves the routed model; `shadow` records what it would have picked and serves the requested one, and standalone turns routing on by itself unless `enabled` is `false` (which logs a warning at startup); `off` does not route |
+| `mirror_sample_rate` | number | `0` | Fraction of eligible non-streamed requests (at most `0.05`) also sent to the routed or mirror candidate, scored off the critical path. The copy goes to the candidate's own provider with that provider's credential; a candidate the request cannot reach as written, or has no credential for, is skipped and counted in `routing_targets_skipped`. Each mirrored request is paid for twice |
+| `mirror_candidate_model` | string | — | A model to mirror-test against live traffic, whether or not it is a candidate |
+| `anthropic_model_override` | string | — | When set, any Anthropic-bound model is rewritten to this ID after routing. Unset leaves the routed model untouched |
+| `sop_pin_max_age_secs` | number | `600` | How long a session's injected SOP text stays fixed, so the prompt prefix stays cacheable. `0` re-renders it on every request |
+| `cache_guard_max_age_secs` | number | `300` | How recent a prompt-cache observation must be for routing to keep a warm session on its model. `0` turns the guard off |
+| `cache_guard_min_read_bp` | number | `5000` | The cache-read share (basis points) that counts as warm |
+| `cache_guard_cold_start_prompt_bytes` | number | `20000` | On a session's first turn, a prompt larger than this stays on the requested model. A provider that reports no cache fields still ends the first turn, so later turns route. `0` turns this off |
+
+**Precedence:** when a control plane manages the workspace, the Valkey `ff_bandit_routing` feature flag is authoritative, and `ff_shadow_routing` decides shadow mode in place of `mode: shadow`. `routing.enabled` applies only to standalone deployments where no control plane manages the workspace.
+
+### Retries (`intutic_settings.routing.retry`)
+
+How the proxy retries a provider call that failed before any response reached the client. On by default. See [Retries and fallbacks](/guide/intelligent-routing#retries-and-fallbacks) for the rules.
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `enabled` | boolean | `true` | `false` makes one call per model; configured fallbacks still run after it fails |
+| `max_attempts` | number | `3` | Calls per model, the first included. At most `5` |
+| `initial_backoff_ms` | number | `500` | Upper bound of the first wait. Each wait is random between zero and a bound that doubles per attempt |
+| `max_backoff_ms` | number | `8000` | Cap on that bound. At most `60000` |
+| `budget_ms` | number | `30000` | Time for the whole request: every call, wait and fallback. A retry or fallback that cannot start inside it is not made (`time_budget` on the trace). At most `120000` |
+| `on_status` | number[] | `[429, 500, 502, 503, 504, 529]` | Statuses retried. Timeouts and failed connections are always retried |
+
+### Fallbacks (`intutic_settings.routing.fallbacks`)
+
+Ordered targets per model, tried when that model's retries run out on a retryable failure. Empty by default. Each key is the model that was sent upstream; each target has a `model`, a `provider` (`anthropic`, `openai`, `gemini`, `mistral`, `openrouter`, `deepseek`, `bedrock`, `vertex_ai` or `vertex`, `azure_openai` or `azure`), or both. The workspace setting takes the same providers. Up to five targets per model.
+
+A target that names only a provider sends the same model there. Between Anthropic's API, Bedrock and Vertex AI the model id is rewritten into the target's scheme: `claude-sonnet-4-5-20250929` becomes `vertex/claude-sonnet-4-5@20250929` on Vertex AI and, on Bedrock, the cross-region inference profile for the configured region (`bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0`; `eu.`, `apac.` or `global.` elsewhere), and an undated id such as `claude-opus-4-7` becomes `bedrock/anthropic.claude-opus-4-7`. Name the `model` as well when your account uses another inference profile.
+
+```yaml
+intutic_settings:
+  routing:
+    fallbacks:
+      claude-sonnet-4-5-20250929:
+        - provider: bedrock
+        - provider: vertex_ai
+```
+
+A workspace's `upstreamRetry` setting overrides any of these fields; the fields it leaves out keep the values here.
+
+### Reward Loop (`intutic_settings.routing.reward`)
+
+Rewards are computed only from signals the proxy already observes — upstream success, latency versus SLO, token anomaly, and cost ratio. No LLM judge is involved.
+
+| Setting | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `enabled` | boolean | `true` | Enables the local deterministic reward loop |
+| `latency_slo_ms` | number | `30000` | Latency SLO; responses slower than this are penalised proportionally. Includes full stream duration for streaming responses |
+| `latency_penalty` | number | `0.3` | Maximum reward deduction for exceeding the latency SLO |
+| `token_anomaly_penalty` | number | `0.2` | Reward deduction when the token-anomaly detector fires |
+| `cost_penalty` | number | `0.2` | Maximum reward deduction when the routed model costs more than the requested model would have |
+
+```yaml
+intutic_settings:
+  # Directory scanned for locally installed WASM rules
+  # (INTUTIC_WASM_DIR takes precedence over this value).
+  wasm_local_dir: "~/.intutic/wasm"
+
+  routing:
+    enabled: true
+    candidate_models: ["claude-sonnet-5-5", "gpt-4.1", "gemini-3.8-flash"]
+    reward:
+      enabled: true
+      latency_slo_ms: 30000
+      latency_penalty: 0.3
+      token_anomaly_penalty: 0.2
+      cost_penalty: 0.2
+    retry:
+      max_attempts: 3
+      budget_ms: 30000
+    fallbacks:
+      claude-opus-4-1:
+        - model: claude-sonnet-4-5
+        - model: deepseek-chat
+          provider: deepseek
+```

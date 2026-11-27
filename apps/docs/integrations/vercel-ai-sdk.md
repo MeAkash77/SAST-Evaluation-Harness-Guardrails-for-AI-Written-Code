@@ -1,0 +1,111 @@
+# Vercel AI SDK
+
+Integrate Intutic governance with the [Vercel AI SDK](https://ai-sdk.dev/) (`ai`, v6+).
+
+The Vercel AI SDK is governed on two independent surfaces, and — unlike almost every other harness in this catalog — **only one of them can be wired up without touching your code:**
+
+1. **Local tool execution** — SDK-side, via `toolApproval`. Wire this into `generateText`/`streamText`/`ToolLoopAgent` and it governs every tool call.
+2. **LLM egress** — **in-code only.** Read the limitation below before assuming this "just works" the way it does for every other harness.
+
+## Positioning vs. `@ai-sdk/policy-opa`
+
+Vercel ships its own first-party `toolApproval` adapter, [`@ai-sdk/policy-opa`](https://www.npmjs.com/package/@ai-sdk/policy-opa) (confirmed at v1.0.68, Apache-2.0). It evaluates Rego policies via [Open Policy Agent](https://www.openpolicyagent.org/) — either in-process WASM or a running OPA HTTP server — and maps the decision onto the same `ToolApprovalStatus` shape `toolApproval` already understands, with a `shadow()` wrapper for rolling out a new policy in observe-only mode before enforcing it.
+
+The two are adjacent, not competing: both attach a policy decision to an `ai`-package tool call. The difference is scope. `@ai-sdk/policy-opa` is a policy backend for the single `ai` package — it authors rules in Rego and evaluates them via OPA, with no reach outside a `toolApproval` callback. Intutic is a cross-framework, cross-harness governance layer: the same proxy, DLP scanner, budget ledger, and audit trail that gates this SDK's LLM egress and tool calls also gate the other 42 harnesses in this catalog (Claude Code, Cursor, LangChain, Strands, ...) from one control plane, with policies as plain files in git rather than compiled Rego bundles. A team already invested in OPA/Rego elsewhere in its stack may reasonably prefer `@ai-sdk/policy-opa` for `ai`-package-only tool gating; a team that needs one governance layer across an entire engineering org's tool sprawl — not just the `ai` package — is what Intutic is built for. Nothing prevents running both: `@intutic/gate/vercel`'s `intuticToolApproval()` composes with any other `toolApproval` callback the same way it composes with a human-in-the-loop `'user-approval'` status (see step 3 below).
+
+## Known, plain limitation: no environment-variable LLM routing
+
+Every other harness in this codebase that governs LLM egress does so by honouring `OPENAI_BASE_URL`/`ANTHROPIC_BASE_URL` (or an equivalent), which `.env.intutic`/`intutic exec` sets for you with zero code changes. **The Vercel AI SDK has no such mechanism.** Its providers (`@ai-sdk/openai`, `@ai-sdk/anthropic`, etc.) are constructed directly in your code, and the base URL they call is a constructor option, not an environment variable the SDK reads on its own.
+
+This means: `.env.intutic`'s `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL`/`INTUTIC_PROXY_URL` vars are written (a workspace may run other harnesses that DO honour them, and you're free to read them yourself), but sourcing that file does **nothing** to route Vercel AI SDK's own LLM calls through the Intutic proxy. Routing requires **in-code provider construction** — every place your application constructs a model provider must point it at the proxy explicitly. `withIntuticProxy()` (below) is a small wrapper for that; it is not a way to avoid it.
+
+## Setup
+
+### 1. Initialize Intutic
+
+```bash
+intutic init
+```
+
+```
+  ✔ vercel-ai-sdk → /path/to/project/.env.intutic
+```
+
+`intutic init` only detects the harness and records it in `~/.intutic/config.json`; it writes no harness files. The files described on this page are written by `intutic gates install` (open core, no control plane), from the rule sets in `.intutic/sops/` — see [What writes harness files](/integrations/#what-writes-harness-files):
+
+```bash
+intutic gates install
+```
+
+Detection requires `ai` at major version 6 or above (the `toolApproval` API this integration relies on is a v6+ surface) **and** at least one `@ai-sdk/*` provider package — `ai` alone declares the tool-loop surface but ships no model provider.
+
+### 2. Route LLM traffic through the proxy (in code — this is the only way)
+
+```bash
+npm install @intutic/gate
+```
+
+```ts
+import { createOpenAI } from '@ai-sdk/openai'
+import { withIntuticProxy } from '@intutic/gate/vercel'
+
+// Every provider construction call site in your app needs this —
+// there is no ambient env var that achieves the same effect.
+const openai = withIntuticProxy(createOpenAI)({ apiKey: process.env.OPENAI_API_KEY })
+const model = openai('gpt-5-mini')
+```
+
+`withIntuticProxy()` resolves the proxy URL the same way every other harness's env-writer does (`INTUTIC_PROXY_URL`, falling back to `http://localhost:4000`), appends `/v1`, and passes the result as `baseURL` to the provider factory you give it — `createOpenAI`, `createAnthropic`, or a compatible `@ai-sdk/*` `create*` export. Those providers append their endpoint path to `baseURL`, so requests reach the proxy's `/v1/chat/completions`, `/v1/responses` and `/v1/messages`. A URL that already ends in `/v1` (or `/v1beta`) is passed unchanged, so `/v1` is never doubled; `intuticProxyBaseUrl()` returns the same value if you construct a provider yourself. `createGateway` is not a target: the Vercel AI Gateway's protocol is not one the proxy parses.
+
+### 3. Gate local tool execution (SDK)
+
+The `ai` package exposes a documented pre-execution veto point — a `toolApproval` callback accepted by `generateText`, `streamText`, and `ToolLoopAgent` — which `intuticToolApproval()` implements. It was confirmed against the shipped types of `ai` 7.0.68 and is tested against the real `generateText()` loop on `ai` 7.0.127:
+
+```ts
+import { generateText } from 'ai'
+import { Gate, install } from '@intutic/gate'
+import { intuticToolApproval } from '@intutic/gate/vercel'
+
+install(new Gate({ workspaceId: process.env.INTUTIC_WORKSPACE_ID }))
+
+await generateText({
+  model,
+  tools,
+  toolApproval: intuticToolApproval(),
+})
+```
+
+On allow, this resolves to `'not-applicable'` — this gate has no opinion, and any other approval mechanism you've configured (e.g. a human-in-the-loop `'user-approval'` status for a specific tool) still applies. On deny, it resolves to `{ type: 'denied', reason }`, where `reason` is the `[Intutic Governance] BLOCKED: ...` message the SDK hands back to the model in place of a tool result — the tool's real implementation never runs.
+
+### 4. Trace attribution
+
+```ts
+import { intuticHeaders } from '@intutic/gate'
+
+const openai = withIntuticProxy(createOpenAI)({
+  apiKey: process.env.OPENAI_API_KEY,
+  headers: intuticHeaders({ sessionId: runId, harness: 'vercel-ai-sdk' }),
+})
+```
+
+## What gets written
+
+Same `.env.intutic` shape as every other SDK-gated framework — proxy URLs plus a pointer at `@intutic/gate/vercel`. **Unlike** the Python-SDK-gated family (LangChain, LangGraph, ...), sourcing this file does not route this framework's own LLM egress — see the limitation above.
+
+To undo what `intutic gates install` writes here, run `intutic disconnect --harness vercel-ai-sdk`: each file goes back to what it held before Intutic first wrote it, or is deleted if Intutic created it, and edits you made since are kept. `.env.intutic` stays while another harness that writes it is still connected. See [`intutic disconnect`](/reference/cli#intutic-disconnect).
+
+## What the adapter does NOT do
+
+Same structural gaps as every SDK-gated framework — see [LangGraph's "What the adapter does NOT do"](/integrations/langgraph#what-the-adapter-does-not-do). In short: there is no sync-daemon hook file, argument-level gating requires wiring the SDK into your own agent code, and `x-intutic-harness` attribution is client-supplied, not authorization. On top of that structural family, this integration is **not** "zero-code" for LLM-egress routing the way the rest of the catalog is — see the limitation above, stated plainly rather than oversold.
+
+## Config details
+
+| Property | Value |
+|----------|-------|
+| Harness type | `vercel-ai-sdk` |
+| Config file | `.env.intutic` |
+| Detection | `ai` at major version ≥ 6, plus any `@ai-sdk/*` package, in `package.json` (`dependencies`, `devDependencies`, or `peerDependencies`) |
+| Format | Shell environment variables (LLM-egress vars are inert for this framework unless read explicitly — see above) |
+| Write strategy | Atomic (write to `.intutic-tmp`, then rename) |
+| Tool gate | SDK-side (`@intutic/gate/vercel`'s `intuticToolApproval()`, the `ai` package's `toolApproval` option) — no sync-daemon hook file |
+| LLM-egress routing | In-code only (`@intutic/gate/vercel`'s `withIntuticProxy()`) — no environment-variable override exists for this framework |

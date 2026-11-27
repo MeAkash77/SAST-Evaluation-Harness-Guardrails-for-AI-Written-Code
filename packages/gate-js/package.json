@@ -1,0 +1,108 @@
+{
+  "name": "@intutic/gate",
+  "version": "3.2.3",
+  "description": "Intutic pre-execution tool gate for JS/TS agent frameworks without a shipped Intutic harness (Mastra, the Vercel AI SDK, LangChain.js, dsh, and hand-rolled agent loops)",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/intutic/intutic",
+    "directory": "packages/gate-js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./mastra": {
+      "import": "./dist/mastra.js",
+      "types": "./dist/mastra.d.ts"
+    },
+    "./vercel": {
+      "import": "./dist/vercel.js",
+      "types": "./dist/vercel.d.ts"
+    },
+    "./dsh": {
+      "import": "./dist/dsh.js",
+      "types": "./dist/dsh.d.ts"
+    },
+    "./openai": {
+      "import": "./dist/openai.js",
+      "types": "./dist/openai.d.ts"
+    },
+    "./eve": {
+      "import": "./dist/eve.js",
+      "types": "./dist/eve.d.ts"
+    },
+    "./harness": {
+      "import": "./dist/harness.js",
+      "types": "./dist/harness.d.ts"
+    },
+    "./workflow": {
+      "import": "./dist/workflow.js",
+      "types": "./dist/workflow.d.ts"
+    },
+    "./managed-agents": {
+      "import": "./dist/managedAgents.js",
+      "types": "./dist/managedAgents.d.ts"
+    },
+    "./trueforge": {
+      "import": "./dist/trueforge.js",
+      "types": "./dist/trueforge.d.ts"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "mastra": ["dist/mastra.d.ts"],
+      "vercel": ["dist/vercel.d.ts"],
+      "dsh": ["dist/dsh.d.ts"],
+      "openai": ["dist/openai.d.ts"],
+      "eve": ["dist/eve.d.ts"],
+      "harness": ["dist/harness.d.ts"],
+      "workflow": ["dist/workflow.d.ts"],
+      "managed-agents": ["dist/managedAgents.d.ts"],
+      "trueforge": ["dist/trueforge.d.ts"]
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "lint": "eslint src",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json && tsc -p tsconfig.response-types.json",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@ai-sdk/anthropic": "^4.0.44",
+    "@ai-sdk/harness": "^1.0.138",
+    "@anthropic-ai/sdk": "^0.131.0",
+    "@ai-sdk/openai": "^4.0.83",
+    "@ai-sdk/workflow": "^2.0.58",
+    "@mastra/core": "^1.74.0",
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@intutic/shared-types": "workspace:*",
+    "@openai/agents": "0.16.1",
+    "@openai/agents-realtime": "0.16.1",
+    "@truefoundry/trueforge-core": "^0.1.4",
+    "@types/node": "^22",
+    "ai": "^7.0.127",
+    "eve": "^0.71.0",
+    "typescript": "^5.5",
+    "vitest": "^4",
+    "workflow": "^5.0.1",
+    "zod": "^4.6.6"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

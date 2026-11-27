@@ -1,0 +1,632 @@
+#!/usr/bin/env node
+/**
+ * SOP policy became deliverable to the cluster proxy only once the
+ * manifests carried `INTUTIC_SOPS_DIR` and a non-optional `proxy-sops`
+ * ConfigMap mount — wiring introduced by hand-editing YAML, with nothing to
+ * catch a typo in a `configMapGenerator` reference, a broken overlay patch,
+ * or a kustomize syntax error before it reached a real cluster. `deploy.yml`
+ * never renders these manifests either: it deploys by `kubectl set image` on
+ * Deployments that already exist, so a change to `infra/kubernetes/` is
+ * otherwise applied for the first time by a human running `kubectl apply -k`
+ * by hand.
+ *
+ * This renders every overlay with the exact tool that would consume it and
+ * fails loudly on any error, then asserts the specific regression that
+ * wiring is prone to — the SOPS env var and its ConfigMap mount — so a bad edit to
+ * the proxy's k8s manifests fails here rather than silently shipping a proxy
+ * that resolves zero SOPs.
+ */
+import { execFileSync } from 'node:child_process'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { loadAll } from 'js-yaml'
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
+const OVERLAYS_DIR = join(ROOT, 'infra', 'kubernetes', 'overlays')
+const CELLS_REMOTE_DIR = join(ROOT, 'infra', 'kubernetes', 'cells-remote')
+
+if (!existsSync(OVERLAYS_DIR)) {
+  console.log('[skip] no infra/kubernetes/overlays in this tree')
+  process.exit(0)
+}
+
+try {
+  execFileSync('kubectl', ['version', '--client'], { stdio: 'ignore' })
+} catch {
+  console.error(
+    '✖ kubernetes manifests: `kubectl` is not on PATH — cannot render. Install kubectl ' +
+      '(its built-in kustomize is what `kubectl apply -k` uses in production).',
+  )
+  process.exit(1)
+}
+
+const overlays = ['dev', 'staging', 'prod']
+const failures = []
+let proxyChecked = false
+let gatewayChecked = false
+let upstreamsChecked = 0
+
+/**
+ * A provider upstream (`OPENAI_UPSTREAM_URL`, `UPSTREAM_URL`, ...) that points
+ * at the in-cluster LiteLLM. Until 2026-10-10 the hosted proxy sent every
+ * OpenAI-family request to http://litellm:4000, which serves only the
+ * self-hosted judge aliases and rejects customer keys: each one failed 401.
+ */
+function upstreamProblems(where, docs) {
+  const problems = []
+  for (const d of docs) {
+    const pod = d.spec?.template?.spec
+    for (const c of [...(pod?.initContainers ?? []), ...(pod?.containers ?? [])]) {
+      for (const e of c.env ?? []) {
+        if (!/(^|_)UPSTREAM_URL$/.test(e.name) || typeof e.value !== 'string') continue
+        upstreamsChecked++
+        let host = ''
+        try {
+          host = new URL(e.value).hostname
+        } catch {
+          continue
+        }
+        if (host === 'litellm' || host.startsWith('litellm.')) {
+          problems.push(
+            `${where}: ${d.kind} ${d.metadata?.name} sets ${e.name}=${e.value}, the in-cluster LiteLLM — it serves ` +
+              'only the self-hosted judge aliases and rejects customer keys. Use the provider\'s public API.',
+          )
+        }
+      }
+    }
+  }
+  return problems
+}
+
+/** Template values: `changeme`, `REPLACE_WITH_…`, `your-…`, `xxx…` (control-plane secretStrength.ts). */
+function isPlaceholder(value) {
+  const v = value.trim().toLowerCase()
+  return (
+    ['changeme', 'change-me', 'change_me', 'secret', 'password', 'example', 'test', 'dev', 'placeholder'].includes(v) ||
+    /^(changeme|replace[_-]with|your[-_])/.test(v) ||
+    /^x{3,}$/.test(v)
+  )
+}
+
+/**
+ * A rendered Secret holding a placeholder, alone or as the password of a
+ * connection URL. The staging overlay rendered control-plane-secrets with
+ * `changeme` into the live namespace: applying it would replace the real JWT_SECRET
+ * and ENCRYPTION_KEY with a value anyone could forge tokens with.
+ */
+function placeholderSecretProblems(where, docs) {
+  const problems = []
+  for (const d of docs.filter((doc) => doc.kind === 'Secret')) {
+    const entries = [
+      ...Object.entries(d.data ?? {}).map(([k, v]) => [k, Buffer.from(String(v), 'base64').toString('utf8')]),
+      ...Object.entries(d.stringData ?? {}).map(([k, v]) => [k, String(v)]),
+    ]
+    for (const [key, value] of entries) {
+      let password = ''
+      try {
+        password = decodeURIComponent(new URL(value).password)
+      } catch {
+        // Not a URL.
+      }
+      if (isPlaceholder(value) || (password && isPlaceholder(password))) {
+        problems.push(
+          `${where}: Secret ${d.metadata?.name} renders a placeholder value for ${key}. Create real secrets ` +
+            'out of band; never apply a template Secret.',
+        )
+      }
+    }
+  }
+  return problems
+}
+
+/**
+ * Transport security for the hosted stack (docs/runbooks/tls-hardening-rollout.md).
+ * Until 2026-10-14 every external Ingress answered plain HTTP and TLS 1.1 (no
+ * FrontendConfig), no response carried HSTS, Postgres ran with ssl off, and
+ * Valkey took commands from any pod that could reach it, with VALKEY_URL in a
+ * ConfigMap. Each rule below holds whenever the overlay renders the object it
+ * is about, so an overlay that deletes postgres or valkey (prod's HA swap) is
+ * not asked for them.
+ */
+const HSTS = /^Strict-Transport-Security:\s*max-age=(\d+)/i
+const transportChecked = { ingresses: 0, postgres: 0, valkey: 0 }
+
+function transportSecurityProblems(where, docs) {
+  const problems = []
+  const byKind = (kind) => docs.filter((d) => d.kind === kind)
+  const named = (kind, name) => byKind(kind).find((d) => d.metadata?.name === name)
+
+  for (const ing of byKind('Ingress')) {
+    const ann = ing.metadata?.annotations ?? {}
+    if (ann['kubernetes.io/ingress.class'] !== 'gce') continue
+    transportChecked.ingresses += 1
+    const label = `${where}: Ingress ${ing.metadata.name}`
+    const fcName = ann['networking.gke.io/v1beta1.FrontendConfig']
+    const fc = fcName && named('FrontendConfig', fcName)
+    if (!fc) {
+      problems.push(`${label} has no FrontendConfig (annotation networking.gke.io/v1beta1.FrontendConfig naming one this overlay renders): it would serve plain HTTP and the load balancer's default TLS policy.`)
+    } else {
+      if (fc.spec?.redirectToHttps?.enabled !== true) {
+        problems.push(`${label}: FrontendConfig ${fcName} does not set redirectToHttps.enabled: true.`)
+      }
+      if (!fc.spec?.sslPolicy) {
+        problems.push(`${label}: FrontendConfig ${fcName} names no sslPolicy, so TLS 1.0/1.1 stay accepted.`)
+      }
+    }
+    // Every backend Service this overlay renders must send HSTS through its
+    // BackendConfig. A Service from another repository (the website) is not
+    // in the render and is checked there.
+    const backends = new Set()
+    for (const rule of ing.spec?.rules ?? []) {
+      for (const path of rule.http?.paths ?? []) {
+        if (path.backend?.service?.name) backends.add(path.backend.service.name)
+      }
+    }
+    for (const svcName of backends) {
+      const svc = named('Service', svcName)
+      if (!svc) continue
+      let bcName
+      try {
+        const raw = svc.metadata?.annotations?.['cloud.google.com/backend-config']
+        bcName = raw ? JSON.parse(raw).default : undefined
+      } catch {
+        bcName = undefined
+      }
+      const bc = bcName && named('BackendConfig', bcName)
+      const headers = bc?.spec?.customResponseHeaders?.headers ?? []
+      const hsts = headers.map((h) => HSTS.exec(h)).find(Boolean)
+      if (!hsts || Number(hsts[1]) < 31536000) {
+        problems.push(`${label} routes to Service ${svcName}, whose BackendConfig ${bcName ?? '(none)'} adds no Strict-Transport-Security header with max-age of at least a year.`)
+      }
+    }
+  }
+
+  const pg = named('StatefulSet', 'postgres')
+  if (pg) {
+    transportChecked.postgres += 1
+    const c = (pg.spec?.template?.spec?.containers ?? []).find((x) => x.name === 'postgres')
+    const args = (c?.args ?? []).join(' ')
+    for (const want of ['ssl=on', 'ssl_min_protocol_version=TLSv1.2', 'hba_file=']) {
+      if (!args.includes(want)) problems.push(`${where}: postgres runs without ${want} in its args.`)
+    }
+    const hba = named('ConfigMap', 'postgres-hba')?.data?.['pg_hba.conf'] ?? ''
+    if (!/^hostssl\s+all\s+all\s+all\s+scram-sha-256\s*$/m.test(hba)) {
+      problems.push(`${where}: the postgres-hba ConfigMap has no "hostssl all all all scram-sha-256" rule.`)
+    }
+    if (!/^hostnossl\s+all\s+all\s+all\s+reject\s*$/m.test(hba)) {
+      problems.push(`${where}: the postgres-hba ConfigMap has no "hostnossl all all all reject" rule.`)
+    }
+  }
+
+  const valkey = named('Deployment', 'valkey')
+  if (valkey) {
+    transportChecked.valkey += 1
+    const c = (valkey.spec?.template?.spec?.containers ?? []).find((x) => x.name === 'valkey')
+    if (!(c?.args ?? []).includes('--aclfile')) {
+      problems.push(`${where}: valkey runs without --aclfile, so it accepts commands from any client.`)
+    }
+    // VALKEY_URL carries the password: from a Secret only, never a literal or
+    // a ConfigMap.
+    for (const d of docs) {
+      const pod = d.spec?.template?.spec
+      for (const ct of [...(pod?.initContainers ?? []), ...(pod?.containers ?? [])]) {
+        for (const e of ct.env ?? []) {
+          if (e.name === 'VALKEY_URL' && !e.valueFrom?.secretKeyRef) {
+            problems.push(`${where}: ${d.kind} ${d.metadata?.name} container ${ct.name} sets VALKEY_URL from somewhere other than a Secret.`)
+          }
+        }
+      }
+      if (d.kind === 'ConfigMap' && d.data && 'VALKEY_URL' in d.data) {
+        problems.push(`${where}: ConfigMap ${d.metadata?.name} carries VALKEY_URL; it holds the Valkey password and belongs in the valkey-auth Secret.`)
+      }
+    }
+  }
+  return problems
+}
+
+for (const overlay of overlays) {
+  const dir = join(OVERLAYS_DIR, overlay)
+  if (!existsSync(dir)) {
+    failures.push(`overlay "${overlay}" is missing from infra/kubernetes/overlays`)
+    continue
+  }
+  let rendered
+  try {
+    rendered = execFileSync('kubectl', ['kustomize', dir], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+  } catch (err) {
+    failures.push(`overlay "${overlay}" failed to render:\n${err.stderr || err.message}`)
+    continue
+  }
+
+  const overlayDocs = loadAll(rendered).filter((d) => d != null)
+  failures.push(...upstreamProblems(`overlay "${overlay}"`, overlayDocs))
+  failures.push(...placeholderSecretProblems(`overlay "${overlay}"`, overlayDocs))
+  failures.push(...transportSecurityProblems(`overlay "${overlay}"`, overlayDocs))
+
+  // The regression this gate exists to catch: SOP policy silently
+  // undeliverable to the cluster proxy. Only assert on overlays that carry a
+  // proxy deployment at all — a future overlay without one should not be
+  // forced to declare SOPS wiring it has no use for.
+  if (/kind:\s*Deployment/.test(rendered) && /name:\s*proxy\b/.test(rendered)) {
+    proxyChecked = true
+    // Anchored to the env-entry `name:` field, not a bare substring search —
+    // `INTUTIC_SOPS_DIR_TYPO` contains `INTUTIC_SOPS_DIR` too, and a
+    // substring match would call that a pass. This was caught by the
+    // verify-by-neutralisation pass this gate is required to survive: it
+    // renamed the var and the first version of this check stayed green.
+    if (!/^\s*- name:\s*INTUTIC_SOPS_DIR\s*$/m.test(rendered)) {
+      failures.push(
+        `overlay "${overlay}" renders a proxy Deployment with no INTUTIC_SOPS_DIR env var — ` +
+          `SOP policy would silently resolve to nothing in this cluster.`,
+      )
+    }
+    // Same anchoring concern: the generated ConfigMap resource is named
+    // `proxy-sops-<hash>` by configMapGenerator, and a bare substring/prefix
+    // match would treat that resource existing as proof the pod's *volume*
+    // (whose own name is the literal `proxy-sops`, unhashed) is still wired.
+    // It is a separate field — deleting the volume or its mount would still
+    // leave the hashed ConfigMap name elsewhere in the same document. No
+    // leading `- ` here (unlike the env entry above): both the volumeMount's
+    // and the volume's `name:` are continuation keys of a multi-field list
+    // item (`- mountPath: ...` / `- configMap: ...`), never the item's own
+    // first key, so requiring a dash on this line would never match either.
+    if (!/^\s+name:\s*proxy-sops\s*$/m.test(rendered)) {
+      failures.push(
+        `overlay "${overlay}" renders a proxy Deployment with no proxy-sops volume mount — ` +
+          `INTUTIC_SOPS_DIR would point at a directory nothing populated.`,
+      )
+    }
+  }
+
+  // gateway.intutic.ai rides the primary `intutic-ingress` (one load balancer fewer)
+  // on its OWN ManagedCertificate, `intutic-gateway-cert`, listed beside the primary
+  // one. The invariant: the gateway domain never joins the primary cert. A domain
+  // change re-issues a ManagedCertificate, which would put the domains already on it
+  // (api/app) in the blast radius of the gateway's.
+  const docs = rendered.split('---')
+  const primary = docs.find((d) => /kind:\s*Ingress/.test(d) && /name:\s*intutic-ingress\s*$/m.test(d)) ?? ''
+  if (/host:\s*gateway\.intutic\.ai\b/.test(primary)) {
+    gatewayChecked = true
+    if (!/networking\.gke\.io\/managed-certificates:[^\n]*\bintutic-gateway-cert\b/.test(primary)) {
+      failures.push(
+        `overlay "${overlay}" routes gateway.intutic.ai on intutic-ingress without listing ` +
+          `intutic-gateway-cert in its managed-certificates — the gateway would have no valid TLS.`,
+      )
+    }
+    for (const doc of docs) {
+      if (/kind:\s*ManagedCertificate/.test(doc) && !/name:\s*intutic-gateway-cert\b/.test(doc)
+        && /^\s*-\s*gateway\.intutic\.ai\s*$/m.test(doc)) {
+        failures.push(
+          `overlay "${overlay}" adds gateway.intutic.ai to another ManagedCertificate — it must ` +
+            `stay on intutic-gateway-cert alone, so the primary cert is never re-issued for it.`,
+        )
+      }
+    }
+  }
+  if (/kind:\s*ManagedCertificate/.test(rendered) && /name:\s*intutic-gateway-cert\b/.test(rendered)) {
+    const doc = rendered.split('---').find((d) => /name:\s*intutic-gateway-cert\b/.test(d)) ?? ''
+    if (!/^\s*-\s*gateway\.intutic\.ai\s*$/m.test(doc)) {
+      failures.push(
+        `overlay "${overlay}"'s intutic-gateway-cert ManagedCertificate does not declare ` +
+          `gateway.intutic.ai — TLS for the gateway would never validate.`,
+      )
+    }
+  }
+}
+
+// The cells namespace kustomization (applied on its own, not by an overlay):
+// its Gateway must keep the same TLS floor as the Ingresses.
+const CELLS_DIR = join(ROOT, 'infra', 'kubernetes', 'cells')
+let cellsTlsChecked = false
+if (existsSync(join(CELLS_DIR, 'kustomization.yaml'))) {
+  try {
+    const docs = loadAll(execFileSync('kubectl', ['kustomize', CELLS_DIR], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }))
+      .filter((d) => d != null)
+    const policy = docs.find(
+      (d) => d.kind === 'GCPGatewayPolicy' && d.spec?.targetRef?.kind === 'Gateway' && d.spec?.targetRef?.name === 'intutic-cells-gateway',
+    )
+    cellsTlsChecked = true
+    if (!policy?.spec?.default?.sslPolicy) {
+      failures.push('infra/kubernetes/cells renders no GCPGatewayPolicy with an sslPolicy for intutic-cells-gateway: the cells load balancer would keep accepting TLS 1.0/1.1.')
+    }
+  } catch (err) {
+    failures.push(`infra/kubernetes/cells failed to render:\n${err.stderr || err.message}`)
+  }
+}
+
+// Remote cells regions (multi-region cells): each infra/kubernetes/
+// cells-remote/<region>/ is its own standalone kustomization applied against
+// a remote cluster (or, for *-sim, the us cluster) — render each with the
+// same tool `kubectl apply -k` would use. Their gateway-bootstrap.yaml files
+// are DELIBERATELY excluded from the kustomizations (applied once by the
+// runbook, never re-applied — see the file headers), so rendering never
+// touches them; YAML-parse them directly instead so a syntax error can't
+// hide in the one file the render gate would otherwise never read.
+let cellsRemoteRendered = 0
+if (existsSync(CELLS_REMOTE_DIR)) {
+  for (const entry of readdirSync(CELLS_REMOTE_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const dir = join(CELLS_REMOTE_DIR, entry.name)
+    if (existsSync(join(dir, 'kustomization.yaml'))) {
+      try {
+        execFileSync('kubectl', ['kustomize', dir], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+        cellsRemoteRendered += 1
+      } catch (err) {
+        failures.push(`cells-remote "${entry.name}" failed to render:\n${err.stderr || err.message}`)
+      }
+    }
+    const bootstrap = join(dir, 'gateway-bootstrap.yaml')
+    if (existsSync(bootstrap)) {
+      try {
+        const docs = loadAll(readFileSync(bootstrap, 'utf8')).filter((d) => d != null)
+        // A truncated file parses "cleanly" as fewer documents — assert the
+        // bootstrap still carries a Gateway so the parse isn't vacuous.
+        if (!docs.some((d) => d.kind === 'Gateway')) {
+          failures.push(
+            `cells-remote "${entry.name}"'s gateway-bootstrap.yaml parses but contains no Gateway document.`,
+          )
+        }
+      } catch (err) {
+        failures.push(`cells-remote "${entry.name}"'s gateway-bootstrap.yaml is not valid YAML:\n${err.message}`)
+      }
+    }
+  }
+}
+
+/**
+ * A pre-install hook runs before Helm creates the release's ordinary
+ * resources, so anything it uses must either come from outside the chart (a
+ * Secret the operator creates first) or be a pre-install hook itself with a
+ * lower weight. Until 2026-10-08 the Self-host migration Job ran as the chart's
+ * ordinary ServiceAccount: every fresh `helm install` waited on a Job whose
+ * pods the API server refused ("serviceaccount not found") until it timed out.
+ */
+function preInstallHookProblems(chart, docs) {
+  const hookOf = (d) => {
+    const a = d.metadata?.annotations ?? {}
+    const phases = String(a['helm.sh/hook'] ?? '').split(',').map((p) => p.trim())
+    return { preInstall: phases.includes('pre-install'), weight: Number(a['helm.sh/hook-weight'] ?? 0) }
+  }
+  const rendered = new Map(docs.map((d) => [`${d.kind}/${d.metadata?.name}`, d]))
+  const problems = []
+  for (const d of docs) {
+    const hook = hookOf(d)
+    const pod = d.spec?.template?.spec
+    if (!hook.preInstall || !pod) continue
+    const containers = [...(pod.initContainers ?? []), ...(pod.containers ?? [])]
+    const refs = [
+      ['ServiceAccount', pod.serviceAccountName],
+      ...(pod.imagePullSecrets ?? []).map((s) => ['Secret', s.name]),
+      ...(pod.volumes ?? []).flatMap((v) => [['Secret', v.secret?.secretName], ['ConfigMap', v.configMap?.name]]),
+      ...containers.flatMap((c) => [
+        ...(c.envFrom ?? []).flatMap((e) => [['Secret', e.secretRef?.name], ['ConfigMap', e.configMapRef?.name]]),
+        ...(c.env ?? []).flatMap((e) => [
+          ['Secret', e.valueFrom?.secretKeyRef?.name],
+          ['ConfigMap', e.valueFrom?.configMapKeyRef?.name],
+        ]),
+      ]),
+    ]
+    for (const [kind, name] of refs) {
+      const target = name && rendered.get(`${kind}/${name}`)
+      if (!target) continue
+      const dep = hookOf(target)
+      if (!dep.preInstall || dep.weight >= hook.weight) {
+        problems.push(
+          `chart ${chart}: pre-install hook ${d.kind} ${d.metadata.name} uses ${kind} ${name}, which the chart ` +
+            `creates ${dep.preInstall ? 'in the same or a later hook weight' : 'as an ordinary resource'} — ` +
+            'it does not exist yet when the hook runs on a fresh install',
+        )
+      }
+    }
+  }
+  return problems
+}
+
+/**
+ * The gateway chart's local judge, rendered with a real config. Until
+ * 2026-10-08 the LiteLLM container set `command:` (replacing the image's
+ * entrypoint, so it never started) and the chart rendered `model_list: []`
+ * whenever no ConfigMap was named, so every judge call failed.
+ */
+function localJudgeProblems(docs) {
+  const problems = []
+  const byComponent = (c) => docs.find((d) => d.kind === 'Deployment' && d.metadata.labels['app.kubernetes.io/component'] === c)
+  const container = byComponent('litellm')?.spec.template.spec.containers[0]
+  if (!container) return ['chart intutic-gateway renders no LiteLLM Deployment with litellm.enabled=true']
+  if (container.command) problems.push("chart intutic-gateway: LiteLLM sets `command`, replacing the image's entrypoint — pass `args`")
+  const configMap = docs.find((d) => d.kind === 'ConfigMap' && d.metadata.name.endsWith('-litellm-config'))
+  const models = (loadAll(configMap?.data?.['config.yaml'] ?? '')[0]?.model_list ?? []).map((m) => m.model_name)
+  if (!models.includes('intutic-openweight-judge')) {
+    problems.push(`chart intutic-gateway: the rendered LiteLLM config serves [${models.join(', ')}], not the judge model it was given`)
+  }
+  const env = Object.fromEntries((byComponent('proxy')?.spec.template.spec.containers[0].env ?? []).map((e) => [e.name, e.value]))
+  if (env.LITELLM_LOCAL_JUDGE_MODEL !== 'intutic-openweight-judge') problems.push('chart intutic-gateway: the proxy is not told the local judge model')
+  // With LiteLLM on and no config at all, the chart must refuse to render
+  // rather than deploy a LiteLLM that answers nothing.
+  try {
+    execFileSync('helm', ['template', 't', join(HELM_DIR, 'intutic-gateway'), '--set', 'litellm.enabled=true'], { stdio: 'pipe' })
+    problems.push('chart intutic-gateway renders litellm.enabled=true with no LiteLLM config')
+  } catch {
+    // Refused, as it should be.
+  }
+  return problems
+}
+
+/**
+ * The gateway chart's decide model, rendered for one variant. The proxy's
+ * engine must name the chart's own Service, and the engine's host guard must
+ * list that name: a Service name is neither loopback nor a private address,
+ * so an unlisted one is refused, and every enforcing decide rule then refuses
+ * its calls.
+ */
+function decideModelProblems(docs, variant) {
+  const problems = []
+  const where = `chart intutic-gateway (decideModel.variant=${variant})`
+  const byComponent = (c) => docs.find((d) => d.kind === 'Deployment' && d.metadata.labels['app.kubernetes.io/component'] === c)
+  const deployment = byComponent('decide-model')
+  const container = deployment?.spec.template.spec.containers[0]
+  if (!container) return [`${where} renders no decide-model Deployment`]
+  if (!/@sha256:[0-9a-f]{64}$/.test(container.image)) problems.push(`${where}: the model server's image ${container.image} is not pinned by digest`)
+  const name = deployment.metadata.name
+  if (!docs.some((d) => d.kind === 'Service' && d.metadata.name === name)) problems.push(`${where} renders no Service ${name}`)
+  const env = Object.fromEntries((byComponent('proxy')?.spec.template.spec.containers[0].env ?? []).map((e) => [e.name, e.value]))
+  let host = ''
+  try {
+    host = new URL(env.INTUTIC_DECIDE_ENGINE_URL).hostname
+  } catch {
+    // Reported below.
+  }
+  if (host !== name) problems.push(`${where}: the proxy's INTUTIC_DECIDE_ENGINE_URL (${env.INTUTIC_DECIDE_ENGINE_URL}) is not the ${name} Service`)
+  const listed = (env.INTUTIC_SELF_HOSTED_DECISION_HOSTS ?? '').split(',').map((h) => h.trim())
+  if (!listed.includes(name)) problems.push(`${where}: INTUTIC_SELF_HOSTED_DECISION_HOSTS does not list ${name}, so the engine refuses it`)
+  if (env.INTUTIC_DECIDE_MODEL !== 'decide-test' || !env.INTUTIC_DECIDE_MODEL_DIGEST) {
+    problems.push(`${where}: the proxy is not told the decide model and its digest`)
+  }
+  if (variant === 'cpu' && !String(container.args?.[0] ?? '').includes('sha256sum -c')) {
+    problems.push(`${where}: llama.cpp starts without checking the weights against the digest`)
+  }
+  if (variant === 'gpu' && !container.resources?.limits?.['nvidia.com/gpu']) problems.push(`${where}: vLLM asks for no GPU`)
+  return problems
+}
+
+// ── Helm charts (Self-host) ──────────────────────────────────────────────────
+// tools/helm/intutic is how a Self-host customer installs on Kubernetes, and
+// nothing deploys it here, so a broken template would first fail on their
+// cluster. Until 2026-10-07 it templated only the control plane, probed a
+// /health route the control plane does not serve, and named a ServiceAccount
+// it never created. Render both charts and hold the Self-host chart to the
+// shape the product needs.
+const HELM_DIR = join(ROOT, 'tools', 'helm')
+let helmCharts = 0
+if (existsSync(HELM_DIR)) {
+  try {
+    execFileSync('helm', ['version', '--short'], { stdio: 'ignore' })
+  } catch {
+    failures.push('`helm` is not on PATH — cannot render tools/helm. Install Helm 3.')
+  }
+  // The gateway chart renders twice: as installed by default, and with the
+  // local judge on, given the compose stack's litellm_config.yaml as its
+  // config (`--set-file`, as `intutic judge configure` tells users to).
+  const localJudge = [
+    '--set', 'litellm.enabled=true', '--set', 'proxy.localJudge=true',
+    '--set', 'litellm.judgeModel=intutic-openweight-judge',
+    '--set-file', `litellm.config=${join(ROOT, 'infra', 'compose', 'litellm_config.yaml')}`,
+  ]
+  // And with its decide model, in each variant.
+  const decideModel = (variant, digest) => [
+    '--set', 'decideModel.enabled=true', '--set', `decideModel.variant=${variant}`,
+    '--set', 'decideModel.model=decide-test', '--set', `decideModel.digest=${digest}`,
+    '--set', 'decideModel.weights.existingClaim=decide-weights', '--set', 'decideModel.weights.path=weights',
+  ]
+  const decideCpu = decideModel('cpu', `sha256:${'0'.repeat(64)}`)
+  const decideGpu = decideModel('gpu', 'hf:example/model@main')
+  const charts = [
+    ['intutic', ['--set', 'hostname=intutic.example.internal', '--set', 'ingress.tls.secretName=tls', '--set', 'bootstrap.secretName=owner']],
+    ['intutic-gateway', []],
+    ['intutic-gateway', localJudge],
+    ['intutic-gateway', decideCpu],
+    ['intutic-gateway', decideGpu],
+  ]
+  if (existsSync(join(HELM_DIR, 'intutic-gateway'))) {
+    // Enabled with no model, the chart must refuse to render rather than
+    // deploy a model server the proxy cannot name.
+    try {
+      execFileSync('helm', ['template', 't', join(HELM_DIR, 'intutic-gateway'), '--set', 'decideModel.enabled=true'], { stdio: 'pipe' })
+      failures.push('chart intutic-gateway renders decideModel.enabled=true with no model')
+    } catch {
+      // Refused, as it should be.
+    }
+  }
+  for (const [chart, args] of charts) {
+    const dir = join(HELM_DIR, chart)
+    if (!existsSync(dir)) {
+      failures.push(`chart tools/helm/${chart} is missing`)
+      continue
+    }
+    let rendered
+    try {
+      execFileSync('helm', ['lint', dir, ...args], { encoding: 'utf8', stdio: 'pipe' })
+      rendered = execFileSync('helm', ['template', 't', dir, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+    } catch (err) {
+      failures.push(`chart ${chart} failed to lint or render:\n${err.stderr || err.stdout || err.message}`)
+      continue
+    }
+    helmCharts++
+    const docs = loadAll(rendered).filter((d) => d != null)
+    const containers = docs.flatMap((d) => d.spec?.template?.spec?.containers ?? [])
+    if (containers.some((c) => (c.env ?? []).some((e) => e.name === 'OFFLINE_MODE'))) {
+      failures.push(`chart ${chart} still sets OFFLINE_MODE, which nothing reads`)
+    }
+    const accounts = new Set(docs.filter((d) => d.kind === 'ServiceAccount').map((d) => d.metadata.name))
+    for (const d of docs) {
+      const sa = d.spec?.template?.spec?.serviceAccountName
+      if (sa && !accounts.has(sa)) failures.push(`chart ${chart}: ${d.kind} ${d.metadata.name} runs as ServiceAccount ${sa}, which the chart does not create`)
+    }
+    failures.push(...preInstallHookProblems(chart, docs))
+    failures.push(...upstreamProblems(`chart ${chart}`, docs))
+    failures.push(...placeholderSecretProblems(`chart ${chart}`, docs))
+    if (args === localJudge) failures.push(...localJudgeProblems(docs))
+    if (args === decideCpu) failures.push(...decideModelProblems(docs, 'cpu'))
+    if (args === decideGpu) failures.push(...decideModelProblems(docs, 'gpu'))
+    if (chart !== 'intutic') continue
+    const deployments = new Map(docs.filter((d) => d.kind === 'Deployment').map((d) => [d.metadata.labels['app.kubernetes.io/component'], d]))
+    for (const c of ['control-plane', 'proxy', 'dashboard', 'docs', 'valkey']) {
+      if (!deployments.has(c)) failures.push(`chart intutic renders no ${c} Deployment`)
+    }
+    const cp = deployments.get('control-plane')?.spec.template.spec.containers[0]
+    if (cp) {
+      const env = Object.fromEntries((cp.env ?? []).map((e) => [e.name, e.value]))
+      if (env.INTUTIC_DEPLOYMENT !== 'self_host') failures.push('chart intutic: the control plane is not INTUTIC_DEPLOYMENT=self_host')
+      if (!env.INTUTIC_LICENSE_FILE) failures.push('chart intutic: the control plane has no INTUTIC_LICENSE_FILE')
+      if (cp.livenessProbe?.httpGet?.path !== '/healthz' || cp.readinessProbe?.httpGet?.path !== '/readyz') {
+        failures.push('chart intutic: the control plane must probe /healthz (liveness) and /readyz (readiness)')
+      }
+    }
+    const ingress = docs.find((d) => d.kind === 'Ingress')
+    const paths = new Set((ingress?.spec.rules[0].http.paths ?? []).map((p) => p.path))
+    for (const p of ['/', '/api', '/scim', '/.well-known', '/v1', '/docs']) {
+      if (!paths.has(p)) failures.push(`chart intutic: the Ingress does not route ${p}`)
+    }
+  }
+}
+
+if (!proxyChecked) {
+  failures.push(
+    'no overlay rendered a proxy Deployment — the SOPS-wiring regression check never ran. ' +
+      'A vacuous pass here is worse than no check.',
+  )
+}
+if (!gatewayChecked) {
+  failures.push(
+    'no overlay rendered intutic-ingress with a gateway.intutic.ai rule — the gateway ' +
+      'cert-isolation check never ran. A vacuous pass here is worse than no check.',
+  )
+}
+
+if (transportChecked.ingresses === 0 || transportChecked.postgres === 0 || transportChecked.valkey === 0) {
+  failures.push(
+    `the transport-security checks did not all run (Ingresses ${transportChecked.ingresses}, postgres ${transportChecked.postgres}, ` +
+      `valkey ${transportChecked.valkey}) — a vacuous pass here is worse than no check.`,
+  )
+}
+if (existsSync(CELLS_DIR) && !cellsTlsChecked) {
+  failures.push('infra/kubernetes/cells exists but its TLS policy check never ran.')
+}
+
+if (upstreamsChecked === 0) {
+  failures.push('no rendered workload sets a *_UPSTREAM_URL — the LiteLLM-upstream check never ran.')
+}
+
+if (failures.length > 0) {
+  console.error(`✖ kubernetes manifests: ${failures.length} problem(s)\n`)
+  for (const f of failures) console.error(`    ${f}\n`)
+  process.exit(1)
+}
+
+console.log(
+  `[PASS] kubernetes manifests: ${overlays.length} overlay(s), ${cellsRemoteRendered} cells-remote ` +
+    `kustomization(s) and ${helmCharts} Helm chart render(s) pass, SOPS wiring intact, ` +
+    `${upstreamsChecked} provider upstream(s) off LiteLLM, no placeholder Secret, ` +
+    `${transportChecked.ingresses} Ingress(es) HTTPS-only with HSTS, Postgres TLS and Valkey auth wired.`,
+)

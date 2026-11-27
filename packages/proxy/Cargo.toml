@@ -1,0 +1,194 @@
+[package]
+name = "intutic-proxy"
+version = "3.2.3"
+edition = "2021"
+authors = ["Intutic <eng@intutic.dev>"]
+description = "High-performance AI agent proxy with WebAssembly-based governance policies"
+license = "MIT"
+# Ships as release binaries and the @intutic/proxy npm launcher, never as a
+# crate: nothing outside this repository builds against it.
+publish = false
+
+[features]
+default = []
+# The clients that talk to the Intutic control plane: gateway heartbeat, key
+# and policy lookups, the judge, decide uploads, SOP and hold sync. Off by
+# default: the open-core proxy builds and runs standalone without them, and a
+# build without the feature refuses to start when a control plane is
+# configured (src/main.rs). Intutic's own images build with it on.
+control-plane = []
+
+[lib]
+name = "intutic_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "intutic-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros", "http2"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+
+# HTTP client for upstream LLM providers
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+
+# WASM runtime
+#
+# Held at >=36: RUSTSEC/GHSA advisories against 29 cover out-of-sandbox loads
+# from the `f64.copysign` and `f64x2.splat` lowerings on x86-64 (fixed 36.0.5 /
+# 36.0.7). Those are Cranelift codegen bugs, and Cranelift is the backend we
+# use, so they are reachable from any rule we execute. 36 also clears the
+# Winch, component-model and WASI advisories, none of which we were exposed to.
+# wasmtime-wasi is used only by benches/wasm_bench.rs, never by shipped code.
+wasmtime = "36"
+wasmtime-wasi = "36"
+
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip`: parse every float to the nearest double, as JavaScript
+# and Python do. The default fast path can land one ulp off on a long
+# mantissa, and a decide rule's band or an engine's probability must read the
+# same in every port (`src/decide`).
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_yaml = "0.9"
+
+# Redis/Valkey client
+redis = { version = "0.25", features = ["aio", "tokio-comp", "connection-manager"] }
+
+# Regex for DLP scanner
+regex = "1"
+
+# Code skeleton extraction — Rust AST (snip_code.rs)
+syn = { version = "2.0", features = ["parsing", "full"] }
+
+# Code skeleton extraction — multi-language via tree-sitter WASM grammars
+# Grammars are embedded via include_bytes! at compile time (see assets/grammars/)
+#
+# The `wasm` feature pulls wasmtime-c-api-impl, i.e. a SECOND wasmtime entirely
+# separate from the one above. 0.24 pinned that to wasmtime 25, which carried
+# the same advisories and would have kept them open no matter what the direct
+# dependency said. 0.26 moved it to wasmtime-c-api-impl ^36.0.12, which is why
+# this bump is part of the security fix rather than routine maintenance.
+tree-sitter = { version = "0.26", features = ["wasm"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Held at >=0.32.1: opentelemetry_sdk 0.24 allocates without bound while parsing
+# W3C Baggage headers, which are attacker-controlled on any inbound request.
+# These four move as a set — otlp 0.32 requires sdk 0.32, and
+# tracing-opentelemetry 0.33 is the first release built against otel 0.32.
+# Metrics ride the same pinned set via feature flags ONLY — never add
+# opentelemetry-prometheus here: it lags the SDK release line and pulling it
+# in would drag this set back below the advisory floor. Export is OTLP push
+# (src/metrics.rs); there is deliberately no /metrics pull endpoint.
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace", "metrics"] }
+# The tonic transport feature was renamed "tonic" -> "grpc-tonic"; the separate
+# "tokio" feature no longer exists.
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "metrics"] }
+tracing-opentelemetry = "0.33"
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+nanoid = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+# `crypto.sha1` for Rego policies (src/wasm/opa_builtins.rs). Already in the
+# lockfile transitively, so this adds no new crate to the tree.
+sha1 = "0.10"
+hex = "0.4"
+# AES-256-GCM and HKDF for the stored provider credentials
+# (src/credential_crypto.rs). Already in the lockfile through rustls, so this
+# adds no new crate to the tree.
+ring = "0.17"
+anyhow = "1"
+# Storage trait (src/store) — dyn-compatible async methods. Native AFIT is
+# available but is not dyn-compatible, and the alternative is a generic
+# AppState<S> threaded through the axum router and every State<…> extractor.
+# Already in Cargo.lock transitively, so this adds no new crate to the tree.
+async-trait = "0.1"
+once_cell = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+rand_distr = "0.4"
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+# Phase 7: Token Intelligence
+tiktoken-rs = "0.6"
+# TLS MITM for Windsurf Cascade AI governance
+rcgen = { version = "0.13", features = ["pem"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Cloud upstreams (src/cloud): crc32fast checks AWS event-stream frames, and
+# is already in the tree through wasmtime. SigV4's HMAC and Google's RS256
+# service-account assertion use `ring` (above).
+crc32fast = "1"
+
+# Advisory file locking (flock) for the standalone learning snapshot, so two
+# proxies sharing ~/.intutic cannot clobber each other's arms. Already in the
+# lockfile transitively via tokio, so this adds no new crate to the tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"
+# Integration tests (tests/reward_test.rs) talk to Valkey directly
+redis = { version = "0.25", features = ["aio", "tokio-comp", "connection-manager"] }
+# Integration tests (tests/wasm_local_test.rs) compile minimal WAT rule fixtures
+wat = "1"
+# Must track the runtime dependency above. Left at 29 this pulled a whole second
+# vulnerable wasmtime into the lockfile, which Dependabot flags on Cargo.lock
+# regardless of it being test-only.
+wasmtime = "36"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The test files that drive the control-plane clients against a mock control plane carry
+# `#![cfg(feature = "control-plane")]` themselves, so a manifest entry per file (which a
+# build that copies only Cargo.toml and src, as the Dockerfile does, cannot resolve) is not needed.
+[[bench]]
+name = "snip_bench"
+harness = false
+
+[[bench]]
+name = "policy_bench"
+harness = false
+
+[[bench]]
+name = "policy_e2e_bench"
+harness = false
+
+[[bench]]
+name = "wasm_bench"
+harness = false
+
+[[bench]]
+name = "anomaly_bench"
+harness = false
+
+[[bench]]
+name = "rego_bench"
+harness = false
+
+[[bench]]
+name = "tool_poison_bench"
+harness = false
+
+# Not criterion: it reports mean +/- sigma and cannot express percentiles or
+# concurrency, and the tail is exactly what a latency claim hides.
+[[bench]]
+name = "ab_latency_bench"
+harness = false

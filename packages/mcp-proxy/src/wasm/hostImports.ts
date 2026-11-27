@@ -1,0 +1,188 @@
+/**
+ * wasm/hostImports.ts — The 4 frozen host imports (`WASM_HOST_IMPORTS` from
+ * `@intutic/shared-types`), implemented for this proxy's `worker_threads`
+ * sandbox.
+ *
+ * Built from `packages/proxy/src/wasm/host.rs` (the Rust behavior each
+ * import must match) and from `packages/wasm-sdk/__tests__/generatedRules.test.ts`'s
+ * `HOST_IMPL` (the reference Node-side implementation the task named as the
+ * base to build from). `log_info`/`abort`/`trace` mirror `host.rs`'s
+ * tracing-log behavior, routed through this package's own `createStderrLogger`
+ * (never `console.log`/stdout — the same stdio-isolation rule every other
+ * module in this package follows). `read_referenced_file` resolves against
+ * the per-evaluation table the runner pre-reads through `referencedFiles.ts`
+ * — the port of `host.rs`'s `read_referenced_file_impl`, code for code: the
+ * read budget is charged before argument validation, a refusal is a value
+ * the rule can act on, and nothing here traps. With no table (no
+ * `INTUTIC_WASM_MANIFEST_ROOT`, or a rule that does not import the function)
+ * every call gets `ERR_REFUSED`, which is what the Rust proxy answers with no
+ * root configured.
+ *
+ * @module
+ */
+
+import { createStderrLogger as createLogger } from '../stderrLog.js'
+import {
+  ReferencedFiles,
+  ERR_BAD_ARGS,
+  ERR_BUDGET,
+  ERR_BUFFER_TOO_SMALL,
+  ERR_REFUSED as REFUSED,
+  MAX_GUEST_PATH_BYTES,
+  MAX_READS_PER_EVALUATION,
+} from './referencedFiles.js'
+
+const log = createLogger('mcp-proxy-wasm-host')
+
+/** `referenced_files.rs`'s `ERR_REFUSED` (-2), kept exported here for the callers that imported it before the resolver existed. */
+export const ERR_REFUSED = REFUSED
+
+/** What one evaluation's host imports need beyond the guest memory. */
+export interface HostImportState {
+  /** The pre-read table; `ReferencedFiles.empty()` refuses everything. */
+  files: ReferencedFiles
+  /** Reads left this evaluation, decremented by every call. */
+  fileReadsRemaining: number
+}
+
+export function newHostImportState(files: ReferencedFiles = ReferencedFiles.empty()): HostImportState {
+  return { files, fileReadsRemaining: MAX_READS_PER_EVALUATION }
+}
+
+/**
+ * Decode a UTF-8 string out of a WASM instance's linear memory. Returns `''`
+ * on any bounds/decode failure — mirrors `host.rs`'s own posture of logging
+ * a warning and returning without acting, never trapping the guest over a
+ * malformed log call.
+ */
+function readUtf8(memory: WebAssembly.Memory, ptr: number, len: number): string | null {
+  if (ptr < 0 || len < 0) return null
+  const bytes = new Uint8Array(memory.buffer)
+  const end = ptr + len
+  if (end > bytes.length) return null
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(ptr, end))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Builds the `env.*` import object for one WASM instance. `getMemory` is a
+ * thunk rather than a captured value because the memory export does not
+ * exist until AFTER `WebAssembly.instantiate` returns, while the import
+ * object has to be supplied BEFORE it — the same ordering `host.rs` avoids
+ * entirely by reading `caller.get_export("memory")` inside each call; this
+ * is the Node-side equivalent of that lazy lookup.
+ */
+export function createHostImports(
+  getMemory: () => WebAssembly.Memory | undefined,
+  state: HostImportState = newHostImportState(),
+): WebAssembly.ModuleImports {
+  return {
+    log_info: (ptr: number, len: number): void => {
+      const memory = getMemory()
+      if (!memory) {
+        log.warn({ action: 'wasm_host_no_memory', call: 'log_info' }, 'WASM rule called log_info with no memory export')
+        return
+      }
+      const msg = readUtf8(memory, ptr, len)
+      if (msg === null) {
+        log.warn({ action: 'wasm_log_info_bad_args' }, 'WASM rule log_info payload out of bounds or not valid UTF-8')
+        return
+      }
+      log.info({ action: 'wasm_rule_log' }, msg)
+    },
+
+    // Mirrors host.rs's `abort` import: log only, never throw/trap. A guest
+    // unhandled-exception calling `abort` must not crash the evaluation —
+    // the caller (worker.ts) still wraps the whole `evaluate` call so any
+    // resulting trap is a rule that reached no verdict, but this import itself
+    // is inert.
+    abort: (msgPtr: number, filePtr: number, line: number, col: number): void => {
+      log.warn(
+        { action: 'wasm_abort', msgPtr, filePtr, line, col },
+        'WASM rule called abort (AssemblyScript unhandled exception)',
+      )
+    },
+
+    // Best-effort decode of AssemblyScript's `String#trace` layout — a
+    // length-prefixed UTF-16LE string with the 4-byte length immediately
+    // before `ptr`. Falls back to logging the raw pointer/length, same as
+    // host.rs's own fallback branch, rather than treating a decode failure
+    // as fatal.
+    trace: (ptr: number, n: number): void => {
+      const memory = getMemory()
+      if (!memory) return
+      if (ptr >= 4) {
+        const bytes = new Uint8Array(memory.buffer)
+        if (ptr <= bytes.length) {
+          const lenBytes = bytes.subarray(ptr - 4, ptr)
+          const len = new DataView(lenBytes.buffer, lenBytes.byteOffset, 4).getUint32(0, true)
+          const end = ptr + len
+          if (end <= bytes.length) {
+            try {
+              const utf16 = new Uint16Array(bytes.buffer, bytes.byteOffset + ptr, len / 2)
+              const msg = String.fromCharCode(...utf16)
+              log.info({ action: 'wasm_trace', n }, msg)
+              return
+            } catch {
+              // fall through to the raw fallback below
+            }
+          }
+        }
+      }
+      log.info({ action: 'wasm_trace_raw', ptr, n }, 'WASM trace (undecoded)')
+    },
+
+    // Ported from host.rs's `read_referenced_file_impl`. Returns a length or
+    // one of the negative codes; never throws — a host trap would unwind the
+    // guest and leave the whole evaluation without a verdict, so one malformed
+    // call would override every OTHER check the rule performs with the fail
+    // setting.
+    read_referenced_file: (pathPtr: number, pathLen: number, outPtr: number, outCap: number): number => {
+      // Charged before anything else, including argument validation, so a
+      // guest cannot spin on cheap malformed calls any more than on
+      // expensive good ones.
+      if (state.fileReadsRemaining <= 0) {
+        log.warn(
+          { action: 'wasm_file_read_budget_exhausted', budget: MAX_READS_PER_EVALUATION },
+          'WASM rule exhausted its referenced-file reads in one evaluation',
+        )
+        return ERR_BUDGET
+      }
+      state.fileReadsRemaining -= 1
+
+      const memory = getMemory()
+      if (!memory) {
+        log.warn({ action: 'wasm_host_no_memory', call: 'read_referenced_file' }, 'WASM rule called read_referenced_file with no memory export')
+        return ERR_BAD_ARGS
+      }
+      if (pathPtr < 0 || pathLen <= 0 || pathLen > MAX_GUEST_PATH_BYTES || outCap < 0) return ERR_BAD_ARGS
+      const requested = readUtf8(memory, pathPtr, pathLen)
+      if (requested === null) return ERR_BAD_ARGS
+
+      const hit = state.files.lookup(requested)
+      if (!hit.ok) {
+        // The reason is operator-facing only. The guest gets the code and is
+        // told nothing it did not already supply.
+        log.debug(
+          { action: 'wasm_referenced_file_refused', path: requested, code: hit.code, reason: state.files.refusalReason(requested) },
+          "refused a WASM rule's referenced-file read",
+        )
+        return hit.code
+      }
+      const len = hit.bytes.length // capped at MAX_REFERENCED_FILE_BYTES on the way in
+      if (outCap === 0) return len
+      if (outCap < len) return ERR_BUFFER_TOO_SMALL
+      const view = new Uint8Array(memory.buffer)
+      if (outPtr < 0 || outPtr + len > view.length) {
+        // Out of bounds: a refusal, not a trap, same as host.rs.
+        log.warn({ action: 'wasm_referenced_file_out_ptr_oob', outPtr, len }, 'WASM rule passed an out-of-bounds output buffer')
+        return ERR_BAD_ARGS
+      }
+      view.set(hit.bytes, outPtr)
+      return len
+    },
+  }
+}

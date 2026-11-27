@@ -1,0 +1,2878 @@
+//! DLP Scanner — bidirectional detection of secrets, credentials and five
+//! kinds of PII.
+//!
+//! Uses Rust `regex` crate (linear-time, ReDoS-safe).
+//! Scans both input and output streams.
+//!
+//! PII coverage is exactly the detectors in `dlp/pii_detectors.json`: payment
+//! card numbers (IIN table + Luhn), IBANs (country length + mod-97), US SSNs
+//! (never-issued ranges rejected), email addresses and phone numbers. These
+//! are pattern-and-checksum detectors, not a model: names, postal addresses
+//! and free-text identifiers are not detected. See `dlp/pii.rs`.
+//!
+//! Each detector's action comes from this machine's config
+//! (`intutic_settings.dlp.detectors`), and, on a proxy connected to a
+//! workspace, from the workspace's `piiDetectors` setting, which is the
+//! baseline the machine's config may only tighten (`dlp/workspace.rs`).
+//!
+//! # Pattern doctrine
+//!
+//! Every pattern here is **prefix- or magic-substring-anchored** — the tier
+//! gitleaks and TruffleHog treat as high-confidence without entropy gates or
+//! context keywords. Formats are ported from the gitleaks default config and
+//! TruffleHog detector sources (verified 2026-07-28), which is why some look
+//! oddly specific: `T3BlbkFJ` is base64("OpenAI") and appears in every OpenAI
+//! key; `AgEIcHlwaS5vcmc` is the macaroon header embedding "pypi.org".
+//!
+//! Deliberately absent, with reasons:
+//! - **Bare 40-char AWS secret keys** — neither reference tool ships this
+//!   without context keywords or live verification; unanchored it matches git
+//!   SHAs and base64 fragments constantly.
+//! - **Generic high-entropy strings** — the entropy+stopword machinery that
+//!   makes those tolerable is out of proportion to this scanner.
+//! - **Context-required vendors** (Telegram, Twilio auth tokens) — their
+//!   secrets are format-ambiguous without a nearby vendor keyword.
+//!
+//! Action doctrine: `block` is reserved for material that is catastrophic to
+//! forward and unambiguous to match (private key blocks, Anthropic keys —
+//! the credential class this proxy itself runs on). Everything else redacts:
+//! a developer who pastes a key wants their question answered, and refusing
+//! teaches them to switch DLP off. Redaction answers with the key removed.
+
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+use crate::wasm::context::DlpFinding;
+
+pub mod pii;
+pub mod workspace;
+
+/// DLP pattern categories
+static PATTERNS: Lazy<Vec<DlpPattern>> = Lazy::new(|| {
+    let defs: Vec<(&str, &str, &str, &str)> = vec![
+        // (name, category, regex, action)
+        (
+            "aws_access_key",
+            "secret",
+            // AKIA long-lived, ASIA temporary, ABIA/ACCA/A3T* other classes.
+            // Base32 alphabet [A-Z2-7] per gitleaks — 0,1,8,9 never appear.
+            r"\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}\b",
+            "redact",
+        ),
+        (
+            "github_token",
+            "secret",
+            // All five classic prefixes: PAT, OAuth, App-user, App-server,
+            // refresh. The old pattern matched ghp_ only.
+            r"\b(?:ghp|gho|ghu|ghs|ghr)_[0-9a-zA-Z]{36}\b",
+            "redact",
+        ),
+        (
+            "github_fine_grained_pat",
+            "secret",
+            // 93 chars total; the tail carries a checksum, so this format is
+            // near-zero-FP by construction (GitHub's own design goal).
+            r"\bgithub_pat_\w{82}\b",
+            "redact",
+        ),
+        (
+            "anthropic_api_key",
+            "secret",
+            r"sk-ant-[A-Za-z0-9\-_]{10,}",
+            "block",
+        ),
+        (
+            "openai_api_key",
+            "secret",
+            // Anchored on T3BlbkFJ = base64("OpenAI"), present in legacy
+            // sk-{48} keys and current sk-proj-/sk-svcacct-/sk-admin- keys.
+            r"\b(?:sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})\b",
+            "redact",
+        ),
+        (
+            "gitlab_pat",
+            "secret",
+            // Legacy glpat-{20} and the newer routable form with a
+            // dot-separated version+checksum suffix.
+            r"\bglpat-[0-9a-zA-Z_-]{20,300}(?:\.[0-9a-z]{9})?\b",
+            "redact",
+        ),
+        (
+            "slack_token",
+            "secret",
+            // Bot/user/app/legacy families share the xox?- shape; xapp- is
+            // the app-level token.
+            r"\b(?:xox[baprse]-[0-9a-zA-Z-]{10,}|xapp-\d-[A-Z0-9]+-\d+-[a-z0-9]+)\b",
+            "redact",
+        ),
+        (
+            "slack_webhook_url",
+            "secret",
+            // The path IS the secret; anyone holding it can post.
+            r"hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{40,60}",
+            "redact",
+        ),
+        (
+            "google_api_key",
+            "secret",
+            r"\bAIza[0-9A-Za-z_-]{35}\b",
+            "redact",
+        ),
+        (
+            "stripe_key",
+            "secret",
+            // Secret and restricted keys, all modes. Test keys redact too:
+            // harmless when redacted, and the format is identical.
+            r"\b(?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99}\b",
+            "redact",
+        ),
+        (
+            "sendgrid_api_key",
+            "secret",
+            // Three-part SG.<key id>.<secret> shape per TruffleHog.
+            r"\bSG\.[0-9A-Za-z_-]{20,24}\.[0-9A-Za-z_-]{39,50}\b",
+            "redact",
+        ),
+        ("npm_token", "secret", r"\bnpm_[A-Za-z0-9]{36}\b", "redact"),
+        (
+            "pypi_token",
+            "secret",
+            // AgEIcHlwaS5vcmc is the macaroon header embedding "pypi.org".
+            r"pypi-AgEIcHlwaS5vcmc[0-9A-Za-z_-]{50,1000}",
+            "redact",
+        ),
+        (
+            "huggingface_token",
+            "secret",
+            // Letters only, per gitleaks' empirically tuned form.
+            r"\b(?:hf_|api_org_)[A-Za-z]{34}\b",
+            "redact",
+        ),
+        (
+            "db_connection_string",
+            "credential",
+            // scheme://user:password@ — the credential is the matched span,
+            // so redaction removes exactly the user:pass while the host
+            // stays legible in what the model sees.
+            r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?)://[^:\s'\x22/@]{1,64}:[^@\s'\x22]{1,128}@",
+            "redact",
+        ),
+        (
+            "jwt",
+            "credential",
+            // Signature segment required (gitleaks makes it optional; we
+            // trade a little recall for precision on the hot path).
+            r"\bey[a-zA-Z0-9]{17,}\.ey[a-zA-Z0-9/_-]{17,}\.[a-zA-Z0-9/_-]{10,}={0,2}",
+            "redact",
+        ),
+        (
+            "bearer_token",
+            "credential",
+            r"Bearer\s+[A-Za-z0-9\-._~+/]+=*",
+            "redact",
+        ),
+        (
+            "private_key",
+            "secret",
+            // The full PEM family via the free-form slot: RSA, EC, DSA,
+            // OPENSSH, ENCRYPTED (PKCS#8), PGP (with " BLOCK"), and bare
+            // "PRIVATE KEY". The old pattern named three variants and
+            // missed OPENSSH and PGP entirely.
+            r"(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----",
+            "block",
+        ),
+    ];
+
+    let mut patterns: Vec<DlpPattern> = defs
+        .into_iter()
+        .map(|(name, category, regex, action)| DlpPattern {
+            name: name.into(),
+            category: category.into(),
+            regex: Regex::new(regex).unwrap(),
+            action: action.into(),
+            pii: None,
+        })
+        .collect();
+
+    // Developer-workstation honeytoken (2026-08-30 architecture-audit
+    // remediation, Wave 4, item 7). Same idea as `llm-provider-secrets.yaml`'s
+    // `OPENAI_API_KEY` canary — a credential-shaped value with zero legitimate
+    // consumer anywhere in this repo, so any appearance is unambiguous signal
+    // — moved onto this repo's other real honeytoken surface: a decoy
+    // AWS_ACCESS_KEY_ID planted in a developer-lookalike `.env`
+    // (`infra/scripts/gen-dev-honeytoken.sh`; the value there and here must
+    // stay byte-identical or the bait stops tripping this pattern).
+    //
+    // `aws_access_key` above already matches this value's *shape* (it is a
+    // syntactically valid AKIA-format key) and would silently redact it and
+    // forward the request. That is the wrong response to a value that no
+    // legitimate caller can ever hold: `block` gives an operator a loud,
+    // attributable "DLP BLOCK action on input" with this pattern's name in
+    // the log (see proxy.rs's DLP step 4) instead of a quiet redaction lost
+    // among ordinary AWS-key false positives.
+    //
+    // The most realistic path a decoy sitting in a workstation `.env` reaches
+    // this scanner: no hook governs the Read tool (protectedPaths.ts's
+    // PreToolUse gate only covers Bash/Edit/Write/MultiEdit/mcp__.* — see its
+    // module doc), so a compromised agent can read the file freely. What it
+    // cannot do unnoticed is USE the value — a Bash command or an MCP call
+    // that echoes it locally is already caught by the generic
+    // `secrets.aws_access_key` GuardPattern in
+    // `services/sync-daemon/src/harness/protectedPaths.ts` (same shape,
+    // independent enforcement point), and pasting it into a prompt that
+    // transits this proxy is caught here.
+    //
+    // Runtime-assembled, not a contiguous literal — this repo's own
+    // convention (see protectedPaths.ts's `SECRET_CONTENT_PATTERNS` fixtures)
+    // — because the assembled value below is AKIA-shaped and a contiguous
+    // spelling of it in this source would itself trip
+    // `.githooks/pre-commit`'s secret scan
+    // (packages/shared-types/src/secretPatterns.ts's `aws_access_key`
+    // alternation matches it on purpose; that pattern and this one are
+    // deliberately the same shape). Note for future edits to this comment:
+    // do not spell the assembled value out contiguously here either.
+    let honeytoken_head = "AKIA";
+    let honeytoken_tail = "HONEYTOKENDECOY6";
+    let honeytoken_regex = format!(r"\b{honeytoken_head}{honeytoken_tail}\b");
+    patterns.push(DlpPattern {
+        name: "dev_env_honeytoken".into(),
+        category: "credential".into(),
+        regex: Regex::new(&honeytoken_regex).expect("honeytoken regex must compile"),
+        action: "block".into(),
+        pii: None,
+    });
+
+    patterns
+});
+
+#[derive(Clone)]
+struct DlpPattern {
+    name: String,
+    category: String,
+    regex: Regex,
+    action: String,
+    /// Set for the PII detectors: the regex finds a candidate and this
+    /// detector's validator and boundary rule decide whether it is a finding.
+    pii: Option<&'static pii::Detector>,
+}
+
+/// The PII detectors at their configured actions, `off` ones left out.
+///
+/// A `OnceCell` for the same reason `CUSTOM` is one: the actions come from
+/// config, installed once at boot by `install_pii_actions`. Read before that
+/// (tests, or a probe that runs first) it holds the defaults from
+/// `pii_detectors.json`, and a later install is refused rather than silently
+/// ignored.
+static PII: once_cell::sync::OnceCell<Vec<DlpPattern>> = once_cell::sync::OnceCell::new();
+
+/// The actions this machine's config names, as written: the ones a workspace
+/// baseline is compared against (`workspace_pii_policy`). Detectors the config
+/// leaves out are not here, so they take the workspace's action when it names
+/// them. Set with `PII`; empty before that.
+static LOCAL_PII: once_cell::sync::OnceCell<std::collections::BTreeMap<String, String>> =
+    once_cell::sync::OnceCell::new();
+
+fn pii_patterns() -> &'static [DlpPattern] {
+    PII.get_or_init(|| {
+        build_pii_patterns(&std::collections::BTreeMap::new())
+            .expect("the shipped PII defaults are valid")
+    })
+}
+
+/// Refuses an unknown detector id or action, naming it and `source` (where
+/// the value came from), for the reason `install_custom_patterns` gives.
+fn validate_pii_actions(
+    actions: &std::collections::BTreeMap<String, String>,
+    source: &str,
+) -> Result<(), String> {
+    let dets = pii::detectors();
+    for (id, action) in actions {
+        if !dets.iter().any(|d| &d.id == id) {
+            let known: Vec<&str> = dets.iter().map(|d| d.id.as_str()).collect();
+            return Err(format!(
+                "{source} names '{id}', which is not a detector; known: {}",
+                known.join(", ")
+            ));
+        }
+        if pii_action_rank(action).is_none() {
+            return Err(format!(
+                "{source} sets '{id}' to '{action}'; only 'off', 'redact' and 'block' exist"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How strict an action is: `off` < `redact` < `block`. `None` for anything
+/// else.
+fn pii_action_rank(action: &str) -> Option<u8> {
+    match action {
+        "off" => Some(0),
+        "redact" => Some(1),
+        "block" => Some(2),
+        _ => None,
+    }
+}
+
+/// Resolve each PII detector's action — the configured one, else its default —
+/// and keep the ones that are not `off`. An unknown id or action is an error
+/// naming it.
+fn build_pii_patterns(
+    actions: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<DlpPattern>, String> {
+    validate_pii_actions(actions, "dlp.detectors")?;
+    Ok(pii::detectors()
+        .iter()
+        .filter_map(|d| {
+            let action = actions.get(&d.id).unwrap_or(&d.default_action);
+            (action != "off").then(|| DlpPattern {
+                name: d.id.clone(),
+                category: d.category.clone(),
+                regex: d.regex.clone(),
+                action: action.clone(),
+                pii: Some(d),
+            })
+        })
+        .collect())
+}
+
+/// Install the configured PII detector actions. Call once, from main, before
+/// serving. Returns each detector's effective action, for the boot log.
+pub fn install_pii_actions(
+    actions: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let built = build_pii_patterns(actions)?;
+    let effective = action_table(&built);
+    PII.set(built)
+        .map_err(|_| "PII detector actions are already installed".to_string())?;
+    // Set after `PII`, so a refused second install cannot replace the
+    // actions the running scanner was built from.
+    let _ = LOCAL_PII.set(actions.clone());
+    Ok(effective)
+}
+
+/// Every detector with the action `patterns` gives it, `off` when it has none.
+fn action_table(patterns: &[DlpPattern]) -> Vec<(String, String)> {
+    pii::detectors()
+        .iter()
+        .map(|d| {
+            let action = patterns
+                .iter()
+                .find(|p| p.name == d.id)
+                .map_or("off", |p| p.action.as_str());
+            (d.id.clone(), action.to_string())
+        })
+        .collect()
+}
+
+/// The actions a workspace baseline and this machine's config give together.
+///
+/// The workspace setting is the baseline for every detector it names; the
+/// machine's config may only tighten it (`off` → `redact` → `block`), never
+/// loosen it, so a developer cannot switch off on their own machine what
+/// their workspace turned on. A detector the workspace does not name keeps
+/// the machine's action, or its default. Errors name an unknown id or action
+/// in the workspace's setting. The MCP proxy applies the same rule
+/// (`effectivePiiActions` in shared-types), and both run
+/// `packages/shared-types/fixtures/pii-precedence-vectors.json`.
+fn effective_pii_actions(
+    local: &std::collections::BTreeMap<String, String>,
+    workspace: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    validate_pii_actions(workspace, "the workspace's piiDetectors setting")?;
+    let mut effective = local.clone();
+    for (id, baseline) in workspace {
+        let tighter = local
+            .get(id)
+            .filter(|mine| pii_action_rank(mine) > pii_action_rank(baseline));
+        effective.insert(id.clone(), tighter.unwrap_or(baseline).clone());
+    }
+    Ok(effective)
+}
+
+/// The PII detectors at the actions one workspace's requests get: its
+/// `piiDetectors` setting tightened by this machine's config. Built per
+/// request from the cached key-context answer; scanned through `scan_with`,
+/// `scrub_stream_text` and `StreamScrubber::with_pii`.
+pub struct PiiPolicy {
+    patterns: Vec<DlpPattern>,
+    /// The detectors the workspace's setting names: its baseline.
+    baseline: std::collections::BTreeSet<String>,
+    /// Scan with these PII detectors alone, without this machine's secret
+    /// and operator patterns: the baseline of a direction this machine's
+    /// DLP switches leave off (`direction_scan`).
+    baseline_only: bool,
+}
+
+impl PiiPolicy {
+    /// The action `id` runs at, `None` when it is off.
+    pub fn action_of(&self, id: &str) -> Option<&str> {
+        self.patterns
+            .iter()
+            .find(|p| p.name == id)
+            .map(|p| p.action.as_str())
+    }
+
+    /// Every detector with its action, `off` included, for logs.
+    pub fn actions(&self) -> Vec<(String, String)> {
+        action_table(&self.patterns)
+    }
+
+    /// The detectors the workspace names, at their actions here, and nothing
+    /// else; `None` when it switches none on, so there is nothing to enforce.
+    fn baseline(&self) -> Option<PiiPolicy> {
+        let patterns: Vec<DlpPattern> = self
+            .patterns
+            .iter()
+            .filter(|p| self.baseline.contains(&p.name))
+            .cloned()
+            .collect();
+        (!patterns.is_empty()).then(|| PiiPolicy {
+            patterns,
+            baseline: self.baseline.clone(),
+            baseline_only: true,
+        })
+    }
+}
+
+/// What one direction of a request (its body and headers, or its response)
+/// is scanned with: `None` when nothing scans it, else the PII policy to pass
+/// to `scan_with`, `scrub_stream_text` and `StreamScrubber::with_pii`, `None`
+/// inside for this machine's own actions.
+///
+/// This machine's DLP switches (`dlp.enabled`, `scan_input`, `scan_output`)
+/// turn its own patterns on and off. They cannot turn off the workspace's
+/// baseline: local config may only tighten what the workspace sets, so with
+/// a switch off the detectors the workspace names still run, in that
+/// direction, at their actions here.
+pub fn direction_scan(
+    local_on: bool,
+    pii: Option<&std::sync::Arc<PiiPolicy>>,
+) -> Option<Option<std::sync::Arc<PiiPolicy>>> {
+    if local_on {
+        return Some(pii.cloned());
+    }
+    pii.and_then(|policy| policy.baseline())
+        .map(|baseline| Some(std::sync::Arc::new(baseline)))
+}
+
+/// The policy for a workspace whose setting is `workspace`, against the
+/// actions this machine's config installed at boot.
+pub fn workspace_pii_policy(
+    workspace: &std::collections::BTreeMap<String, String>,
+) -> Result<PiiPolicy, String> {
+    let local = LOCAL_PII.get().cloned().unwrap_or_default();
+    let effective = effective_pii_actions(&local, workspace)?;
+    Ok(PiiPolicy {
+        patterns: build_pii_patterns(&effective)?,
+        baseline: workspace.keys().cloned().collect(),
+        baseline_only: false,
+    })
+}
+
+/// Operator-supplied patterns, installed once at boot from config.
+///
+/// Separate from `PATTERNS` rather than merged into it because `PATTERNS` is a
+/// `Lazy` with no input: it cannot see the config, and making it able to would
+/// mean either a global mutable or threading config through every call site of
+/// `scan()`. A `OnceCell` set before the server binds gives the same read path
+/// (no lock, no branch per pattern) with none of that.
+///
+/// Unset in tests, which is what keeps the built-in false-positive fixtures —
+/// notably the phone number at the bottom of this file that must NOT match —
+/// meaningful regardless of what an operator configures in production.
+static CUSTOM: once_cell::sync::OnceCell<Vec<DlpPattern>> = once_cell::sync::OnceCell::new();
+
+/// Compile and install operator patterns. Call once, from main, before serving.
+///
+/// Returns an error rather than panicking. The built-in set uses
+/// `Regex::new(..).unwrap()`, which is fine for a literal list reviewed at
+/// compile time and completely wrong for a value an operator types into a
+/// ConfigMap: a typo there would abort the process at the first request that
+/// happened to reach the scanner, with a panic naming no pattern.
+pub fn install_custom_patterns(defs: &[crate::config::CustomDlpPattern]) -> Result<usize, String> {
+    let mut out = Vec::with_capacity(defs.len());
+    for d in defs {
+        if !matches!(d.action.as_str(), "block" | "redact") {
+            return Err(format!(
+                "dlp pattern '{}' declares action '{}'; only 'block' and 'redact' exist",
+                d.name, d.action
+            ));
+        }
+        if d.name.trim().is_empty() {
+            return Err("a dlp pattern has an empty name".to_string());
+        }
+        if PATTERNS.iter().any(|p| p.name == d.name)
+            || pii::detectors().iter().any(|p| p.id == d.name)
+        {
+            return Err(format!(
+                "dlp pattern '{}' shadows a built-in of the same name; \
+                 findings are counted by distinct pattern_name, so a duplicate \
+                 would quietly weaken the escalation threshold",
+                d.name
+            ));
+        }
+        let regex = Regex::new(&d.regex)
+            .map_err(|e| format!("dlp pattern '{}' is not a valid regex: {e}", d.name))?;
+        out.push(DlpPattern {
+            name: d.name.clone(),
+            category: d.category.clone(),
+            regex,
+            action: d.action.clone(),
+            pii: None,
+        });
+    }
+    let n = out.len();
+    CUSTOM
+        .set(out)
+        .map_err(|_| "custom DLP patterns are already installed".to_string())?;
+    Ok(n)
+}
+
+/// Built-ins first, then the enabled PII detectors — the workspace's when
+/// `pii` is given, else this machine's — then operator patterns. A baseline
+/// alone (`direction_scan`) is its PII detectors and nothing else.
+fn all_patterns(pii: Option<&PiiPolicy>) -> impl Iterator<Item = &DlpPattern> {
+    let (builtins, pii, custom): (&[DlpPattern], &[DlpPattern], &[DlpPattern]) = match pii {
+        Some(policy) if policy.baseline_only => (&[], &policy.patterns, &[]),
+        Some(policy) => (
+            &PATTERNS,
+            &policy.patterns,
+            CUSTOM.get().map(Vec::as_slice).unwrap_or(&[]),
+        ),
+        None => (
+            &PATTERNS,
+            pii_patterns(),
+            CUSTOM.get().map(Vec::as_slice).unwrap_or(&[]),
+        ),
+    };
+    builtins.iter().chain(pii.iter()).chain(custom.iter())
+}
+
+/// Scan text for DLP matches.
+///
+/// # Why this is a plain loop and not a `RegexSet`
+///
+/// It used to be a `RegexSet` prefilter, on the reasoning that one traversal
+/// beats ~20. The arithmetic is right and the conclusion is backwards, by two
+/// orders of magnitude. Measured on a 128 KB clean body (Apple M4 Pro, release,
+/// `benches/policy_bench.rs`):
+///
+/// | strategy | total | per byte |
+/// |---|---|---|
+/// | every pattern individually, in a loop | **0.12 ms** | 0.91 ns |
+/// | the same patterns as one `RegexSet` | **19.9 ms** | 150.6 ns |
+///
+/// The set was **165× slower than the loop it replaced.** Each pattern on its
+/// own starts with a literal or a tight class — `AKIA`, `ghp_`, `sk-ant-`,
+/// `glpat-`, `-----BEGIN` — so the regex crate picks a memchr-accelerated
+/// prefilter and skips almost every byte. Union them and no common literal
+/// survives, so no prefilter applies; worse, the combined automaton over these
+/// patterns' large bounded repetitions (`{20,300}`, `{50,1000}`, `{82}`)
+/// overflows the lazy DFA's state cache and degrades to the PikeVM, which
+/// visits every byte. Nineteen accelerated passes that skip most of the input
+/// beat one unaccelerated pass that cannot.
+///
+/// This mattered in production, not just in a benchmark. The cost was linear at
+/// ~150 ns/byte, so a 32 KB request body spent ~5 ms in DLP alone — the entire
+/// latency the public docs advertised for the whole evaluation chain — and the
+/// scanner runs on the request *and* the response, so it was paid twice.
+///
+/// If this is ever revisited: measure it. `is_match` before `matches` was also
+/// tried and changed nothing (both engines are equally slow on this set) while
+/// making the dirty path ~20% worse by scanning twice.
+///
+/// # What the PII detectors cost
+///
+/// Card, IBAN and SSN (on by default) open with a character class, not a
+/// literal, so their regexes get no prefilter and each walks every byte;
+/// validators run only on candidates. Measured 2026-10-08 with the same
+/// benchmark: a 32 KB clean body went from 23 µs to 64 µs, a 128 KB one from
+/// about 0.2 ms to 0.32 ms — roughly 1.2 ns per byte, per direction.
+pub fn scan(text: &str) -> Vec<DlpFinding> {
+    scan_with(text, None)
+}
+
+/// [`scan`] with a workspace's PII detector actions in place of this
+/// machine's (`workspace_pii_policy`). `None` is exactly `scan`.
+pub fn scan_with(text: &str, pii: Option<&PiiPolicy>) -> Vec<DlpFinding> {
+    scan_patterns(text, all_patterns(pii))
+}
+
+/// Every PII detector whose `stored_action` is `redact`, at `redact`: what
+/// [`scan_for_storage`] adds to the secret patterns. Built from the shipped
+/// definition alone, never from a workspace's or machine's live actions.
+static STORED_PII: Lazy<Vec<DlpPattern>> = Lazy::new(|| {
+    pii::detectors()
+        .iter()
+        .filter(|d| d.stored_action == "redact")
+        .map(|d| DlpPattern {
+            name: d.id.clone(),
+            category: d.category.clone(),
+            regex: d.regex.clone(),
+            action: "redact".into(),
+            pii: Some(d),
+        })
+        .collect()
+});
+
+/// [`scan`] for text Intutic is about to keep rather than forward: every
+/// secret pattern, this machine's operator patterns, and each PII detector at
+/// its `stored_action`.
+///
+/// Separate from the live actions on purpose. Email and phone are off on
+/// live traffic by default, because a coding agent edits real addresses and
+/// numbers — a `package.json` author, a git config, a test fixture — and a
+/// model shown `[REDACTED_PII]` writes the placeholder back into the file.
+/// None of that applies to a copy in a trace or a replay context: nobody
+/// edits code from it, so the stored copy loses nothing by not carrying them.
+/// A workspace or machine setting a detector `off` changes what reaches the
+/// model, never what Intutic keeps.
+pub fn scan_for_storage(text: &str) -> Vec<DlpFinding> {
+    let custom = CUSTOM.get().map(Vec::as_slice).unwrap_or(&[]);
+    scan_patterns(
+        text,
+        PATTERNS
+            .iter()
+            .chain(STORED_PII.iter())
+            .chain(custom.iter()),
+    )
+}
+
+/// `text` with every [`scan_for_storage`] match replaced by
+/// `[REDACTED_{CATEGORY}]`; `None` when nothing matched, so a clean string
+/// costs no allocation.
+pub fn redact_for_storage(text: &str) -> Option<String> {
+    let findings = scan_for_storage(text);
+    (!findings.is_empty()).then(|| redact(text, &findings))
+}
+
+/// [`redact_for_storage`] over every string in a JSON value, object keys
+/// left alone (they name fields, not data). Returns how many strings changed.
+pub fn redact_json_for_storage(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => match redact_for_storage(s) {
+            Some(clean) => {
+                *s = clean;
+                1
+            }
+            None => 0,
+        },
+        serde_json::Value::Array(items) => items.iter_mut().map(redact_json_for_storage).sum(),
+        serde_json::Value::Object(map) => map.values_mut().map(redact_json_for_storage).sum(),
+        _ => 0,
+    }
+}
+
+/// [`scan_with`] over every string in a JSON value (object keys left alone),
+/// with each `redact` finding replaced in place. Returns every finding, the
+/// `block` ones included; the caller refuses when there is one. Used for a
+/// decision call's state, which may be a string, a JSON object or content
+/// parts.
+pub fn scan_and_redact_json(
+    value: &mut serde_json::Value,
+    pii: Option<&PiiPolicy>,
+) -> Vec<DlpFinding> {
+    match value {
+        serde_json::Value::String(s) => {
+            let findings = scan_with(s, pii);
+            let redacting: Vec<DlpFinding> = findings
+                .iter()
+                .filter(|f| f.action == "redact")
+                .cloned()
+                .collect();
+            if !redacting.is_empty() {
+                *s = redact(s, &redacting);
+            }
+            findings
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .flat_map(|v| scan_and_redact_json(v, pii))
+            .collect(),
+        serde_json::Value::Object(map) => map
+            .values_mut()
+            .flat_map(|v| scan_and_redact_json(v, pii))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn scan_patterns<'a>(
+    text: &str,
+    patterns: impl Iterator<Item = &'a DlpPattern>,
+) -> Vec<DlpFinding> {
+    let mut findings = Vec::new();
+    for pattern in patterns {
+        if let Some(det) = pattern.pii {
+            for (start, end) in pii::find(det, text) {
+                findings.push(DlpFinding {
+                    category: pattern.category.clone(),
+                    pattern_name: pattern.name.clone(),
+                    action: pattern.action.clone(),
+                    offset: start,
+                    length: end - start,
+                });
+            }
+            continue;
+        }
+        for mat in pattern.regex.find_iter(text) {
+            findings.push(DlpFinding {
+                category: pattern.category.clone(),
+                pattern_name: pattern.name.clone(),
+                action: pattern.action.clone(),
+                offset: mat.start(),
+                length: mat.len(),
+            });
+        }
+    }
+    findings
+}
+
+/// Whether a finding comes from a PII detector (`pii.card`, `pii.iban`, ...).
+pub fn is_pii(f: &DlpFinding) -> bool {
+    f.pattern_name.starts_with("pii.")
+}
+
+/// `findings` without the PII `redact` ones whose matched value is part of a
+/// tool call's arguments, and those values (intutic/intutic#438).
+///
+/// Redacting a response rewrites what the client is about to execute, not text
+/// anyone reads: a payment ran to `[REDACTED_PII]`. The arguments go to the
+/// user's own tool, so rewriting them protects nothing and changes the action.
+/// Secrets and operator patterns are still redacted there (a model that puts a
+/// cloud key into a call is the case output redaction exists for, recorded as a
+/// substituted call), and `block` findings still refuse. The same value in the
+/// model's prose is left too: the client receives it in the call either way.
+pub fn without_tool_argument_pii(
+    text: &str,
+    findings: Vec<DlpFinding>,
+    tool_arguments: &[String],
+) -> (Vec<DlpFinding>, Vec<String>) {
+    if tool_arguments.is_empty() {
+        return (findings, Vec::new());
+    }
+    let mut kept_values = Vec::new();
+    let findings = findings
+        .into_iter()
+        .filter(|f| {
+            if !is_pii(f) || f.action != "redact" {
+                return true;
+            }
+            let value = text.get(f.offset..f.offset + f.length).unwrap_or_default();
+            let in_args = !value.is_empty() && tool_arguments.iter().any(|a| a.contains(value));
+            if in_args && !kept_values.contains(&f.pattern_name) {
+                kept_values.push(f.pattern_name.clone());
+            }
+            !in_args
+        })
+        .collect();
+    (findings, kept_values)
+}
+
+/// Scrub one unit of streamed text.
+///
+/// # What this covers, and what it does not
+///
+/// This is the **wire-form** scrub: one reassembled SSE line, `data:` envelope
+/// and JSON escaping included. It catches a secret that sits inside a single
+/// line's `data:` JSON, which is the common case.
+///
+/// It does **not** catch a secret split across two deltas, and the argument
+/// that it did was the bug. That argument ran: a secret either sits within one
+/// line's `data:` JSON, or it has SSE scaffolding through the middle of it,
+/// which no linear pattern can match anyway. The second clause is true and is
+/// precisely the leak. This function sees
+///
+/// ```text
+/// data: {"choices":[{"delta":{"content":"AKIAIOSFODNN7"}}]}
+/// data: {"choices":[{"delta":{"content":"EXAMPLE"}}]}
+/// ```
+///
+/// and matches nothing, because the scaffolding really is in the way. The
+/// client concatenates the two `content` values and sees
+/// `AKIAIOSFODNN7` + `EXAMPLE`. The scrubber reads the wire form; the client reads
+/// the decoded form; a pattern invisible in the first is plain in the second.
+/// "No linear pattern can match it" described the scanner's blindness, not the
+/// stream's safety, and it was written as if it were a safety property — which
+/// is why the hole survived review.
+///
+/// Decoded-form continuity is `StreamScrubber`'s job (below). The two run
+/// together: this one first, on the raw line, then the holdback on the decoded
+/// delta text. Keeping both is deliberate — this one also covers text the
+/// holdback never sees (tool-call arguments, non-text event payloads, any
+/// provider shape whose delta field the holdback does not know), and it costs
+/// nothing on a clean line.
+///
+/// Returns `None` when the line is clean (the overwhelming case — the caller
+/// forwards the original, allocating nothing), or the scrubbed line plus the
+/// pattern names redacted.
+///
+/// Block-action patterns are redacted here, not blocked. Input-side "block"
+/// exists to keep material from reaching the provider; on the output side
+/// the goal is containment — the private key never reaches the client — and
+/// redaction achieves that without killing a live stream.
+///
+/// `pii` is the request's workspace PII policy, `None` for this machine's.
+pub fn scrub_stream_text(text: &str, pii: Option<&PiiPolicy>) -> Option<(String, Vec<String>)> {
+    let findings = scan_with(text, pii);
+    if findings.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for f in &findings {
+        if !names.contains(&f.pattern_name) {
+            names.push(f.pattern_name.clone());
+        }
+    }
+    Some((redact(text, &findings), names))
+}
+
+/// Whether a raw SSE line carries a fragment of a tool call's arguments
+/// (Anthropic `input_json_delta`, OpenAI `tool_calls[].function.arguments`,
+/// Responses `function_call_arguments`, Gemini `functionCall`).
+pub fn is_tool_argument_line(line: &str) -> bool {
+    line.contains("\"input_json_delta\"")
+        || (line.contains("\"tool_calls\"") && line.contains("\"arguments\""))
+        || line.contains("function_call_arguments")
+        || line.contains("\"functionCall\"")
+}
+
+/// [`scrub_stream_text`] for a line of tool-call arguments: PII `redact`
+/// findings are left as written (`without_tool_argument_pii`); everything else
+/// is scrubbed as usual. Returns the scrub, if any, and the PII names left.
+pub fn scrub_stream_argument_line(
+    text: &str,
+    pii: Option<&PiiPolicy>,
+) -> (Option<(String, Vec<String>)>, Vec<String>) {
+    let (findings, left): (Vec<_>, Vec<_>) = scan_with(text, pii)
+        .into_iter()
+        .partition(|f| !(is_pii(f) && f.action == "redact"));
+    let mut left_names: Vec<String> = Vec::new();
+    for f in left {
+        if !left_names.contains(&f.pattern_name) {
+            left_names.push(f.pattern_name);
+        }
+    }
+    if findings.is_empty() {
+        return (None, left_names);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for f in &findings {
+        if !names.contains(&f.pattern_name) {
+            names.push(f.pattern_name.clone());
+        }
+    }
+    (Some((redact(text, &findings), names)), left_names)
+}
+
+/// Redact all findings in text, replacing matches with [REDACTED_{CATEGORY}]
+///
+/// # Overlapping findings
+///
+/// Patterns overlap on real input, and the obvious case is on the hot path:
+/// `Authorization: Bearer eyJ…` matches `bearer_token` over the whole span and
+/// `jwt` over the token inside it. Reverse-offset replacement alone **panicked**
+/// on that — the inner span was replaced first, the string shrank, and the
+/// outer span's end index then pointed past the end of it. In the streaming
+/// forward loop that panic kills the response mid-flight.
+///
+/// So overlaps are resolved before anything is replaced: earliest start wins,
+/// and at equal starts the longest span wins. The survivor is the outermost
+/// match, which covers at least the bytes the discarded one did — no secret is
+/// exposed by dropping the inner finding, and the caller's finding list is
+/// still reported in full elsewhere (`scrub_stream_text` names every pattern
+/// it saw, not just the ones whose span survived).
+pub fn redact(text: &str, findings: &[DlpFinding]) -> String {
+    let mut sorted = findings.to_vec();
+    sorted.sort_by(|a, b| a.offset.cmp(&b.offset).then(b.length.cmp(&a.length)));
+
+    let mut disjoint: Vec<&DlpFinding> = Vec::with_capacity(sorted.len());
+    let mut covered_to = 0usize;
+    for f in &sorted {
+        if f.offset >= covered_to {
+            covered_to = f.offset + f.length;
+            disjoint.push(f);
+        }
+    }
+
+    let mut result = text.to_string();
+    // Back to front, so each replacement leaves the earlier offsets valid.
+    for finding in disjoint.iter().rev() {
+        let replacement = format!("[REDACTED_{}]", finding.category.to_uppercase());
+        result.replace_range(
+            finding.offset..finding.offset + finding.length,
+            &replacement,
+        );
+    }
+    result
+}
+
+// ── Streaming holdback ────────────────────────────────────────────────────
+//
+// Everything below exists because the scrubber above reads the wire form and
+// the client reads the decoded form. See `scrub_stream_text`'s doc comment for
+// the leak; this is the fix.
+
+/// Upper bound, in **bytes**, on the text one pattern can match.
+///
+/// `None` means "no bound": the pattern contains a `*`, `+` or `{n,}`
+/// repetition, or syntax this walker does not model. Both cases are treated
+/// identically by the caller and both are reported at boot, because a pattern
+/// that contributes no bound is a pattern the fixed window does not
+/// *guarantee* (it is still usually caught — see `StreamScrubber`'s straddle
+/// clamp — just not by the window alone).
+///
+/// # Why a hand-written walker
+///
+/// `regex-syntax` computes this exactly (`Properties::maximum_len`) and is
+/// already in the lock file as a transitive dependency of `regex` — but only
+/// as a transitive one, and promoting it to a direct dependency is a
+/// `Cargo.toml`/`Cargo.lock` edit. This walker is ~120 lines, is pinned by a
+/// per-pattern test table below (every built-in's bound is asserted, so a
+/// walker bug fails the suite rather than silently shrinking the window), and
+/// fails **open-to-unbounded** on anything it does not recognise, which is the
+/// safe direction: unrecognised ⇒ no bound ⇒ reported, never a small number
+/// that would silently shrink the holdback.
+///
+/// # Bytes, not characters
+///
+/// The holdback is a byte window over a `String`, so this counts bytes.
+/// `\d`, `\w`, `\s` and negated classes are Unicode-aware in the `regex`
+/// crate and can match a 4-byte character, so they count 4. Positive
+/// all-ASCII classes and ASCII literals count 1. That over-counts (the
+/// built-in set is entirely ASCII in practice) in the direction of a larger,
+/// safer window.
+fn max_match_len(src: &str) -> Option<usize> {
+    let mut w = LenWalker {
+        b: src.as_bytes(),
+        i: 0,
+    };
+    let n = w.alternation()?;
+    // A trailing unconsumed byte means the walker lost its place; refuse to
+    // report a bound it cannot stand behind.
+    if w.i == w.b.len() {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Bytes a single Unicode-aware atom can occupy. UTF-8's maximum encoding.
+const UNICODE_ATOM_BYTES: usize = 4;
+
+struct LenWalker<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl LenWalker<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let c = self.peek()?;
+        self.i += 1;
+        Some(c)
+    }
+
+    /// `a|b|c` — the longest alternative. One unbounded alternative makes the
+    /// whole alternation unbounded, which `?` propagation gives us for free.
+    fn alternation(&mut self) -> Option<usize> {
+        let mut best = self.concat()?;
+        while self.peek() == Some(b'|') {
+            self.i += 1;
+            best = best.max(self.concat()?);
+        }
+        Some(best)
+    }
+
+    fn concat(&mut self) -> Option<usize> {
+        let mut total = 0usize;
+        loop {
+            match self.peek() {
+                None | Some(b'|') | Some(b')') => break,
+                _ => {}
+            }
+            let atom = self.atom();
+            let piece = self.quantified(atom)?;
+            total = total.checked_add(piece)?;
+        }
+        Some(total)
+    }
+
+    /// One atom, without its quantifier.
+    fn atom(&mut self) -> Option<usize> {
+        match self.next_byte()? {
+            b'(' => {
+                if self.peek() == Some(b'?') {
+                    self.i += 1;
+                    // `(?i)` flag-setter, `(?i:` or `(?:` group. Anything else
+                    // after `?` — lookaround, named capture — is unmodelled.
+                    loop {
+                        match self.next_byte()? {
+                            b':' => break,
+                            b')' => return Some(0), // flag-setter: zero width
+                            c if c.is_ascii_alphabetic() || c == b'-' => {}
+                            _ => return None,
+                        }
+                    }
+                }
+                let n = self.alternation()?;
+                if self.next_byte()? != b')' {
+                    return None;
+                }
+                Some(n)
+            }
+            b'[' => self.char_class(),
+            b'\\' => match self.next_byte()? {
+                // Zero-width assertions.
+                b'b' | b'B' | b'A' | b'z' | b'Z' => Some(0),
+                // Unicode-aware shorthands.
+                b'd' | b'D' | b'w' | b'W' | b's' | b'S' => Some(UNICODE_ATOM_BYTES),
+                // Unicode property / code-point escapes: unmodelled.
+                b'p' | b'P' | b'u' | b'U' => None,
+                // `\xHH` and `\x{...}` name one code point, up to 4 bytes.
+                b'x' => {
+                    if self.peek() == Some(b'{') {
+                        while self.next_byte()? != b'}' {}
+                    } else {
+                        self.i += 2;
+                        if self.i > self.b.len() {
+                            return None;
+                        }
+                    }
+                    Some(UNICODE_ATOM_BYTES)
+                }
+                // An escaped ASCII literal: one byte.
+                _ => Some(1),
+            },
+            b'^' | b'$' => Some(0),
+            b'.' => Some(UNICODE_ATOM_BYTES),
+            // A raw byte. Multi-byte UTF-8 literals in the source arrive here
+            // one byte at a time and sum to their true width.
+            _ => Some(1),
+        }
+    }
+
+    /// Consume `[...]`, returning the bytes one member can occupy.
+    ///
+    /// A negated class can match any code point outside the set, so it costs
+    /// the Unicode maximum. A positive all-ASCII class costs one byte.
+    fn char_class(&mut self) -> Option<usize> {
+        let mut negated = false;
+        let mut ascii_only = true;
+        if self.peek() == Some(b'^') {
+            negated = true;
+            self.i += 1;
+        }
+        // A `]` in first position is a literal, not the terminator.
+        if self.peek() == Some(b']') {
+            self.i += 1;
+        }
+        loop {
+            match self.next_byte()? {
+                b']' => break,
+                b'\\' => {
+                    // `\w`/`\d`/`\s` inside a class widen it past ASCII.
+                    match self.next_byte()? {
+                        b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'p' | b'P' => ascii_only = false,
+                        _ => {}
+                    }
+                }
+                // A nested class (`[[:alpha:]]`, `[a[b]]`) is unmodelled.
+                b'[' => return None,
+                c if !c.is_ascii() => ascii_only = false,
+                _ => {}
+            }
+        }
+        if negated || !ascii_only {
+            Some(UNICODE_ATOM_BYTES)
+        } else {
+            Some(1)
+        }
+    }
+
+    /// Apply the quantifier that follows an atom, if any.
+    fn quantified(&mut self, atom: Option<usize>) -> Option<usize> {
+        let reps: Option<usize> = match self.peek() {
+            Some(b'*') | Some(b'+') => {
+                self.i += 1;
+                None
+            }
+            Some(b'?') => {
+                self.i += 1;
+                Some(1)
+            }
+            Some(b'{') => self.repetition_max(),
+            _ => Some(1),
+        };
+        // Lazy (`??`, `*?`, `{1,2}?`) and possessive (`*+`) suffixes change
+        // which match is preferred, never how long it can be.
+        if matches!(self.peek(), Some(b'?') | Some(b'+')) && self.i > 0 {
+            let prev = self.b[self.i - 1];
+            if matches!(prev, b'*' | b'+' | b'?' | b'}') {
+                self.i += 1;
+            }
+        }
+        match (atom, reps) {
+            (Some(a), Some(r)) => a.checked_mul(r),
+            _ => None,
+        }
+    }
+
+    /// `{n}`, `{n,}`, `{n,m}` — the maximum. `None` for `{n,}`.
+    ///
+    /// Restores the cursor and reports "no quantifier" if this `{` is a
+    /// literal brace rather than a repetition.
+    fn repetition_max(&mut self) -> Option<usize> {
+        let start = self.i;
+        self.i += 1; // '{'
+        let mut lo = String::new();
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            lo.push(self.b[self.i] as char);
+            self.i += 1;
+        }
+        if lo.is_empty() {
+            self.i = start;
+            return Some(1); // literal '{'
+        }
+        match self.next_byte() {
+            Some(b'}') => lo.parse::<usize>().ok(),
+            Some(b',') => {
+                let mut hi = String::new();
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    hi.push(self.b[self.i] as char);
+                    self.i += 1;
+                }
+                if self.next_byte() != Some(b'}') {
+                    self.i = start;
+                    return Some(1);
+                }
+                if hi.is_empty() {
+                    None // {n,} — unbounded
+                } else {
+                    hi.parse::<usize>().ok()
+                }
+            }
+            _ => {
+                self.i = start;
+                Some(1)
+            }
+        }
+    }
+}
+
+/// The holdback the current pattern set requires, and why.
+#[derive(Debug, Clone)]
+pub struct HoldbackDerivation {
+    /// Bytes of decoded text the forward loop must lag by.
+    pub bytes: usize,
+    /// The pattern that sets `bytes`. Named so an operator who adds a pattern
+    /// with a wide repetition can see what just cost them latency.
+    pub set_by: String,
+    /// Patterns with no computable maximum length — `*`, `+`, `{n,}`, or
+    /// syntax the walker does not model.
+    pub unbounded: Vec<String>,
+}
+
+/// Derive the holdback from the pattern set actually installed.
+///
+/// # The derivation
+///
+/// The scrubber releases every byte except the last `H`, and re-scans the
+/// whole held buffer each time. A match that begins at stream offset `p` is
+/// therefore still unreleased until the stream has grown past `p + H`. If the
+/// match is no longer than `H` it is entirely inside the buffer at the moment
+/// the decision to release `p` is taken, so it is found. Hence
+///
+/// > **H = max over patterns of the longest text that pattern can match.**
+///
+/// Not `max - 1`: a match of exactly `H` bytes starting at `p` is complete
+/// once the buffer holds `p + H` bytes, which is the same instant `p` becomes
+/// releasable, and the straddle clamp then holds it.
+///
+/// Patterns with no maximum cannot raise `H` — nothing finite would cover
+/// them. They are listed in `unbounded` so this is visible rather than
+/// assumed, and they fall into two groups that behave differently:
+///
+/// - **Open-ended tail** — `anthropic_api_key` (`sk-ant-…{10,}`),
+///   `bearer_token` (`Bearer\s+[…]+`), `slack_token`'s `xox?-` form. The
+///   unbounded repetition is the last thing in the pattern, so a *prefix* of
+///   the secret already matches. The match is detected at its minimum length,
+///   while its first byte is still held, and the straddle clamp then refuses
+///   to release that byte for as long as the match keeps growing. Verified:
+///   a 3013-byte `sk-ant-` key, streamed 8 bytes at a time through a
+///   1020-byte window, is redacted in full.
+/// - **Unbounded middle** — `jwt` (`…{17,}\.…{17,}\.…{10,}`) and
+///   `slack_token`'s `xapp-` form. Required content sits *after* the
+///   unbounded part, so nothing matches until that content arrives, and the
+///   head can be released before the pattern is detectable at all. Verified:
+///   a JWT under `H` is caught; one totalling 1558 bytes is **not**. This is
+///   the one class of secret the holdback does not close, and no finite
+///   window would — closing it needs a partial-match automaton
+///   (`regex-automata` DFA state stepping) rather than a bigger buffer.
+///
+/// # What it comes out to
+///
+/// 1020 bytes for the built-in set, set by `pypi_token`
+/// (`pypi-AgEIcHlwaS5vcmc` + `[0-9A-Za-z_-]{50,1000}`). One pattern's
+/// `{50,1000}` sets the window for the whole scanner; the runner-up is
+/// `db_connection_string` at 784. This is worth knowing before adding a
+/// pattern with a wide bounded repetition: it is paid as latency by every
+/// streamed response in the deployment.
+///
+/// Read once, lazily. First read is the first streamed response, which is
+/// strictly after `install_custom_patterns` runs at boot, so operator
+/// patterns are included.
+pub fn derive_holdback() -> &'static HoldbackDerivation {
+    static DERIVED: Lazy<HoldbackDerivation> = Lazy::new(|| {
+        let mut bytes = 0usize;
+        let mut set_by = String::from("none");
+        let mut unbounded = Vec::new();
+        // Every PII detector counts, enabled here or not: a workspace's
+        // setting can switch one on for its requests, and the window must
+        // already cover it.
+        let every_pii = pii::detectors().iter().map(|d| (&d.id, &d.regex));
+        let installed = all_patterns(None)
+            .filter(|p| p.pii.is_none())
+            .map(|p| (&p.name, &p.regex));
+        for (name, regex) in installed.chain(every_pii) {
+            match max_match_len(regex.as_str()) {
+                Some(n) => {
+                    if n > bytes {
+                        bytes = n;
+                        set_by = name.clone();
+                    }
+                }
+                None => unbounded.push(name.clone()),
+            }
+        }
+        HoldbackDerivation {
+            bytes,
+            set_by,
+            unbounded,
+        }
+    });
+    &DERIVED
+}
+
+/// The effective holdback for this configuration, logged once.
+///
+/// `None` in config means "the derived bound" — the only value that carries a
+/// guarantee. An explicit value, including `0`, is an operator override and is
+/// logged as such: `0` restores the pre-holdback behaviour exactly, leak
+/// included.
+pub fn resolve_holdback(cfg: &crate::config::DlpConfig) -> usize {
+    static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+    let derived = derive_holdback();
+    let effective = cfg.stream_holdback_bytes.unwrap_or(derived.bytes);
+    ANNOUNCE.call_once(|| {
+        if effective == 0 {
+            tracing::warn!(
+                derived_bytes = derived.bytes,
+                "Output DLP streaming holdback is OFF (dlp.stream_holdback_bytes = 0). \
+                 Per-line scrubbing still runs, but a secret split across two SSE \
+                 deltas will reach the client unredacted."
+            );
+        } else {
+            tracing::info!(
+                holdback_bytes = effective,
+                derived_bytes = derived.bytes,
+                set_by = %derived.set_by,
+                explicit = cfg.stream_holdback_bytes.is_some(),
+                unbounded_patterns = ?derived.unbounded,
+                "Output DLP streaming holdback active: streamed text is forwarded \
+                 this many bytes behind the model. Time-to-first-token grows by the \
+                 time the model needs to produce that many bytes; total response \
+                 time is unchanged."
+            );
+            if effective < derived.bytes {
+                tracing::warn!(
+                    holdback_bytes = effective,
+                    derived_bytes = derived.bytes,
+                    set_by = %derived.set_by,
+                    "Configured holdback is below the derived bound; a secret longer \
+                     than the configured window can still be split across deltas \
+                     undetected."
+                );
+            }
+        }
+    });
+    effective
+}
+
+/// Decoded-text continuity across SSE deltas.
+///
+/// The proxy feeds every delta's **decoded** text through `push`, forwards
+/// what comes back, and calls `flush` at end of stream. What comes back lags
+/// the input by up to `holdback` bytes, which is exactly what buys the ability
+/// to see a pattern whole: bytes already handed to the client cannot be taken
+/// back, so forwarding has to trail far enough behind to have seen any match
+/// in full before its first byte goes out.
+///
+/// # The latency this costs, precisely
+///
+/// - **Delayed:** every byte of streamed text, by `holdback` bytes of
+///   generation. At the derived 1020 bytes and a typical 250–400 B/s of output
+///   (60–100 tok/s at ~4 bytes/token) that is **2.5–4 s** before the first
+///   text reaches the client. Faster models pay proportionally less; a
+///   500 tok/s model pays ~0.5 s.
+/// - **Not delayed:** the *last* byte, and therefore total response time.
+///   `flush` runs in the same task before the terminal event, so the tail
+///   arrives with the terminal event it would have arrived with anyway. This
+///   moves when text appears, not when the response finishes.
+/// - **Not delayed:** anything that is not streamed text — tool-call
+///   arguments, usage events, the governance block, the judge's synthesis.
+/// - **Not paid at all** when `dlp.scan_output` is off, or when
+///   `dlp.stream_holdback_bytes` is `0`.
+///
+/// CPU cost is one `scan` over the held buffer per delta, plus a JSON parse
+/// and re-serialise of the delta line (the released text has to be written
+/// back into it). Measured end to end through `holdback_rewrite_line` — Apple
+/// M4 Pro, release, 20 000 × 26-byte OpenAI chunks at the derived 1020-byte
+/// holdback: **2.23 µs per delta**, against 0.39 µs for the per-line scrub
+/// alone. About +1.8 µs per delta, or **+0.9 ms** across a 500-delta response.
+/// The byte lag below, not the CPU, is the cost worth arguing about.
+///
+/// # Memory
+///
+/// `pending` is bounded by `holdback` plus the length of the longest match
+/// currently in progress, and a match cannot outlive the response. The
+/// streaming task already holds the entire response in `accumulated_content`,
+/// so in the worst case this buffers a bounded slice of something already
+/// resident — it does not introduce a new unbounded buffer.
+pub struct StreamScrubber {
+    holdback: usize,
+    pending: String,
+    redactions: Vec<String>,
+    /// The request's workspace PII policy; `None` scans with this machine's.
+    pii: Option<std::sync::Arc<PiiPolicy>>,
+    /// Set for a tool call's buffered arguments: PII `redact` findings are left
+    /// as written (`without_tool_argument_pii`), and their names kept here.
+    tool_arguments: bool,
+    pii_left: Vec<String>,
+}
+
+impl StreamScrubber {
+    pub fn new(holdback: usize) -> Self {
+        Self {
+            holdback,
+            pending: String::new(),
+            redactions: Vec::new(),
+            pii: None,
+            tool_arguments: false,
+            pii_left: Vec::new(),
+        }
+    }
+
+    /// For a tool call's arguments: PII the client is about to execute is not
+    /// rewritten (intutic/intutic#438); secrets still are.
+    pub fn for_tool_arguments(mut self) -> Self {
+        self.tool_arguments = true;
+        self
+    }
+
+    /// PII detector names left unredacted in tool arguments.
+    pub fn pii_left(&self) -> &[String] {
+        &self.pii_left
+    }
+
+    fn findings(&mut self) -> Vec<DlpFinding> {
+        let findings = scan_with(&self.pending, self.pii.as_deref());
+        if !self.tool_arguments {
+            return findings;
+        }
+        let (kept, left): (Vec<_>, Vec<_>) = findings
+            .into_iter()
+            .partition(|f| !(is_pii(f) && f.action == "redact"));
+        for f in left {
+            if !self.pii_left.contains(&f.pattern_name) {
+                self.pii_left.push(f.pattern_name);
+            }
+        }
+        kept
+    }
+
+    /// Scan with a workspace's PII detector actions (`workspace_pii_policy`).
+    pub fn with_pii(mut self, pii: Option<std::sync::Arc<PiiPolicy>>) -> Self {
+        self.pii = pii;
+        self
+    }
+
+    /// Distinct pattern names this scrubber has redacted.
+    pub fn redactions(&self) -> &[String] {
+        &self.redactions
+    }
+
+    /// Feed one delta's decoded text; returns the text safe to forward now.
+    ///
+    /// With `holdback == 0` this is the identity function, byte for byte —
+    /// which is what makes `stream_holdback_bytes: 0` an exact restoration of
+    /// the pre-holdback behaviour rather than an approximation of it.
+    pub fn push(&mut self, text: &str) -> String {
+        if self.holdback == 0 {
+            return text.to_string();
+        }
+        self.pending.push_str(text);
+        self.release()
+    }
+
+    /// Everything still held, scrubbed. Idempotent: a second call returns
+    /// `None`, so the several terminal paths that must flush can each call it
+    /// without coordinating.
+    pub fn flush(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let findings = self.findings();
+        self.note(&findings);
+        let held = std::mem::take(&mut self.pending);
+        Some(if findings.is_empty() {
+            held
+        } else {
+            redact(&held, &findings)
+        })
+    }
+
+    fn note(&mut self, findings: &[DlpFinding]) {
+        for f in findings {
+            if !self.redactions.contains(&f.pattern_name) {
+                self.redactions.push(f.pattern_name.clone());
+            }
+        }
+    }
+
+    fn release(&mut self) -> String {
+        if self.pending.len() <= self.holdback {
+            return String::new();
+        }
+        let findings = self.findings();
+        let mut cut = self.pending.len() - self.holdback;
+
+        // The straddle clamp. A finding that starts before the cut and ends
+        // after it must not have its head released — the tail is still
+        // arriving, and once the head is out it cannot be redacted. Pull the
+        // cut back to the finding's start and re-check, because findings
+        // overlap (a `bearer_token` and the `jwt` inside it) and moving the
+        // cut can expose a different straddle. Terminates: `cut` strictly
+        // decreases and is bounded below by 0.
+        //
+        // This is also what covers patterns with no maximum length. Their
+        // match keeps growing, the clamp keeps holding its start, and the
+        // whole thing is released — redacted — only once it stops growing.
+        loop {
+            let mut next = cut;
+            for f in &findings {
+                if f.offset < next && f.offset + f.length > next {
+                    next = f.offset;
+                }
+            }
+            if next == cut {
+                break;
+            }
+            cut = next;
+        }
+
+        // `len - holdback` can land inside a multi-byte character. Findings
+        // always start and end on character boundaries, so walking the cut
+        // *down* to a boundary cannot move it past the end of a finding that
+        // was clear of it a moment ago.
+        while cut > 0 && !self.pending.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == 0 {
+            return String::new();
+        }
+
+        let head_findings: Vec<DlpFinding> = findings
+            .into_iter()
+            .filter(|f| f.offset + f.length <= cut)
+            .collect();
+        self.note(&head_findings);
+        let head: String = self.pending.drain(..cut).collect();
+        if head_findings.is_empty() {
+            head
+        } else {
+            redact(&head, &head_findings)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aws_key_detection() {
+        // Fixture is runtime-assembled: the repo convention forbids contiguous
+        // credential-shaped literals in source, in every package.
+        let text = concat!("My key is AKIA", "IOSFODNN7EXAMPLE and it should be found");
+        let findings = scan(text);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern_name, "aws_access_key");
+    }
+
+    #[test]
+    fn test_anthropic_key_detection() {
+        let text = "Print my API_KEY: sk-ant-api03-abcdefg";
+        let findings = scan(text);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern_name, "anthropic_api_key");
+        assert_eq!(findings[0].action, "block");
+    }
+
+    #[test]
+    fn test_ssn_detection() {
+        let text = format!("SSN: {}-{}-{}", "123", "45", "6789");
+        let findings = scan(&text);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern_name, "pii.ssn");
+        assert_eq!(findings[0].category, "pii");
+        assert_eq!(redact(&text, &findings), "SSN: [REDACTED_PII]");
+    }
+
+    /// Email and phone stay off on live traffic, so an agent editing a
+    /// `package.json` author keeps the address; a copy Intutic keeps loses
+    /// both, alongside the secrets.
+    #[test]
+    fn stored_copies_redact_email_and_phone_that_live_traffic_keeps() {
+        let text = format!(
+            "git config user.email {}@{} && call {} 555-0100 key AKIA{}",
+            "jane.doe", "example.com", "(415)", "IOSFODNN7EXAMPLE"
+        );
+        let live: Vec<String> = scan(&text).into_iter().map(|f| f.pattern_name).collect();
+        assert_eq!(
+            live,
+            vec!["aws_access_key".to_string()],
+            "live defaults: secrets only"
+        );
+
+        let stored = redact_for_storage(&text).expect("the stored copy has matches");
+        assert_eq!(
+            stored,
+            "git config user.email [REDACTED_PII] && call [REDACTED_PII] key [REDACTED_SECRET]"
+        );
+        assert_eq!(
+            redact_for_storage("cargo test --package intutic-proxy"),
+            None
+        );
+    }
+
+    #[test]
+    fn every_detector_redacts_what_is_stored() {
+        for d in pii::detectors() {
+            assert_eq!(
+                d.stored_action, "redact",
+                "{} must redact stored copies",
+                d.id
+            );
+        }
+    }
+
+    #[test]
+    fn json_storage_redaction_rewrites_values_never_keys() {
+        let mut v = serde_json::json!({
+            "author": format!("Jane <{}@{}>", "jane", "example.com"),
+            "nested": [{"phone": format!("{} 555-0100", "(415)")}, 3, true],
+            "clean": "src/main.rs",
+        });
+        assert_eq!(redact_json_for_storage(&mut v), 2);
+        assert_eq!(v["author"], "Jane <[REDACTED_PII]>");
+        assert_eq!(v["nested"][0]["phone"], "[REDACTED_PII]");
+        assert_eq!(v["clean"], "src/main.rs");
+    }
+
+    #[test]
+    fn test_redaction() {
+        let text = concat!("Key: AKIA", "IOSFODNN7EXAMPLE");
+        let findings = scan(text);
+        let redacted = redact(text, &findings);
+        assert!(redacted.contains("[REDACTED_SECRET]"));
+        assert!(!redacted.contains("AKIA"));
+    }
+
+    // ── developer-workstation honeytoken (Wave 4 item 7) ──────────────────
+    //
+    // The decoy value planted by `infra/scripts/gen-dev-honeytoken.sh` and
+    // matched by `PATTERNS`'s `dev_env_honeytoken` entry. Runtime-assembled
+    // here too, for the same reason `test_aws_key_detection` above is.
+
+    #[test]
+    fn honeytoken_value_is_blocked_not_merely_redacted() {
+        let decoy = concat!("AKIA", "HONEYTOKENDECOY6");
+        let text = format!("AWS_ACCESS_KEY_ID={decoy}");
+        let findings = scan(&text);
+        // Also matches the generic `aws_access_key` shape (deliberately — see
+        // the `dev_env_honeytoken` doc comment above `PATTERNS`), so this
+        // asserts presence and action rather than an exact count.
+        let hit = findings
+            .iter()
+            .find(|f| f.pattern_name == "dev_env_honeytoken")
+            .expect("the honeytoken value must be recognised by its own pattern, not just aws_access_key's generic shape");
+        assert_eq!(hit.action, "block", "a honeytoken hit must block, not redact — a quiet redaction is indistinguishable from an ordinary AWS-key false positive in the logs");
+        assert_eq!(hit.category, "credential");
+    }
+
+    #[test]
+    fn honeytoken_pattern_does_not_fire_on_an_ordinary_aws_key() {
+        // The false-positive contract every fixture table in this repo
+        // carries: a real (fake-but-differently-shaped) AWS key must not be
+        // misreported as the honeytoken specifically.
+        let ordinary = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let findings = scan(ordinary);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.pattern_name == "dev_env_honeytoken"),
+            "an unrelated AWS key must not be misidentified as the honeytoken: {findings:?}"
+        );
+        // It must still be caught by the generic pattern — this test is about
+        // over-matching, not about losing coverage.
+        assert!(findings.iter().any(|f| f.pattern_name == "aws_access_key"));
+    }
+
+    // ── operator-supplied patterns ─────────────────────────────────────────
+    //
+    // `install_custom_patterns` writes a process-global `OnceCell`, so exactly
+    // one test may install. The pattern used here is deliberately absurd
+    // (`ZZTESTPHIZZ-1234`) so that installing it cannot change the verdict of
+    // any other test in this file — several of which assert that ordinary text
+    // produces NO findings, and would start failing if a realistic custom
+    // pattern leaked into their fixtures.
+
+    fn def(
+        name: &str,
+        category: &str,
+        regex: &str,
+        action: &str,
+    ) -> crate::config::CustomDlpPattern {
+        crate::config::CustomDlpPattern {
+            name: name.into(),
+            category: category.into(),
+            regex: regex.into(),
+            action: action.into(),
+        }
+    }
+
+    #[test]
+    fn custom_patterns_are_scanned_alongside_the_builtins() {
+        let installed =
+            install_custom_patterns(&[def("zz_test_phi", "phi", r"ZZTESTPHIZZ-\d{4}", "redact")]);
+        // Another test in this binary may have installed first; either outcome
+        // is fine, what matters is that the pattern is active afterwards.
+        assert!(installed.is_ok() || installed.is_err());
+
+        if CUSTOM.get().is_some() {
+            let findings = scan("record ZZTESTPHIZZ-4471 attached");
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.pattern_name == "zz_test_phi" && f.category == "phi"),
+                "custom pattern did not fire: {findings:?}"
+            );
+            // And the built-ins still work with a custom set installed.
+            assert!(!scan(concat!("AKIA", "IOSFODNN7EXAMPLE")).is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_pattern_with_a_bad_regex_is_rejected_by_name() {
+        let err = install_custom_patterns(&[def("broken", "phi", "([unclosed", "redact")])
+            .expect_err("a malformed regex must not be accepted");
+        assert!(
+            err.contains("broken"),
+            "the error must name the pattern: {err}"
+        );
+    }
+
+    #[test]
+    fn custom_pattern_with_an_unknown_action_is_rejected() {
+        // There is no warn tier. Accepting one would silently downgrade to
+        // redact and the operator would believe they had configured a warning.
+        let err = install_custom_patterns(&[def("warny", "phi", "abc", "warn")])
+            .expect_err("only block and redact exist");
+        assert!(err.contains("warn"), "{err}");
+    }
+
+    #[test]
+    fn custom_pattern_may_not_shadow_a_builtin_name() {
+        // DlpEscalationDetector counts DISTINCT pattern_name values, so a
+        // duplicate name would quietly make two findings count as one.
+        let err = install_custom_patterns(&[def("pii.ssn", "phi", "abc", "redact")])
+            .expect_err("shadowing a built-in must be refused");
+        assert!(err.contains("pii.ssn"), "{err}");
+    }
+
+    #[test]
+    fn test_no_false_positives() {
+        let text = "Hello world, this is a normal message";
+        let findings = scan(text);
+        assert!(findings.is_empty());
+    }
+
+    // ── Expanded pattern set (2026-07-29) ───────────────────────────────
+    //
+    // Formats ported from the gitleaks default config and TruffleHog
+    // detector sources. Each test uses a syntactically valid but fake token.
+
+    fn names(text: &str) -> Vec<String> {
+        scan(text).into_iter().map(|f| f.pattern_name).collect()
+    }
+
+    #[test]
+    fn aws_temporary_and_other_key_classes_detected() {
+        // ASIA (STS temporary) was invisible to the old AKIA-only pattern.
+        // Assembled at runtime, per this module's convention — no contiguous
+        // credential-shaped literal (GitHub secret scanning flags those even
+        // with an EXAMPLE suffix).
+        let asia = format!("key {}{} here", "ASIA", "JEXAMPLEKEY234AB");
+        let abia = format!("key {}{} here", "ABIA", "JEXAMPLEKEY234AB");
+        assert!(names(&asia).contains(&"aws_access_key".into()));
+        assert!(names(&abia).contains(&"aws_access_key".into()));
+    }
+
+    #[test]
+    fn all_github_classic_prefixes_detected() {
+        // Only ghp_ matched before; the other four classes were invisible.
+        for prefix in ["ghp", "gho", "ghu", "ghs", "ghr"] {
+            let tok = format!("{}_{}", prefix, "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+            assert!(
+                names(&format!("token {tok} end")).contains(&"github_token".into()),
+                "{prefix} must be detected"
+            );
+        }
+    }
+
+    #[test]
+    fn github_fine_grained_pat_detected() {
+        let tok = format!("github_pat_{}", "A".repeat(82));
+        assert!(names(&tok).contains(&"github_fine_grained_pat".into()));
+    }
+
+    #[test]
+    fn openai_keys_detected_via_magic_substring() {
+        // Legacy: sk- + 20 alnum + T3BlbkFJ + 20 alnum.
+        let legacy = format!(
+            "sk-{}T3BlbkFJ{}",
+            "a1B2c3D4e5F6g7H8i9J0", "K1l2M3n4O5p6Q7r8S9t0"
+        );
+        assert!(names(&legacy).contains(&"openai_api_key".into()));
+        // Project-scoped: symmetric 58-char halves around the magic.
+        let half = "a".repeat(58);
+        let proj = format!("sk-proj-{half}T3BlbkFJ{half}");
+        assert!(names(&proj).contains(&"openai_api_key".into()));
+    }
+
+    #[test]
+    fn platform_tokens_detected() {
+        let cases: Vec<(String, &str)> = vec![
+            (format!("glpat-{}", "aB3dE5fG7hI9jK1lM3nO"), "gitlab_pat"),
+            // Assembled at runtime: a contiguous literal in this shape trips
+            // GitHub push protection — correctly, which is its own kind of
+            // proof the pattern is worth having.
+            (
+                format!("xox{}-123456789012-123456789012-AbCdEfGhIjKlMnOp", "b"),
+                "slack_token",
+            ),
+            (
+                format!("https://hooks.slack.com/services/{}", "A".repeat(44)),
+                "slack_webhook_url",
+            ),
+            (
+                format!("AIza{}", "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6c"),
+                "google_api_key",
+            ),
+            (
+                format!("sk_live_{}", "a1B2c3D4e5F6g7H8i9J0k1L2"),
+                "stripe_key",
+            ),
+            (
+                format!("SG.{}.{}", "a".repeat(22), "b".repeat(43)),
+                "sendgrid_api_key",
+            ),
+            (
+                format!("npm_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"),
+                "npm_token",
+            ),
+            (
+                format!("pypi-AgEIcHlwaS5vcmc{}", "x".repeat(60)),
+                "pypi_token",
+            ),
+            (
+                format!("hf_{}", "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh"),
+                "huggingface_token",
+            ),
+        ];
+        for (tok, expected) in cases {
+            assert!(
+                names(&format!("value: {tok} .")).contains(&expected.to_string()),
+                "{expected} must detect {tok}"
+            );
+        }
+    }
+
+    #[test]
+    fn db_connection_credentials_detected_and_redaction_spares_the_host() {
+        // Assembled at runtime so no credential-shaped literal exists in
+        // source (GitHub secret scanning flags the contiguous form).
+        let text = format!(
+            "url is postgres://{}:{}@db.internal:5432/app",
+            "svc_user", "hunter22secret"
+        );
+        let findings = scan(&text);
+        assert!(findings
+            .iter()
+            .any(|f| f.pattern_name == "db_connection_string"));
+        let redacted = redact(&text, &findings);
+        assert!(
+            !redacted.contains("hunter22secret"),
+            "password must be gone"
+        );
+        assert!(
+            redacted.contains("db.internal:5432/app"),
+            "host stays legible"
+        );
+    }
+
+    /// The loop and the `RegexSet` it replaced must agree on every finding.
+    ///
+    /// `scan` used to prefilter with a `RegexSet` and then run only the patterns
+    /// the set reported. That was replaced with a plain loop over every pattern
+    /// because the set measured **165× slower** on a clean body (see `scan`'s doc
+    /// comment). A speed change must not be a behaviour change, and "the other
+    /// tests still pass" does not prove that — they assert individual patterns,
+    /// not that the two strategies produce the *same list*, in the same order,
+    /// with the same offsets.
+    ///
+    /// So this reconstructs the old strategy and diffs the whole `Vec`. If anyone
+    /// reintroduces a prefilter, this is what tells them whether it is equivalent.
+    #[test]
+    fn the_loop_and_the_regexset_prefilter_agree_exactly() {
+        // Every pattern family in one body, so the comparison covers the
+        // multi-match path and not just the empty case. Assembled at runtime,
+        // per this module's convention — no contiguous credential literal.
+        let body = format!(
+            "deploy log\n\
+             aws {}{} ok\n\
+             gh {}_{} ok\n\
+             anthropic sk-ant-{} ok\n\
+             gitlab glpat-{} ok\n\
+             google AIza{} ok\n\
+             stripe sk_live_{} ok\n\
+             npm npm_{} ok\n\
+             hf hf_{} ok\n\
+             db postgres://{}:{}@db.internal:5432/app\n\
+             ssn 123-45-6789\n\
+             auth Bearer abc123DEF456ghi789\n\
+             key {}\n\
+             and a lot of ordinary prose to make the body worth scanning. {}",
+            "ASIA",
+            "JEXAMPLEKEY234AB",
+            "ghp",
+            "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+            "abcdefghijklmnop",
+            "aB3dE5fG7hI9jK1lM3nO",
+            "SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6c",
+            "a1B2c3D4e5F6g7H8i9J0k1L2",
+            "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+            "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh",
+            "svc_user",
+            "hunter22secret",
+            concat!("-----BEGIN ", "OPENSSH PRIVATE KEY-----"),
+            "lorem ipsum dolor sit amet ".repeat(200),
+        );
+
+        // The old strategy, reconstructed verbatim.
+        let prefilter = regex::RegexSet::new(PATTERNS.iter().map(|p| p.regex.as_str())).unwrap();
+        let mut via_set = Vec::new();
+        for idx in prefilter.matches(&body) {
+            let pattern = &PATTERNS[idx];
+            for mat in pattern.regex.find_iter(&body) {
+                via_set.push((
+                    pattern.name.clone(),
+                    pattern.category.clone(),
+                    pattern.action.clone(),
+                    mat.start(),
+                    mat.len(),
+                ));
+            }
+        }
+
+        // The PII detectors are left out of the comparison: a validator
+        // decides each of their findings, which no `RegexSet` reproduces.
+        let via_loop: Vec<_> = scan(&body)
+            .into_iter()
+            .filter(|f| PATTERNS.iter().any(|p| p.name == f.pattern_name))
+            .map(|f| (f.pattern_name, f.category, f.action, f.offset, f.length))
+            .collect();
+
+        assert!(
+            !via_loop.is_empty(),
+            "fixture must actually trip patterns, or this test proves nothing",
+        );
+        assert_eq!(
+            via_loop, via_set,
+            "the loop and the RegexSet prefilter must produce identical findings",
+        );
+    }
+
+    #[test]
+    fn jwt_with_signature_detected() {
+        let jwt = format!(
+            "eyJhbGciOiJIUzI1NiJ9x.eyJzdWIiOiIxMjM0NTY3ODkwIn0.{}",
+            "TJVA95OrM7E2cBab30RM"
+        );
+        assert!(names(&jwt).contains(&"jwt".into()));
+    }
+
+    #[test]
+    fn bearer_token_detected() {
+        // Had zero coverage since the pattern was written.
+        let f = scan("Authorization value Bearer abc123DEF456ghi789 in body");
+        assert!(f.iter().any(|x| x.pattern_name == "bearer_token"));
+    }
+
+    #[test]
+    fn private_key_family_blocks_including_openssh_and_pgp() {
+        // Had zero coverage; the old pattern also missed both of these.
+        // Fixture is runtime-assembled: the repo convention forbids contiguous
+        // credential-shaped literals in source, in every package.
+        for header in [
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            concat!("-----BEGIN ", "RSA PRIVATE KEY-----"),
+            concat!("-----BEGIN ", "OPENSSH PRIVATE KEY-----"),
+            concat!("-----BEGIN ", "ENCRYPTED PRIVATE KEY-----"),
+            concat!("-----BEGIN ", "PGP PRIVATE KEY BLOCK-----"),
+        ] {
+            let f = scan(header);
+            let hit = f.iter().find(|x| x.pattern_name == "private_key");
+            let hit = hit.unwrap_or_else(|| panic!("{header} must be caught"));
+            assert_eq!(hit.action, "block", "{header} must block, not redact");
+        }
+    }
+
+    #[test]
+    fn ordinary_technical_text_produces_no_findings() {
+        // The false-positive control. Everyday engineering text carrying the
+        // shapes that trip naive scanners: git SHAs, UUIDs, base64-ish ids,
+        // words containing pattern prefixes.
+        let text = "task-123 finished; risk-based review of commit                     9f86d081884c7d659a2feaa0c55ad015a3bf4f1b left node_modules                     unchanged. uuid 550e8400-e29b-41d4-a716-446655440000,                     ghost_user asked about skiing at https://example.com/a/b.                     The phone extension is 555-0100 and the build id is                     AKIA-lowercase-not-a-key.";
+        let findings = scan(text);
+        assert!(
+            findings.is_empty(),
+            "no findings expected, got: {:?}",
+            findings.iter().map(|f| &f.pattern_name).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_scrub_tests {
+    use super::*;
+
+    #[test]
+    fn clean_line_returns_none_and_costs_nothing() {
+        assert!(scrub_stream_text(r#"data: {"delta":{"text":"hello world"}}"#, None).is_none());
+    }
+
+    #[test]
+    fn secret_inside_a_delta_is_redacted_and_named() {
+        let line = concat!(
+            r#"data: {"delta":{"text":"key: AKIA"#,
+            r#"IOSFODNN7EXAMPLE done"}}"#
+        );
+        let (scrubbed, names) = scrub_stream_text(line, None).expect("must find the key");
+        assert!(!scrubbed.contains(concat!("AKIA", "IOSFODNN7EXAMPLE")));
+        assert!(scrubbed.contains("[REDACTED_SECRET]"));
+        assert_eq!(names, ["aws_access_key"]);
+        // The scrubbed line must still be a valid SSE data line with valid JSON.
+        let json_part = scrubbed.strip_prefix("data: ").unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(json_part).is_ok());
+    }
+
+    #[test]
+    fn block_action_material_is_contained_by_redaction() {
+        // Output-side doctrine: containment, not stream-kill.
+        let line = concat!(
+            r#"data: {"delta":{"text":"-----BEGIN "#,
+            r#"OPENSSH PRIVATE KEY----- b"}}"#
+        );
+        let (scrubbed, names) = scrub_stream_text(line, None).unwrap();
+        assert!(!scrubbed.contains("BEGIN OPENSSH"));
+        assert!(names.contains(&"private_key".to_string()));
+    }
+
+    /// `Bearer eyJ…` matches `bearer_token` across the whole span and `jwt`
+    /// across the token inside it. Reverse-offset replacement panicked on that
+    /// — inside the streaming task, which means the client's response died
+    /// mid-sentence. The trigger is a model echoing an Authorization header,
+    /// which is neither rare nor adversarial.
+    #[test]
+    fn a_token_nested_inside_another_finding_does_not_panic() {
+        let line = format!(
+            r#"data: {{"delta":{{"text":"Authorization: Bearer {}.{}.{}"}}}}"#,
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvZSJ9",
+            "S1gnATur3S1gnATur3"
+        );
+        let (scrubbed, names) = scrub_stream_text(&line, None).expect("must find the token");
+        assert!(!scrubbed.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+        assert!(!scrubbed.contains("S1gnATur3"));
+        // Both patterns are still reported even though only the outer span is
+        // the one that got replaced.
+        assert!(names.contains(&"bearer_token".to_string()));
+        assert!(names.contains(&"jwt".to_string()));
+        let json_part = scrubbed.strip_prefix("data: ").unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(json_part).is_ok());
+    }
+
+    #[test]
+    fn several_distinct_secrets_in_one_line_all_redact() {
+        let line = format!(
+            r#"data: {{"text":"a {} b ghp_{} c 123-45-6789"}}"#,
+            concat!("AKIA", "IOSFODNN7EXAMPLE"),
+            "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+        );
+        let (scrubbed, names) = scrub_stream_text(&line, None).unwrap();
+        assert!(!scrubbed.contains("AKIA"));
+        assert!(!scrubbed.contains("ghp_"));
+        assert!(!scrubbed.contains("123-45-6789"));
+        assert_eq!(names.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod redaction_before_forward_tests {
+    use super::*;
+
+    /// Redaction must leave the body parseable, because the proxy forwards the
+    /// redacted JSON rather than the original. A replacement that
+    /// broke the structure would turn a leak into a confusing upstream error.
+    #[test]
+    fn redacting_inside_json_keeps_it_valid() {
+        // Fixture is runtime-assembled: the repo convention forbids contiguous
+        // credential-shaped literals in source, in every package.
+        let body = concat!(
+            r#"{"messages":[{"role":"user","content":"key AKIA"#,
+            r#"IOSFODNN7EXAMPLE here"}]}"#
+        );
+        let findings = scan(body);
+        assert!(!findings.is_empty(), "the fixture must actually match");
+
+        let redacted = redact(body, &findings);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&redacted).expect("redacted body must still be valid JSON");
+
+        let content = parsed["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !content.contains(concat!("AKIA", "IOSFODNN7EXAMPLE")),
+            "secret must be gone"
+        );
+        assert!(content.contains("REDACTED"));
+    }
+
+    /// The replacement text must not introduce characters that would need
+    /// escaping inside a JSON string.
+    #[test]
+    fn the_replacement_needs_no_json_escaping() {
+        let findings = scan(concat!("AKIA", "IOSFODNN7EXAMPLE"));
+        let out = redact(concat!("AKIA", "IOSFODNN7EXAMPLE"), &findings);
+        assert!(
+            !out.contains('"'),
+            "a quote would break the enclosing string"
+        );
+        assert!(!out.contains('\\'), "a backslash would break escaping");
+    }
+
+    #[test]
+    fn several_secrets_in_one_body_are_all_removed() {
+        // Offsets shift as each replacement is applied; reverse ordering is
+        // what keeps the later ones pointing at the right bytes.
+        let body = concat!(
+            r#"{"a":"AKIA"#,
+            r#"IOSFODNN7EXAMPLE","b":"ghp_"#,
+            r#"012345678901234567890123456789012345","c":"123-45-6789"}"#
+        );
+        let findings = scan(body);
+        assert!(
+            findings.len() >= 3,
+            "expected three matches, got {}",
+            findings.len()
+        );
+
+        let redacted = redact(body, &findings);
+        serde_json::from_str::<serde_json::Value>(&redacted).expect("still valid JSON");
+        assert!(!redacted.contains(concat!("AKIA", "IOSFODNN7EXAMPLE")));
+        assert!(!redacted.contains(concat!("ghp_", "012345678901234567890123456789012345")));
+        assert!(!redacted.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn multibyte_content_does_not_split_a_character() {
+        // replace_range panics on a non-char-boundary. Regex offsets are byte
+        // offsets, so a body with multibyte text before the secret is the case
+        // that would expose it.
+        let body = concat!(
+            r#"{"m":"日本語のテキスト AKIA"#,
+            r#"IOSFODNN7EXAMPLE です"}"#
+        );
+        let findings = scan(body);
+        let redacted = redact(body, &findings);
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        let m = parsed["m"].as_str().unwrap();
+        assert!(m.contains("日本語のテキスト"), "surrounding text intact");
+        assert!(!m.contains(concat!("AKIA", "IOSFODNN7EXAMPLE")));
+    }
+
+    #[test]
+    fn a_clean_body_is_returned_unchanged() {
+        let body = r#"{"messages":[{"role":"user","content":"nothing sensitive"}]}"#;
+        assert_eq!(redact(body, &scan(body)), body);
+    }
+}
+
+#[cfg(test)]
+mod holdback_tests {
+    use super::*;
+
+    /// A 20-byte AWS key, and the two halves a model would stream it as.
+    const AWS_KEY: &str = concat!("AKIA", "IOSFODNN7EXAMPLE");
+    const AWS_HEAD: &str = "AKIAIOSFODNN7";
+    const AWS_TAIL: &str = "EXAMPLE";
+
+    /// Drive a scrubber the way the forward loop does and return everything
+    /// the client would have received.
+    fn stream(holdback: usize, deltas: &[&str]) -> (String, StreamScrubber) {
+        let mut sc = StreamScrubber::new(holdback);
+        let mut out = String::new();
+        for d in deltas {
+            out.push_str(&sc.push(d));
+        }
+        if let Some(tail) = sc.flush() {
+            out.push_str(&tail);
+        }
+        (out, sc)
+    }
+
+    // ── the defect ────────────────────────────────────────────────────────
+
+    /// The leak this whole mechanism exists to close, pinned as a test.
+    ///
+    /// A zero holdback is byte-for-byte the behaviour that shipped: per-line
+    /// scrubbing only. The unsplit key is caught by `scrub_stream_text`; the
+    /// split key is not caught by anything, and the client reassembles it.
+    /// If this test ever starts failing because the split key IS redacted at
+    /// holdback 0, the claim in `DlpConfig::stream_holdback_bytes` that `0`
+    /// restores the old behaviour exactly has stopped being true.
+    #[test]
+    fn holdback_zero_is_the_leak_it_documents() {
+        let wire_head = format!(r#"data: {{"delta":{{"text":"{AWS_HEAD}"}}}}"#);
+        let wire_tail = format!(r#"data: {{"delta":{{"text":"{AWS_TAIL}"}}}}"#);
+        // The wire form of each half: the per-line scrub sees nothing.
+        assert!(scrub_stream_text(&wire_head, None).is_none());
+        assert!(scrub_stream_text(&wire_tail, None).is_none());
+        // Unsplit, on one line, it is caught — which is what made the hole
+        // look closed.
+        let whole = format!(r#"data: {{"delta":{{"text":"{AWS_KEY}"}}}}"#);
+        assert!(scrub_stream_text(&whole, None).is_some());
+
+        let (client_sees, _) = stream(0, &[AWS_HEAD, AWS_TAIL]);
+        assert_eq!(
+            client_sees, AWS_KEY,
+            "a zero holdback must be a byte-exact passthrough, leak included"
+        );
+    }
+
+    #[test]
+    fn split_pattern_is_redacted_and_the_unsplit_control_still_is() {
+        let h = derive_holdback().bytes;
+
+        let (split, sc_split) = stream(h, &[AWS_HEAD, AWS_TAIL]);
+        assert!(
+            !split.contains(AWS_KEY),
+            "split key reached the client verbatim: {split}"
+        );
+        assert!(split.contains("[REDACTED_SECRET]"), "got: {split}");
+        assert_eq!(sc_split.redactions(), ["aws_access_key"]);
+
+        let (unsplit, _) = stream(h, &[AWS_KEY]);
+        assert!(!unsplit.contains(AWS_KEY));
+        assert!(unsplit.contains("[REDACTED_SECRET]"));
+    }
+
+    /// Split into as many deltas as it has characters — the shape a
+    /// character-by-character stream actually takes.
+    #[test]
+    fn a_key_split_one_character_per_delta_is_still_caught() {
+        let deltas: Vec<String> = AWS_KEY.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
+        let (out, _) = stream(derive_holdback().bytes, &refs);
+        assert!(!out.contains(AWS_KEY), "got: {out}");
+        assert!(out.contains("[REDACTED_SECRET]"));
+    }
+
+    // ── no truncation, no duplication ─────────────────────────────────────
+
+    /// The failure mode that would be worse than the leak.
+    #[test]
+    fn every_byte_of_a_clean_response_arrives_exactly_once() {
+        let deltas = ["The quick ", "brown fox ", "jumps over ", "the lazy dog."];
+        let (out, _) = stream(derive_holdback().bytes, &deltas);
+        assert_eq!(out, deltas.concat());
+    }
+
+    #[test]
+    fn released_text_and_the_flush_partition_the_response() {
+        // Small holdback so text is released mid-stream rather than all at
+        // flush, which is the case where double-emission would show up.
+        let mut sc = StreamScrubber::new(16);
+        let body: String = std::iter::repeat_n("alpha beta gamma ", 40).collect();
+        let mut released = String::new();
+        for chunk in body.as_bytes().chunks(7) {
+            released.push_str(&sc.push(std::str::from_utf8(chunk).unwrap()));
+        }
+        assert!(
+            !released.is_empty() && released.len() < body.len(),
+            "expected a partial release, got {} of {}",
+            released.len(),
+            body.len()
+        );
+        released.push_str(&sc.flush().unwrap());
+        assert_eq!(released, body);
+    }
+
+    #[test]
+    fn flush_is_idempotent() {
+        let mut sc = StreamScrubber::new(64);
+        sc.push("hello");
+        assert_eq!(sc.flush().as_deref(), Some("hello"));
+        assert_eq!(sc.flush(), None, "a second flush must not re-emit the tail");
+        assert_eq!(sc.flush(), None);
+    }
+
+    #[test]
+    fn flushing_an_untouched_scrubber_emits_nothing() {
+        assert_eq!(StreamScrubber::new(64).flush(), None);
+    }
+
+    // ── the window and the clamp ──────────────────────────────────────────
+
+    /// The holdback lags; it does not buffer the whole response. This is the
+    /// difference between "first token late" and "no streaming at all".
+    #[test]
+    fn text_is_released_progressively_not_at_the_end() {
+        let mut sc = StreamScrubber::new(32);
+        let mut released = 0usize;
+        for _ in 0..20 {
+            released += sc.push("0123456789").len();
+        }
+        // 200 bytes in, all but the last 32 must already be out.
+        assert_eq!(released, 200 - 32);
+    }
+
+    /// A pattern with no maximum length (`sk-ant-[A-Za-z0-9\-_]{10,}`) is
+    /// caught by the straddle clamp, not by the window: the match is detected
+    /// at its minimum length while its first byte is still held, and the clamp
+    /// then refuses to release that byte while the match keeps growing.
+    #[test]
+    fn an_unbounded_pattern_longer_than_the_window_is_still_held() {
+        let key = format!("sk-ant-api03-{}", "a".repeat(80));
+        // A window far shorter than the key: the clamp is the only thing that
+        // can be doing the work here.
+        let mut sc = StreamScrubber::new(24);
+        let mut released = String::new();
+        released.push_str(&sc.push("here is the key: "));
+        for c in key.chars() {
+            released.push_str(&sc.push(&c.to_string()));
+        }
+        released.push_str(&sc.push(" and that is all"));
+        released.push_str(&sc.flush().unwrap());
+
+        assert!(!released.contains("sk-ant-"), "got: {released}");
+        assert!(!released.contains(&"a".repeat(80)), "got: {released}");
+        assert!(released.starts_with("here is the key: [REDACTED_SECRET]"));
+        assert!(released.ends_with(" and that is all"));
+    }
+
+    /// The one class of secret this does not close, pinned so it stays known.
+    ///
+    /// `jwt` puts required content — the `.` separators and the signature —
+    /// *after* its unbounded segments, so nothing matches until the signature
+    /// arrives. A JWT that fits in the window is caught; one that does not has
+    /// its head released before the pattern is detectable at all. No larger
+    /// window fixes this; a partial-match automaton would. If this test starts
+    /// failing because the long form is now caught, the `derive_holdback`
+    /// doctrine describing this gap needs deleting.
+    #[test]
+    fn a_jwt_longer_than_the_window_is_a_known_and_documented_gap() {
+        let h = derive_holdback().bytes;
+        let jwt_of = |payload: usize| {
+            format!(
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ey{}.S1gnATur3S1gnATur3",
+                "J".repeat(payload)
+            )
+        };
+        let run = |jwt: &str| {
+            let deltas: Vec<String> = jwt
+                .as_bytes()
+                .chunks(8)
+                .map(|c| String::from_utf8(c.to_vec()).unwrap())
+                .collect();
+            let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
+            stream(h, &refs).0
+        };
+        let short = jwt_of(500);
+        assert!(
+            !run(&short).contains(&short),
+            "a JWT inside the window must be caught"
+        );
+        let long = jwt_of(1500);
+        assert!(long.len() > h);
+        assert!(
+            run(&long).contains(&long),
+            "the documented gap has closed — update derive_holdback's doctrine"
+        );
+    }
+
+    /// Overlapping findings: `bearer_token` covers the `jwt` inside it, so
+    /// pulling the cut back to one finding's start can expose the other. The
+    /// clamp iterates for exactly this reason.
+    #[test]
+    fn overlapping_findings_do_not_leak_through_the_clamp() {
+        let jwt = format!(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvZSJ9.{}",
+            "S1gnATur3S1gnATur3"
+        );
+        let payload = format!("Authorization: Bearer {jwt}");
+        let mut sc = StreamScrubber::new(20);
+        let mut released = String::new();
+        for chunk in payload.as_bytes().chunks(3) {
+            released.push_str(&sc.push(std::str::from_utf8(chunk).unwrap()));
+        }
+        released.push_str(&sc.flush().unwrap_or_default());
+        assert!(
+            !released.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+            "got: {released}"
+        );
+        assert!(!released.contains("S1gnATur3S1gnATur3"), "got: {released}");
+    }
+
+    /// `len - holdback` lands wherever it lands, including inside a
+    /// three-byte character. `String::drain` panics on a non-boundary.
+    #[test]
+    fn a_cut_inside_a_multibyte_character_does_not_panic_or_corrupt() {
+        let body = "日本語のテキストです、これはとても長い文章になります。";
+        for holdback in 1..40 {
+            let mut sc = StreamScrubber::new(holdback);
+            let mut out = String::new();
+            for chunk in body.chars() {
+                out.push_str(&sc.push(&chunk.to_string()));
+            }
+            out.push_str(&sc.flush().unwrap_or_default());
+            assert_eq!(out, body, "corrupted at holdback {holdback}");
+        }
+    }
+
+    /// A single delta far larger than the window must not be swallowed.
+    #[test]
+    fn a_delta_larger_than_the_window_releases_its_head_immediately() {
+        let mut sc = StreamScrubber::new(10);
+        let out = sc.push("0123456789abcdefghij");
+        assert_eq!(out, "0123456789");
+        assert_eq!(sc.flush().as_deref(), Some("abcdefghij"));
+    }
+
+    // ── PII detectors ─────────────────────────────────────────────────────
+    //
+    // Detection itself is pinned by the shared conformance vectors
+    // (tests/pii_conformance_test.rs); these cover how the detectors sit in
+    // the scanner: actions, configuration, redaction and streaming. Card
+    // numbers are the card brands' published test PANs, assembled at runtime.
+
+    fn visa_test_pan() -> String {
+        ["4111", "1111", "1111", "1111"].join(" ")
+    }
+
+    #[test]
+    fn a_valid_card_redacts_and_a_luhn_failure_is_not_a_card() {
+        let text = format!("card {} exp 12/29", visa_test_pan());
+        let findings = scan(&text);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].pattern_name, "pii.card");
+        assert_eq!(findings[0].action, "redact");
+        assert_eq!(redact(&text, &findings), "card [REDACTED_PII] exp 12/29");
+
+        let off_by_one = format!(
+            "card {} exp 12/29",
+            ["4111", "1111", "1111", "1112"].join(" ")
+        );
+        assert!(scan(&off_by_one).is_empty());
+    }
+
+    #[test]
+    fn email_and_phone_are_off_by_default_and_card_iban_ssn_redact() {
+        let defaults: Vec<(String, String)> = pii::detectors()
+            .iter()
+            .map(|d| (d.id.clone(), d.default_action.clone()))
+            .collect();
+        assert_eq!(
+            defaults,
+            [
+                ("pii.card", "redact"),
+                ("pii.iban", "redact"),
+                ("pii.ssn", "redact"),
+                ("pii.email", "off"),
+                ("pii.phone", "off"),
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+        );
+        let text = format!(
+            "mail {}@{} or call +44 20 {} {}",
+            "jane.doe", "corp.io", "7946", "0958"
+        );
+        assert!(scan(&text).is_empty(), "off detectors must not scan");
+    }
+
+    #[test]
+    fn configured_actions_override_the_defaults() {
+        let cfg: std::collections::BTreeMap<String, String> = [
+            ("pii.email".to_string(), "redact".to_string()),
+            ("pii.card".to_string(), "block".to_string()),
+            ("pii.ssn".to_string(), "off".to_string()),
+        ]
+        .into();
+        let built = build_pii_patterns(&cfg).unwrap();
+        let got: Vec<(&str, &str)> = built
+            .iter()
+            .map(|p| (p.name.as_str(), p.action.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("pii.card", "block"),
+                ("pii.iban", "redact"),
+                ("pii.email", "redact")
+            ]
+        );
+    }
+
+    fn actions(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, a)| (id.to_string(), a.to_string()))
+            .collect()
+    }
+
+    /// The machine's config may raise a workspace's action, in every step.
+    #[test]
+    fn a_machine_may_tighten_the_workspace_baseline() {
+        let workspace = actions(&[
+            ("pii.card", "off"),
+            ("pii.iban", "redact"),
+            ("pii.email", "off"),
+        ]);
+        let local = actions(&[
+            ("pii.card", "redact"),
+            ("pii.iban", "block"),
+            ("pii.email", "block"),
+        ]);
+        let got = effective_pii_actions(&local, &workspace).unwrap();
+        assert_eq!(got["pii.card"], "redact", "off → redact");
+        assert_eq!(got["pii.iban"], "block", "redact → block");
+        assert_eq!(got["pii.email"], "block", "off → block");
+    }
+
+    /// And never lower it, in every step.
+    #[test]
+    fn a_machine_cannot_loosen_the_workspace_baseline() {
+        let workspace = actions(&[
+            ("pii.card", "block"),
+            ("pii.iban", "redact"),
+            ("pii.ssn", "block"),
+        ]);
+        let local = actions(&[
+            ("pii.card", "redact"),
+            ("pii.iban", "off"),
+            ("pii.ssn", "off"),
+        ]);
+        let got = effective_pii_actions(&local, &workspace).unwrap();
+        assert_eq!(got["pii.card"], "block", "block stays above redact");
+        assert_eq!(got["pii.iban"], "redact", "redact stays above off");
+        assert_eq!(got["pii.ssn"], "block", "block stays above off");
+    }
+
+    /// The workspace's action applies where the machine names none, below the
+    /// shipped default included; a detector the workspace leaves out keeps
+    /// the machine's action or its default.
+    #[test]
+    fn the_workspace_governs_only_the_detectors_it_names() {
+        let workspace = actions(&[("pii.card", "off"), ("pii.phone", "redact")]);
+        let local = actions(&[("pii.ssn", "off")]);
+        let built =
+            build_pii_patterns(&effective_pii_actions(&local, &workspace).unwrap()).unwrap();
+        assert_eq!(
+            action_table(&built),
+            [
+                ("pii.card", "off"),
+                ("pii.iban", "redact"),
+                ("pii.ssn", "off"),
+                ("pii.email", "off"),
+                ("pii.phone", "redact"),
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_workspace_setting_with_an_unknown_action_is_refused_by_name() {
+        let err = effective_pii_actions(&actions(&[]), &actions(&[("pii.card", "warn")]))
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("piiDetectors") && err.contains("warn"),
+            "{err}"
+        );
+    }
+
+    /// A direction this machine's switches leave off is still scanned with
+    /// the detectors the workspace names, at their actions here, and with
+    /// nothing else; one they leave on is scanned in full.
+    #[test]
+    fn a_local_switch_cannot_turn_the_workspace_baseline_off() {
+        let policy = std::sync::Arc::new(
+            workspace_pii_policy(&actions(&[("pii.email", "redact"), ("pii.card", "block")]))
+                .unwrap(),
+        );
+        let text = format!(
+            "mail jane.doe@{} card {} key AKIA{}",
+            "corp.io",
+            visa_test_pan(),
+            "IOSFODNN7EXAMPLE"
+        );
+        let found = |scan: &Option<std::sync::Arc<PiiPolicy>>| -> Vec<(String, String)> {
+            scan_with(&text, scan.as_deref())
+                .into_iter()
+                .map(|f| (f.pattern_name, f.action))
+                .collect()
+        };
+
+        let off = direction_scan(false, Some(&policy)).expect("the baseline still scans");
+        let mut baseline = found(&off);
+        baseline.sort();
+        assert_eq!(
+            baseline,
+            [("pii.card", "block"), ("pii.email", "redact")]
+                .map(|(a, b)| (a.to_string(), b.to_string())),
+            "only the workspace's detectors run with the local switch off"
+        );
+
+        let on = direction_scan(true, Some(&policy)).expect("a switch on scans");
+        let names: Vec<String> = found(&on).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"aws_access_key".to_string()), "{names:?}");
+        assert!(names.contains(&"pii.email".to_string()), "{names:?}");
+
+        // Nothing to enforce: no workspace setting, or one that switches every
+        // detector it names off.
+        assert!(direction_scan(false, None).is_none());
+        let all_off =
+            std::sync::Arc::new(workspace_pii_policy(&actions(&[("pii.card", "off")])).unwrap());
+        assert!(direction_scan(false, Some(&all_off)).is_none());
+        assert!(matches!(direction_scan(true, None), Some(None)));
+    }
+
+    /// A workspace policy changes what the PII detectors do and nothing else:
+    /// credentials are found and acted on exactly as without one.
+    #[test]
+    fn a_workspace_policy_leaves_the_credential_patterns_alone() {
+        let policy = workspace_pii_policy(&actions(&[
+            ("pii.card", "off"),
+            ("pii.iban", "off"),
+            ("pii.ssn", "off"),
+        ]))
+        .unwrap();
+        let text = format!("key AKIA{} and {}", "IOSFODNN7EXAMPLE", visa_test_pan());
+        let names: Vec<String> = scan_with(&text, Some(&policy))
+            .into_iter()
+            .map(|f| f.pattern_name)
+            .collect();
+        assert_eq!(names, ["aws_access_key"]);
+        let ant = format!("sk-ant-api03-{}", "a".repeat(93));
+        let found = scan_with(&ant, Some(&policy));
+        assert!(
+            found.iter().any(|f| f.action == "block"),
+            "an Anthropic key still blocks: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_scrubber_with_a_workspace_policy_redacts_its_detectors() {
+        let policy = std::sync::Arc::new(
+            workspace_pii_policy(&actions(&[("pii.email", "redact")])).unwrap(),
+        );
+        let mut sc = StreamScrubber::new(derive_holdback().bytes).with_pii(Some(policy));
+        let mut out = sc.push(&format!("mail {}@{} ok", "jane.doe", "corp.io"));
+        out.push_str(&sc.flush().unwrap_or_default());
+        assert_eq!(out, "mail [REDACTED_PII] ok");
+        assert_eq!(sc.redactions(), ["pii.email"]);
+    }
+
+    #[test]
+    fn an_unknown_detector_or_action_is_refused_by_name() {
+        let unknown: std::collections::BTreeMap<String, String> =
+            [("pii.passport".to_string(), "redact".to_string())].into();
+        let err = build_pii_patterns(&unknown).err().unwrap();
+        assert!(
+            err.contains("pii.passport") && err.contains("pii.card"),
+            "{err}"
+        );
+
+        let bad: std::collections::BTreeMap<String, String> =
+            [("pii.email".to_string(), "warn".to_string())].into();
+        let err = build_pii_patterns(&bad).err().unwrap();
+        assert!(err.contains("warn"), "{err}");
+    }
+
+    #[test]
+    fn a_card_inside_a_json_body_redacts_to_valid_json() {
+        // The input path re-parses the redacted body and refuses the request
+        // if it no longer parses; a card value must survive that.
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": format!("Refund\n{}\nplease", visa_test_pan())}]
+        })
+        .to_string();
+        let findings = scan(&body);
+        assert_eq!(findings.len(), 1, "after an escaped newline: {findings:?}");
+        let redacted = redact(&body, &findings);
+        let v: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(
+            v["messages"][0]["content"],
+            "Refund\n[REDACTED_PII]\nplease"
+        );
+    }
+
+    #[test]
+    fn a_card_split_across_deltas_is_redacted() {
+        let pan = visa_test_pan();
+        let (out, sc) = stream(
+            derive_holdback().bytes,
+            &["card ", &pan[..7], &pan[7..], " ok"],
+        );
+        assert_eq!(out, "card [REDACTED_PII] ok");
+        assert_eq!(sc.redactions(), ["pii.card"]);
+    }
+
+    #[test]
+    fn pii_bounds_leave_the_holdback_where_it_was() {
+        let bounds: Vec<(&str, Option<usize>)> = pii::detectors()
+            .iter()
+            .map(|d| (d.id.as_str(), max_match_len(d.regex.as_str())))
+            .collect();
+        assert_eq!(
+            bounds,
+            [
+                ("pii.card", Some(19)),
+                ("pii.iban", Some(64)),
+                ("pii.ssn", Some(11)),
+                ("pii.email", Some(640)),
+                ("pii.phone", Some(53)),
+            ]
+        );
+        assert_eq!(derive_holdback().set_by, "pypi_token");
+    }
+
+    // ── the derivation ────────────────────────────────────────────────────
+
+    /// Pins every built-in's computed bound.
+    ///
+    /// `max_match_len` is a hand-written walker standing in for
+    /// `regex-syntax`, so its output is asserted rather than trusted: a walker
+    /// bug that shrank the window would otherwise be a silent loss of
+    /// coverage. Unicode-aware atoms (`\w`, `\d`, negated classes) count 4
+    /// bytes each, which is why some numbers are larger than the ASCII forms
+    /// these patterns match in practice — an over-estimate here costs latency,
+    /// an under-estimate costs coverage.
+    #[test]
+    fn every_built_in_patterns_bound_is_what_we_think_it_is() {
+        let expected: &[(&str, Option<usize>)] = &[
+            ("aws_access_key", Some(20)),
+            ("github_token", Some(40)),
+            // `\w{82}`: \w is Unicode-aware, so 82 × 4.
+            ("github_fine_grained_pat", Some(339)),
+            ("anthropic_api_key", None), // {10,}
+            ("openai_api_key", Some(167)),
+            ("gitlab_pat", Some(316)),
+            ("slack_token", None), // {10,} and +
+            ("slack_webhook_url", Some(86)),
+            ("google_api_key", Some(39)),
+            ("stripe_key", Some(107)),
+            ("sendgrid_api_key", Some(78)),
+            ("npm_token", Some(40)),
+            // The pattern that sets the holdback for the whole scanner.
+            ("pypi_token", Some(1020)),
+            ("huggingface_token", Some(42)),
+            // Two negated classes, 64 and 128 wide, at 4 bytes each.
+            ("db_connection_string", Some(784)),
+            ("jwt", None),          // {17,}
+            ("bearer_token", None), // \s+ and +
+            ("private_key", Some(132)),
+            ("dev_env_honeytoken", Some(20)),
+        ];
+        let by_name: Vec<(String, Option<usize>)> = PATTERNS
+            .iter()
+            .map(|p| (p.name.clone(), max_match_len(p.regex.as_str())))
+            .collect();
+        assert_eq!(
+            by_name.len(),
+            expected.len(),
+            "a pattern was added or removed; the holdback derivation changed with it"
+        );
+        for (got, want) in by_name.iter().zip(expected) {
+            assert_eq!(got.0, want.0, "pattern order changed");
+            assert_eq!(got.1, want.1, "bound for {} changed", want.0);
+        }
+    }
+
+    #[test]
+    fn the_derived_holdback_is_the_widest_bounded_pattern() {
+        let d = derive_holdback();
+        assert_eq!(d.bytes, 1020);
+        assert_eq!(d.set_by, "pypi_token");
+        assert_eq!(
+            d.unbounded,
+            ["anthropic_api_key", "slack_token", "jwt", "bearer_token"],
+            "the patterns the window cannot bound — these rely on the clamp"
+        );
+        let widest = PATTERNS
+            .iter()
+            .filter_map(|p| max_match_len(p.regex.as_str()))
+            .max()
+            .unwrap();
+        assert_eq!(d.bytes, widest);
+    }
+
+    /// The window must cover the longest match its own bound claims to cover.
+    #[test]
+    fn a_pattern_at_the_derived_bound_is_caught_when_split_at_its_middle() {
+        // A pypi token at close to the maximum the pattern allows: the
+        // longest single match anything in the set can produce.
+        let token = format!("pypi-AgEIcHlwaS5vcmc{}", "a".repeat(990));
+        let mid = token.len() / 2;
+        let (out, _) = stream(
+            derive_holdback().bytes,
+            &[&token[..mid], &token[mid..], " trailing prose"],
+        );
+        assert!(
+            !out.contains("AgEIcHlwaS5vcmc"),
+            "got a {}-byte leak",
+            out.len()
+        );
+        assert!(out.contains("[REDACTED_SECRET]"));
+        assert!(out.ends_with(" trailing prose"));
+    }
+
+    /// Unparseable or unmodelled syntax must report "no bound", never a small
+    /// number — a small number would silently shrink the window.
+    #[test]
+    fn unmodelled_syntax_reports_no_bound_rather_than_a_short_one() {
+        assert_eq!(max_match_len(r"abc"), Some(3));
+        assert_eq!(max_match_len(r"a{3}"), Some(3));
+        assert_eq!(max_match_len(r"a{2,5}"), Some(5));
+        assert_eq!(max_match_len(r"(?:ab|cde)"), Some(3));
+        assert_eq!(max_match_len(r"a?b"), Some(2));
+        assert_eq!(max_match_len(r"\bab\b"), Some(2));
+        assert_eq!(max_match_len(r"a*"), None);
+        assert_eq!(max_match_len(r"a+"), None);
+        assert_eq!(max_match_len(r"a{2,}"), None);
+        // Unbalanced / truncated input must not be reported as bounded.
+        assert_eq!(max_match_len(r"(?:ab"), None);
+        assert_eq!(max_match_len(r"[a-z"), None);
+        assert_eq!(max_match_len(r"ab)"), None);
+    }
+
+    // ── configuration ─────────────────────────────────────────────────────
+
+    #[test]
+    fn config_none_means_the_derived_bound_and_zero_means_off() {
+        let derived = derive_holdback().bytes;
+        let mut cfg = crate::config::DlpConfig::default();
+        assert_eq!(cfg.stream_holdback_bytes, None, "default must not be 0");
+        assert_eq!(resolve_holdback(&cfg), derived);
+        cfg.stream_holdback_bytes = Some(0);
+        assert_eq!(resolve_holdback(&cfg), 0);
+        cfg.stream_holdback_bytes = Some(256);
+        assert_eq!(resolve_holdback(&cfg), 256);
+    }
+}
+
+/// intutic/intutic#438: PII in a tool call's arguments is what the client
+/// runs, so output redaction leaves it as written; secrets are still removed.
+#[cfg(test)]
+mod tool_argument_pii_tests {
+    use super::*;
+
+    const IBAN: &str = "GB29NWBK60161331926819";
+    const OTHER_IBAN: &str = "DE89370400440532013000";
+    // Assembled so the repo-wide secret scan does not match a contiguous literal.
+    const KEY: &str = concat!("AKIA", "IOSFODNN7EXAMPLE");
+
+    #[test]
+    fn a_response_keeps_pii_in_tool_arguments_and_redacts_the_rest() {
+        let body = format!(
+            r#"{{"content":[{{"type":"text","text":"Paying {OTHER_IBAN} later."}},{{"type":"tool_use","name":"send_money","input":{{"recipient":"{IBAN}","note":"{KEY}"}}}}]}}"#
+        );
+        let args = vec![format!(r#"{{"note":"{KEY}","recipient":"{IBAN}"}}"#)];
+        let (kept, left) = without_tool_argument_pii(&body, scan(&body), &args);
+        let out = redact(&body, &kept);
+        assert!(
+            out.contains(IBAN),
+            "the payee the client will pay is left as written"
+        );
+        assert!(
+            !out.contains(KEY),
+            "a secret in the same call is still redacted"
+        );
+        assert!(
+            !out.contains(OTHER_IBAN),
+            "PII that is not in a call is still redacted"
+        );
+        assert_eq!(left, vec!["pii.iban".to_string()]);
+    }
+
+    #[test]
+    fn without_tool_calls_nothing_changes() {
+        let body = format!("Paying {IBAN}");
+        let (kept, left) = without_tool_argument_pii(&body, scan(&body), &[]);
+        assert!(!redact(&body, &kept).contains(IBAN));
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn buffered_tool_arguments_keep_pii_and_lose_secrets() {
+        let mut sc = StreamScrubber::new(usize::MAX).for_tool_arguments();
+        sc.push(&format!(r#"{{"recipient":"{IBAN}","#));
+        sc.push(&format!(r#""note":"{KEY}"}}"#));
+        let out = sc.flush().unwrap();
+        assert!(out.contains(IBAN));
+        assert!(!out.contains(KEY));
+        assert_eq!(sc.pii_left(), &["pii.iban".to_string()]);
+    }
+
+    #[test]
+    fn a_streamed_argument_line_keeps_pii_and_a_text_line_does_not() {
+        let arg_line = format!(
+            r#"data: {{"type":"content_block_delta","index":1,"delta":{{"type":"input_json_delta","partial_json":"{{\"recipient\":\"{IBAN}\"}}"}}}}"#
+        );
+        assert!(is_tool_argument_line(&arg_line));
+        let (scrub, left) = scrub_stream_argument_line(&arg_line, None);
+        assert!(scrub.is_none());
+        assert_eq!(left, vec!["pii.iban".to_string()]);
+
+        let text_line = format!(
+            r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{IBAN}"}}}}"#
+        );
+        assert!(!is_tool_argument_line(&text_line));
+        assert!(scrub_stream_text(&text_line, None).is_some());
+    }
+}

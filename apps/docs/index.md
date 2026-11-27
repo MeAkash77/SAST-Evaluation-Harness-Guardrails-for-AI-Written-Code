@@ -1,0 +1,74 @@
+---
+layout: home
+
+hero:
+  name: Intutic
+  text: Policy as Code for AI agents
+  tagline: "Agent policies live as files in git. Intutic — the circuit breaker for AI agents — evaluates every file write, API call, and shell command against them in a synchronous, in-process enforcement chain: no model call, no network hop. Every decision becomes Continuous Compliance evidence and Continuous Enforcement action."
+  actions:
+    - theme: brand
+      text: Get Started
+      link: /guide/getting-started
+    - theme: alt
+      text: View on GitHub
+      link: https://github.com/intutic
+
+features:
+  - icon: 🔴
+    title: Circuit Breaker
+    details: Five enforcement actions — BYPASS, ENHANCE, HIJACK, REASK, KILL — evaluated per tool call, in-process, with no model call. SOPs define the rules; the circuit breaker intercepts, rewrites, or blocks actions before they reach your infrastructure.
+  - icon: 🔍
+    title: DLP & Threat Detection
+    details: Detect secrets in prompts, data exfiltration, prompt injection, tool abuse, token waste, SQL injection, and unauthorized operations. Threats are flagged — and deterministic violations blocked — before they leave the proxy.
+  - icon: 💰
+    title: FinOps Ledger
+    details: Track every token, every model, every dollar. Per-model cost breakdowns, local session token metering, and customizable spending caps.
+  - icon: 🔌
+    title: 43 Harness Integrations
+    details: Works with Claude Code, Cursor, Windsurf, Aider, Antigravity, Codex, OpenHands, n8n, Cline, Roo Code, Continue, Claude Desktop, Goose, Open WebUI, OpenClaw, Hermes, Pi, GitHub Copilot, LangGraph, Muse Code, Grok Build, OpenCode, dsh, Xirp, DoorDash Agentic Orchestrator, and AWS Bedrock AgentCore Runtime — plus dedicated SDK-side gates for LangChain, CrewAI, AutoGen, AG2, Google ADK, OpenAI Agents SDK, Pydantic AI, smolagents, AWS Strands Agents, Microsoft Agent Framework, Mastra, the Vercel AI SDK, eve, TrueForge (embedded), and Vercel's AI SDK Harness and AI SDK Workflow platform-agent runtimes — plus an out-of-process bridge-gated integration for TrueForge run as its own standalone/hosted server. Also reaches QM, Anthropic Managed Agents, and AWS Bedrock AgentCore Gateway as server-side platform integrations that call Intutic directly over HTTP rather than being locally detected. Auto-detects your tooling and syncs governance rules to every agent.
+---
+
+<style>
+:root {
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: -webkit-linear-gradient(120deg, #3b82f6 30%, #10b981);
+  --vp-home-hero-image-background-image: linear-gradient(-45deg, #3b82f6 50%, #10b981 50%);
+  --vp-home-hero-image-filter: blur(44px);
+}
+</style>
+
+## Quick Install
+
+```bash
+# Install global CLI and native Rust proxy binary
+npm install -g @intutic/cli @intutic/proxy
+
+# Start the local proxy gateway (no account needed)
+intutic start
+```
+
+Your workspace is now governed. Every AI agent request flows through the Intutic proxy, where SOPs are enforced and traces are recorded.
+
+## What Gets Blocked
+
+Intutic's circuit breaker evaluates every tool call against your policy stack. Here's what gets caught:
+
+| Threat | How It's Blocked |
+|--------|-----------------|
+| 🗂️ **File system destruction** | `rm -rf`, mass deletes, and recursive overwrites are intercepted by path-pattern SOPs |
+| 🔐 **Secrets in prompts** | API keys, tokens, and credentials are redacted before they reach the model |
+| 🏭 **Production writes** | Database mutations against prod connections are blocked or routed to review queue |
+| 🔀 **Unauthorized git ops** | Force pushes, branch deletions, and pushes to protected branches are killed |
+| 💸 **Budget overruns** | Token spend exceeding session ceilings triggers automatic session suspension |
+| 🌐 **Unapproved API calls** | Outbound HTTP to non-allowlisted domains is blocked at the proxy layer, and `intutic enforce` closes the escape hatch — a host firewall that makes the proxy the *only* path off the machine |
+| 🧩 **MCP tool violations** | Calls to unapproved MCP servers or tools are intercepted before execution |
+| 💉 **Destructive SQL** | `DROP TABLE` / `DROP DATABASE` / `DROP SCHEMA` / `TRUNCATE TABLE` in an MCP tool call are blocked by the MCP governance proxy, and in an SDK gate's tool call by the control-plane check; the same shapes in a harness shell command are flagged for triage at the hook gate (advisory tier, not blocked), and refused at the LLM proxy — before the harness runs them — when they target a database outside the workspace's DSN allowlist ([`sql_guard:`](/reference/sop-front-matter#destructive-sql), opt-in) |
+
+Every blocked action generates an audit log entry with full context — who, what, when, and why it was stopped.
+
+### 🐱 Agentic Custom Skill (Kitkat)
+
+If you are using an agentic coding assistant (such as Claude Code, Cursor, Google Antigravity, or OpenAI Codex), you can download our pre-configured **Kitkat Governance Skill** to load rules directly into your workspace:
+
+- <a href="downloads/SKILL.md" download="SKILL.md" class="download-button" style="display: inline-block; padding: 4px 10px; background: var(--vp-c-brand); color: white; border-radius: 4px; text-decoration: none; font-weight: 500; font-size: 0.8rem; margin-top: var(--space-2); margin-bottom: var(--space-2);">Download SKILL.md</a> (Save into `.agents/skills/intutic-governance-kitkat/` inside your project root).
+- See the [Kitkat Agent Custom Skill Guide](/integrations/kitkat) for detailed setup.

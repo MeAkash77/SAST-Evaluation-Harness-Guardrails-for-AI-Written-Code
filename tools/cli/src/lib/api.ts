@@ -1,0 +1,267 @@
+/**
+ * HTTP client for Intutic control plane API.
+ *
+ * Uses native fetch() (Node 18+). All requests include
+ * Authorization: Bearer <apiKey> header.
+ *
+ * @module
+ */
+
+import type { SyncConfigPayload } from '@intutic/shared-types'
+import { toonDecode as sharedToonDecode } from '@intutic/shared-types'
+import { injectTraceHeaders } from './otelPropagation.js'
+
+/** API client for control plane communication. */
+export interface ApiClient {
+  fetchConfig(workspaceId: string): Promise<SyncConfigPayload>
+  /** Generic GET request for arbitrary API paths. */
+  get<T>(path: string): Promise<T>
+  /**
+   * GET that hands back the status instead of throwing on it.
+   *
+   * For endpoints where a non-2xx *is* the answer: a chain check that returns
+   * 409 with the whole walk in the body when a link is missing. `get()` throws
+   * on any non-2xx, which would leave the caller digging the break out of an
+   * error message.
+   */
+  getWithStatus<T>(path: string): Promise<{ status: number; body: T }>
+  /**
+   * GET for a file download: the body as bytes.
+   *
+   * `get()` parses JSON, which a report served as markdown, CSV or PDF is
+   * not. A non-2xx throws exactly as `get()` does, since those errors are JSON.
+   */
+  getFile(path: string): Promise<Uint8Array>
+  /** Generic POST request for arbitrary API paths. */
+  post<T>(path: string, body?: unknown): Promise<T>
+  /**
+   * POST that hands back the status instead of throwing on it.
+   *
+   * Same rationale as `getWithStatus`: a route that answers 422 with a body
+   * saying what is missing (too little sampled history, say) has given the
+   * answer a caller needs to report, not a failure to unwrap and discard.
+   */
+  postWithStatus<T>(path: string, body?: unknown): Promise<{ status: number; body: T }>
+  /**
+   * PUT and DELETE that hand back the status, for the same reason: an update
+   * that answers 400 with the validator's named checks and 409 with a `code`
+   * has given two answers, not two failures.
+   */
+  putWithStatus<T>(path: string, body?: unknown): Promise<{ status: number; body: T }>
+  delWithStatus<T>(path: string): Promise<{ status: number; body: T }>
+  /**
+   * Multipart POST that hands back the status.
+   *
+   * `POST /api/v1/rule-candidates/:id/bundle` reads a `file` field and a
+   * `source_sha256` field; `post()` JSON-encodes, so it cannot carry either.
+   * The content type is left to `fetch`, which writes the boundary.
+   */
+  postForm<T>(path: string, form: FormData): Promise<{ status: number; body: T }>
+  /** Generic PUT request for arbitrary API paths. */
+  put<T>(path: string, body?: unknown): Promise<T>
+  /** Generic PATCH request for arbitrary API paths. */
+  patch<T>(path: string, body?: unknown): Promise<T>
+  /** Generic DELETE request for arbitrary API paths. */
+  del<T>(path: string, body?: unknown): Promise<T>
+}
+
+/**
+ * Create an API client bound to a control plane URL and API key.
+ *
+ * @param controlPlaneUrl - Base URL (e.g., http://localhost:3001 or https://api.intutic.ai)
+ * @param apiKey - API key (vk_*) or JWT access token
+ */
+/**
+ * The error a failed call throws. A 403 carries the server's `detail` when it
+ * gives one (a role guard names the roles that may make the call), so a member
+ * whose role cannot do something is told which role can, not shown raw JSON.
+ */
+export function apiFailure(method: string, path: string, status: number, text: string): Error {
+  if (status === 403) {
+    try {
+      const body = JSON.parse(text) as { detail?: unknown }
+      if (typeof body.detail === 'string') return new Error(`API ${method} ${path} refused (403): ${body.detail}`)
+    } catch {
+      // Not JSON: fall through to the raw text.
+    }
+  }
+  return new Error(`API ${method} ${path} failed (${status}): ${text}`)
+}
+
+export function createApiClient(controlPlaneUrl: string, apiKey: string): ApiClient {
+  const baseHeaders = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${apiKey}`,
+  }
+
+  async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const url = `${controlPlaneUrl}${path}`
+    // Per-request copy: injectTraceHeaders mutates in place, and baseHeaders
+    // is shared across every call this client makes.
+    const headers: Record<string, string> = { ...baseHeaders }
+    injectTraceHeaders(headers)
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    })
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => 'Unknown error')
+      throw apiFailure(method, path, res.status, text)
+    }
+
+    return unwrapToonEnvelope(await res.json()) as T
+  }
+
+  /** A JSON request whose non-2xx answer is returned, not thrown; a body that is not JSON comes back as `{ error: text }`. */
+  async function withStatus<T>(method: string, path: string, body?: unknown): Promise<{ status: number; body: T }> {
+    const headers: Record<string, string> = { ...baseHeaders }
+    injectTraceHeaders(headers)
+    const res = await fetch(`${controlPlaneUrl}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    })
+    const text = await res.text()
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      parsed = { error: text }
+    }
+    return { status: res.status, body: unwrapToonEnvelope(parsed) as T }
+  }
+
+  return {
+    async fetchConfig(workspaceId: string): Promise<SyncConfigPayload> {
+      return request<SyncConfigPayload>('POST', '/api/v1/sync/config', { workspaceId })
+    },
+
+    async get<T>(path: string): Promise<T> {
+      return request<T>('GET', path)
+    },
+
+    async getWithStatus<T>(path: string): Promise<{ status: number; body: T }> {
+      const headers: Record<string, string> = { ...baseHeaders }
+      injectTraceHeaders(headers)
+      const res = await fetch(`${controlPlaneUrl}${path}`, { method: 'GET', headers })
+      const text = await res.text()
+      let body: unknown
+      try {
+        body = JSON.parse(text)
+      } catch {
+        // Kept rather than discarded: a proxy's HTML error page is the thing
+        // that explains a status the caller did not expect.
+        body = { error: text }
+      }
+      return { status: res.status, body: body as T }
+    },
+
+    async getFile(path: string): Promise<Uint8Array> {
+      const headers: Record<string, string> = { Authorization: baseHeaders.Authorization }
+      injectTraceHeaders(headers)
+      const res = await fetch(`${controlPlaneUrl}${path}`, { method: 'GET', headers })
+      if (!res.ok) {
+        const text = await res.text().catch(() => 'Unknown error')
+        throw apiFailure('GET', path, res.status, text)
+      }
+      return new Uint8Array(await res.arrayBuffer())
+    },
+
+    async post<T>(path: string, body?: unknown): Promise<T> {
+      return request<T>('POST', path, body)
+    },
+
+    async postWithStatus<T>(path: string, body?: unknown): Promise<{ status: number; body: T }> {
+      return withStatus<T>('POST', path, body)
+    },
+
+    async putWithStatus<T>(path: string, body?: unknown): Promise<{ status: number; body: T }> {
+      return withStatus<T>('PUT', path, body)
+    },
+
+    async delWithStatus<T>(path: string): Promise<{ status: number; body: T }> {
+      return withStatus<T>('DELETE', path)
+    },
+
+    async postForm<T>(path: string, form: FormData): Promise<{ status: number; body: T }> {
+      const headers: Record<string, string> = { Authorization: baseHeaders.Authorization }
+      injectTraceHeaders(headers)
+      const res = await fetch(`${controlPlaneUrl}${path}`, { method: 'POST', headers, body: form })
+      const text = await res.text()
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        parsed = { error: text }
+      }
+      return { status: res.status, body: unwrapToonEnvelope(parsed) as T }
+    },
+
+    async put<T>(path: string, body?: unknown): Promise<T> {
+      return request<T>('PUT', path, body)
+    },
+
+    async patch<T>(path: string, body?: unknown): Promise<T> {
+      return request<T>('PATCH', path, body)
+    },
+
+    async del<T>(path: string, body?: unknown): Promise<T> {
+      return request<T>('DELETE', path, body)
+    },
+  }
+}
+
+/**
+ * Decodes a TOON payload, normalising "not TOON" to an empty list.
+ *
+ * The format lives in `@intutic/shared-types`, imported rather than copied. It
+ * used to be a private `splitCells` here, byte-identical to one in the dashboard
+ * and a third in the control plane, with a comment in each saying they must not
+ * diverge. They did — an escaping fix reached the encoder and the control
+ * plane's own decoder, which nothing calls, while these two kept the old code
+ * and a CRITICAL incident carried on printing as its trace id.
+ *
+ * The shared decoder returns `null` for input that is not TOON; this surface has
+ * always returned a list, and its caller assigns the result straight onto the
+ * response object, so the shape is preserved here rather than pushed outward.
+ */
+export function toonDecode(toon: string): Record<string, unknown>[] {
+  return sharedToonDecode(toon) ?? []
+}
+
+/**
+ * Move a TOON-encoded list out of its envelope and onto `listProperty`.
+ *
+ * Extracted from `request` because it was inline and therefore untestable, and
+ * it was wrong: the old code assigned the decoded rows and only THEN deleted
+ * `data`. `listProperty` names where the rows should land, and for
+ * one list route that name IS `data` — so the rows were written and
+ * immediately deleted, and any such response over the 20-row TOON
+ * threshold arrived as `{meta:{total:22}}`. Zero rows, no error.
+ * `/api/v1/traces` escaped only because its listProperty is `traces`.
+ *
+ * Non-TOON bodies pass through untouched.
+ */
+export function unwrapToonEnvelope(data: unknown): unknown {
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    !('format' in data) ||
+    (data as Record<string, unknown>)['format'] !== 'toon'
+  ) {
+    return data
+  }
+  const body = data as Record<string, unknown>
+  const listProperty = body['listProperty']
+  if (typeof body['data'] !== 'string' || typeof listProperty !== 'string') return data
+
+  const decoded = toonDecode(body['data'])
+  delete body['format']
+  delete body['data']
+  delete body['listProperty']
+  body[listProperty] = decoded
+  return body
+}
+

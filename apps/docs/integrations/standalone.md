@@ -1,0 +1,197 @@
+# Standalone Cloud Proxy Integration Guide
+
+Intutic's proxy engine (`intutic-proxy`) is a high-performance, OpenAI-compatible proxy gateway written in Rust. It can be deployed on your own infrastructure to audit, cache, and govern agent model traffic centrally without installing any workstation shims or developer daemons.
+
+---
+
+## 🚀 Deployment Topologies
+
+Intutic Proxy supports three deployment topologies, depending on whether you require multi-provider LLM gateway translation (via LiteLLM), direct model provider routing, or a one-off run of the native binary:
+
+```
+                            [ Option A: Dual Self-Hosted Proxy ]
+
+   Developer IDE / CLI                                           Upstream LLM Providers
+  (Claude Code, Cursor,  ──────►  Intutic Proxy  ──────►  LiteLLM Proxy  ──────►  (Anthropic, OpenAI,
+       LangGraph)               (Rust — :4000)      (Python — litellm:4000)     Bedrock, Vertex, Ollama)
+                                       │                        │
+                                       ▼                        ▼
+                                DLP & SOP rules          Model Translation &
+                                WASM Policy Engine         Unified API Gateway
+
+
+                            [ Option B: Standalone Intutic Proxy ]
+
+   Developer IDE / CLI           Intutic Proxy                                   Upstream LLM Providers
+  (Claude Code, Cursor,  ──────► (Rust — :4000) ─────────────────────────────►   (api.anthropic.com,
+       LangGraph)                      │                                          api.openai.com)
+                                       ▼
+                                DLP & SOP rules
+                                WASM Policy Engine
+
+
+                            [ Option C: Native NPM Binary Execution ]
+
+   Developer / CI               npx @intutic/proxy                              Upstream LLM Providers
+  (Node.js / Terminal)   ──────► (Native Rust Gateway) ────────────────────►    (api.anthropic.com,
+                                       │                                          api.openai.com)
+                                       ▼
+                                DLP & SOP rules
+                                WASM Policy Engine
+```
+
+### Option A: Dual Self-Hosted Proxy (Intutic + LiteLLM Gateway)
+* **How it works:** Intutic Proxy (Rust `:4000`) sits in front of LiteLLM (`litellm:4000` on the Compose network, published on the host as `:4001`). Intutic enforces DLP, security SOPs and WASM policies in-process, then forwards clean requests to LiteLLM to translate and route across 100+ model providers (Bedrock, Azure, Vertex, Ollama).
+* **Docker Compose Snippet:**
+  ```yaml
+  services:
+    intutic-proxy:
+      # The open-core proxy, linux/amd64 and linux/arm64, published on every
+      # release. Pin a version tag (3.2.1) or a digest in production. To
+      # build it yourself instead: docker build -t intutic-proxy packages/proxy
+      image: ghcr.io/intutic/intutic-proxy:latest
+      ports:
+        - "4000:4000"
+      environment:
+        # One upstream for every provider: LiteLLM serves both
+        # /v1/messages and /v1/chat/completions.
+        - UPSTREAM_URL=http://litellm:4000
+        # Send each request to LiteLLM as it arrived, with LiteLLM's own
+        # model names, rather than picking a provider from the model name.
+        - INTUTIC_UPSTREAM_WIRE=passthrough
+        # No CONTROL_PLANE_URL: open core ships no control plane, and pointing
+        # this at a host that does not exist makes the policy pre-check fail —
+        # which, with the default `fail_closed: true`, blocks every request.
+        # Set it only when you actually have a control plane to talk to.
+
+    litellm:
+      image: ghcr.io/berriai/litellm@sha256:be646214d7bc1cda0be57debbbf58e822ca4f233ddc50d0c0c7fa9b4a28063af
+      ports:
+        - "4001:4000"
+      volumes:
+        - ./config.yaml:/app/config.yaml
+  ```
+
+### Option B: Standalone Intutic Proxy (Direct Provider Connection)
+* **How it works:** Run Intutic Proxy standalone without LiteLLM. Each request goes straight to its provider's public API (`api.anthropic.com`, `api.openai.com`, …), picked from the model it names — no upstream setting needed.
+* **Environment Setup:**
+  ```bash
+  intutic start
+  export ANTHROPIC_BASE_URL="http://localhost:4000"      # Anthropic SDKs append /v1/messages
+  export OPENAI_BASE_URL="http://localhost:4000/v1"      # OpenAI SDKs append /chat/completions
+  ```
+* **In a container:** the same proxy is published as `ghcr.io/intutic/intutic-proxy` (linux/amd64 and linux/arm64), tagged with each release's version and `latest`. Mount your SOPs and name the folder with `INTUTIC_SOPS_DIR`:
+  ```bash
+  docker run -p 4000:4000 \
+    -v "$PWD/.intutic/sops:/etc/intutic/sops:ro" -e INTUTIC_SOPS_DIR=/etc/intutic/sops \
+    ghcr.io/intutic/intutic-proxy:latest
+  ```
+  The image listens on every interface and runs as a non-root user. Each version carries a build provenance attestation: `gh attestation verify oci://ghcr.io/intutic/intutic-proxy:<version> --owner intutic`.
+* **Keys:** A proxy with no `CONTROL_PLANE_URL` runs standalone whether or not a local Valkey is up. It forwards the provider key the client sends, and accepts a virtual key (`vk_…`) by sending the provider key from its own environment upstream.
+* **Approved models:** With no control plane to publish a workspace allowlist, the standalone proxy reads `allowedModels` from `~/.intutic/config.json` and enforces it the same way. See [Settings → Standalone allowlist](/guide/settings#standalone-allowedmodels-in-intutic-config-json).
+
+::: warning Standalone has no control plane: leave mirroring off
+`mirror_sample_rate` still mirrors up to 5% of eligible requests to a candidate model standalone — every mirrored request is billed twice — but there is no control plane to judge the pair or build the [adoption report](/guide/mirror-adoption-report), so the result is discarded. The proxy warns once, the first time. Keep the rate at `0` unless a control plane is attached.
+:::
+
+### Upstream URLs
+
+Where the proxy forwards a request is decided per provider, first match wins:
+
+1. The provider's own variable: `ANTHROPIC_UPSTREAM_URL`, `OPENAI_UPSTREAM_URL`, `GEMINI_UPSTREAM_URL`, `MISTRAL_UPSTREAM_URL`, `OPENROUTER_UPSTREAM_URL`, `DEEPSEEK_UPSTREAM_URL`.
+2. `UPSTREAM_URL` — one gateway for every provider. This is what `intutic start --upstream-url` and `intutic daemon install --proxy --upstream-url` set. Use it for a gateway that serves both `/v1/messages` and `/v1/chat/completions`, such as LiteLLM; behind it, DeepSeek's Anthropic-format requests go to `/v1/messages` rather than DeepSeek's own `/anthropic` path.
+3. The provider's public API.
+
+The provider is picked from the model name (`claude-*` is Anthropic, `gemini-*` Gemini, `bedrock/`, `vertex/` and `azure/` a cloud provider, and so on), and a request in another provider's format is translated or refused. A gateway such as LiteLLM serves every route for every model it routes and names the models itself, so set `INTUTIC_UPSTREAM_WIRE=passthrough` with `UPSTREAM_URL`: each request on `/v1/messages`, `/v1/chat/completions` and `/v1/responses` then goes to the gateway unchanged, in the format it arrived in, with the model it names. DLP, SOPs, the response gate and budgets apply as before. See [`INTUTIC_UPSTREAM_WIRE`](/reference/configuration#provider-upstreams-and-keys).
+
+A request the proxy receives as a TLS-intercepted `CONNECT` to a known provider host (the Windsurf path) keeps going to that host.
+
+### Option C: Native NPM Binary Runner (`npx @intutic/proxy`)
+* **How it works:** Execute the native high-performance Rust proxy binary directly via npm without needing Docker or Kubernetes:
+  ```bash
+  # Run directly via npx
+  npx @intutic/proxy
+
+  # Or install once and skip the npx download step on every run
+  npm install -g @intutic/proxy
+  intutic-proxy
+  ```
+
+  Both commands run the proxy in the **foreground**. For unattended background
+  operation on a single host, install it as a supervised service instead —
+  [`intutic daemon install --proxy`](/reference/cli#intutic-daemon-install)
+  writes a launchd plist (macOS) or systemd unit (Linux) for the installed
+  `intutic-proxy` binary, carrying the same `PORT`, `VALKEY_URL` /
+  `INTUTIC_STANDALONE=1` and `UPSTREAM_URL` environment `intutic start` sets:
+  ```bash
+  intutic daemon install --proxy --dry-run   # preview
+  intutic daemon install --proxy
+  ```
+  Add `--upstream-url http://localhost:4001` to send every provider's traffic to
+  a LiteLLM (or other gateway) instead — see [Upstream URLs](#upstream-urls).
+  Option A/B's Docker container above remains the alternative, supervised by
+  Docker's own restart policy.
+
+---
+
+### Option D: Intutic behind an existing gateway (Portkey, Kong, LiteLLM)
+
+* **How it works:** If your traffic already goes through an AI gateway, keep it there and put the Intutic proxy **between the gateway and the provider**. The gateway keeps doing routing, retries and provider credentials; Intutic sees every request the gateway forwards and applies DLP, tool interception and budgets on the way through. Point the gateway's provider base URL at the Intutic proxy. The Intutic proxy then forwards to each provider's public API; to send one provider somewhere else, set that provider's own variable (for example `OPENAI_UPSTREAM_URL`) — see [Upstream URLs](#upstream-urls).
+* **Portkey:** on the provider config (or per request, with the custom-host option Portkey documents for its provider integrations), set the provider's base URL to the Intutic proxy, for example `http://intutic-proxy:4000/v1`. Leave the provider's API key on the Portkey side; the Intutic proxy forwards the `Authorization` header it receives.
+* **Kong (AI Proxy plugin):** create a Service whose `url` is the Intutic proxy and a Route for the model path, and keep the AI Proxy plugin's provider settings as they are; Kong's rate limiting and key auth run first, Intutic's governance runs on the forwarded request.
+* **LiteLLM:** that is Option A above — LiteLLM stays the gateway and Intutic is its upstream.
+* **What you keep and what you lose:** everything on the request path (DLP, tool interception, budgets, the routing guard) works unchanged. Attribution is by whatever identity the gateway forwards — configure the gateway to pass the caller's `user` / `metadata.user_id` through, or every request lands in one bucket. If the gateway rewrites tool-call bodies, tool interception sees what the gateway sends, not what the agent sent.
+
+## 🛠️ Framework Integration
+
+Connecting any standard LLM framework to the standalone proxy is simple. Just override the `base_url` parameter; the proxy forwards the provider API key the client sends.
+
+### 1. LangGraph (Python & TypeScript)
+
+LangGraph now has a dedicated harness adapter — see the [LangGraph integration guide](/integrations/langgraph) for the full setup: `base_url` snippets for both Python and TypeScript, the SDK-side tool gate (`intutic_clawde.gate`), and the `x-intutic-harness` trace-attribution header. The short version is the same `base_url` override as every other framework on this page, pointed at your hosted proxy.
+
+### 2. Amazon Bedrock AgentCore & Anthropic Managed Agents
+
+The proxy serves Amazon Bedrock models itself: send an Anthropic- or OpenAI-format request to the proxy naming the model `bedrock/<model id>`, and the proxy signs the Bedrock call with the AWS credentials it is configured with — see [AWS Bedrock](/integrations/aws-bedrock). A Bedrock SDK client, which signs its own requests for the Bedrock runtime endpoint, cannot be pointed at the proxy. An agent deployed to Bedrock AgentCore is governed through the framework it is built with — see [AWS Bedrock AgentCore](/integrations/agentcore).
+
+Anthropic Managed Agents run their tool loop at Anthropic, so their model calls do not pass through the proxy; govern their tool calls by answering the session's confirmation events — see [Anthropic Managed Agents](/integrations/anthropic-managed-agents).
+
+### 3. Custom & Proprietary Company Harnesses
+
+Any internal, microservice-based, or custom company agent framework can be governed by Intutic with zero refactoring:
+
+* **Standard HTTP Protocol Override**: Point `OPENAI_BASE_URL` to `https://proxy.your-company.com/v1` and `ANTHROPIC_BASE_URL` to `https://proxy.your-company.com`.
+* **Native Package Suite**: Import `@intutic/clawde` (TypeScript SDK) or spawn `npx @intutic/proxy` directly inside microservice containers.
+* **Custom Harness Config Adapters**: Intutic supports Markdown (`.md`), YAML (`.yml`), JSON (`.json`), and Env (`.env`) harness config formats.
+
+---
+
+## 🔒 Air-Gapped VPC & Offline Deployment
+
+For strict security environments requiring zero data egress:
+
+1. **100% Offline Local Operation**: Intutic Proxy, WASM policy engine, and Valkey memory cache operate entirely inside your private VPC or local workstation without sending telemetry to external clouds.
+2. **Local Log & Spend Sharding**: Offline telemetry and prompt logs are written to sharded local files (`~/.intutic/logs/traces-YYYY-MM-DD.jsonl`).<!-- ENTERPRISE_ONLY_START -->
+3. **Automated Offline Sync**: When a VPC network connection is established (or during scheduled sync windows), the sync daemon reconciles spend back to your self-hosted Control Plane (`/api/v1/traces/sync-back`).<!-- ENTERPRISE_ONLY_END -->
+
+---
+
+## ⚡ Interactive Slash Commands
+
+Because the proxy intercepts prompt content *pre-flight*, developers can invoke interactive slash commands directly inside their chat prompts or agent sessions. 
+
+If the last user message begins with `/fix` or `/draw` (also `@fix`, `/intutic-fix`, `@intutic fix`, and the same forms of `draw`), the proxy answers it locally without calling the upstream provider (unless `intutic_settings.commands.non_blocking` is on, which forwards `/fix`'s enhanced prompt); this works standalone. `/fix` returns the governance primitives that apply to the request with recommendations, and `/draw` the guardrail graph.
+
+A line beginning with `/intutic <command>` or `@intutic <command>` (for example `/intutic status`) is answered by the control plane, so the proxy intercepts it only when `CONTROL_PLANE_URL` is set; standalone, the message goes to the model as written. With a control plane, a request made with an Intutic virtual key gets the control plane's answer, and one made with a provider key gets an answer saying the command is unavailable; neither is forwarded to the model:
+
+```python
+# Answered by the control plane: needs CONTROL_PLANE_URL and a virtual key
+response = llm.invoke("/intutic status")
+print(response.content)
+```
+
+### Protocol Compliance
+To prevent client-side SDK parser failures, the proxy automatically formats the slash command response content to match the requested protocol schema:
+*   **OpenAI SDK:** Wraps the payload in a standard `chat.completion` Choice object.
+*   **Anthropic SDK:** Wraps the payload in a standard `message` JSON block.
+*   **Streaming Content:** every command answers a `stream: true` request with Server-Sent Events (SSE) in the route's format (Anthropic Messages, OpenAI chat completions or the Responses API), and any other request with a single JSON body.

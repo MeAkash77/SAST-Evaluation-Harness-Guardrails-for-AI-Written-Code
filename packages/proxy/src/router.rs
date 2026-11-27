@@ -1,0 +1,784 @@
+//! Route table — maps HTTP paths to proxy handlers.
+//!
+//! Supported protocols:
+//! - POST /v1/messages          (Anthropic Messages API — Claude Code)
+//! - POST /v1/chat/completions   (OpenAI Chat Completions — Cursor)
+//! - POST /v1/responses          (OpenAI Responses API — Codex CLI)
+//! - POST /v1beta/models/:model  (Gemini v1beta — refused, see `root`)
+//! - POST /v1/systemone          (System One decision API — decision traffic)
+//! - POST /v1/decisions          (OpenAI Decisions API — decision traffic)
+//! - GET  /health                (Health check)
+//! - GET  /intutic/instance      (This process's instance id — loopback only)
+
+use std::net::SocketAddr;
+
+use axum::{
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, Method, StatusCode},
+    response::Json,
+    routing::{any, get, post},
+    Router,
+};
+use serde_json::json;
+
+use tower_http::trace::TraceLayer;
+
+#[cfg(feature = "control-plane")]
+use crate::credential::RequestCredential;
+use crate::credential::VirtualKey;
+use crate::proxy::AppState;
+use crate::tls_mitm::handle_connect;
+
+pub fn build_router(state: AppState) -> Router {
+    let proxy_routes = Router::new()
+        // Anthropic Messages API (Claude Code)
+        .route("/v1/messages", post(crate::proxy::handle_proxy))
+        // OpenAI Chat Completions (Cursor)
+        .route("/v1/chat/completions", post(crate::proxy::handle_proxy))
+        // OpenAI Responses API (Codex CLI)
+        .route("/v1/responses", post(crate::proxy::handle_proxy))
+        // Gemini v1beta (Antigravity)
+        .route("/v1beta/models/:model_id", post(crate::proxy::handle_proxy))
+        // Customer calls to decision models (`crate::decision_traffic`)
+        .route("/v1/systemone", post(crate::proxy::handle_proxy))
+        .route("/v1/decisions", post(crate::proxy::handle_proxy))
+        .layer(TraceLayer::new_for_http());
+
+    Router::new()
+        // Health check
+        .route("/health", get(health))
+        // Guard-liveness verdicts from the last scheduled run (main.rs's
+        // startup + 15-minute loop — this route no longer runs the suite
+        // itself, see `run_probes`'s doc comment). Loopback-only, same
+        // reasoning and same guard as `/intutic/spend` below: binding probe
+        // ids are shaped `binding.forbid_after.{first}->{then}` — a
+        // workspace's declared tool-succession policy, verbatim — and the
+        // listener can be opened beyond loopback (`INTUTIC_PROXY_BIND`) with no
+        // authentication on this path.
+        .route("/intutic/probes", get(run_probes))
+        // Egress enforcement posture + live deny counts. Makes an
+        // Enforce/Monitor decision observable rather than silent.
+        .route("/intutic/egress", get(egress_status))
+        // Today's local-machine spend, sourced from the same numbers the
+        // budget gate already enforces, for a live terminal
+        // cost readout. Loopback-only — see `spend_status` — because unlike
+        // `/health` and `/intutic/egress` above, this number grows with the
+        // developer's actual usage, and the listener can be opened beyond
+        // loopback.
+        .route("/intutic/spend", get(spend_status))
+        // This process's `proxy_instance_id`. The sync
+        // daemon reads it over loopback so it can register the session row
+        // the control plane derives for this process and put the workspace's
+        // git/task context on it — the row the traces land on. Loopback-only
+        // like `/intutic/spend`: the id is not a secret (every trace carries
+        // it), but the listener can be opened beyond loopback, and a LAN
+        // peer holding the workspace key could otherwise write its own branch
+        // onto a teammate's row. Not folded into `/health`, which load balancers
+        // and readiness probes hit unauthenticated.
+        .route("/intutic/instance", get(instance_status))
+        // Sandbox attestation callback. A `--sandbox`
+        // container's firewall permits egress ONLY to this proxy — it cannot
+        // reach the control plane directly — so this is the one path a
+        // sandboxed agent has to attest. The proxy authenticates the bearer
+        // every LLM call already carries, then forwards it.
+        .route("/intutic/attest-sandbox", post(attest_sandbox))
+        .route("/", get(root_info))
+        .merge(proxy_routes)
+        // HTTP CONNECT tunnel + Decrypted MITM requests fallback handler
+        .fallback(any(
+            |State(state): State<AppState>, req: axum::extract::Request| async move {
+                if req.method() == Method::CONNECT {
+                    if let Some(refusal) = crate::tls_mitm::admit_connect(&state, &req).await {
+                        return refusal;
+                    }
+                    handle_connect(req).await
+                } else {
+                    crate::proxy::handle_proxy(State(state), req).await
+                }
+            },
+        ))
+        .with_state(state)
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(json!({
+        "status": "ok",
+        "service": "intutic-proxy",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+async fn root_info() -> Json<serde_json::Value> {
+    Json(json!({
+        "service": "Intutic Proxy Gateway",
+        "version": env!("CARGO_PKG_VERSION"),
+        "status": "running",
+        // Only what actually works end to end.
+        //
+        // `gemini` was listed here and does not function: `/v1beta/models/:id`
+        // is routed, but a Gemini body carries its model in the URL rather than
+        // in `model`, so `extract_model` yields `"unknown"` and
+        // `get_model_provider` answers OpenAI. No translation exists from the
+        // Gemini wire to that target (`proxy::wire_route`), so the request is
+        // refused with `400 unsupported_route`; it used to be posted to
+        // OpenAI's chat-completions endpoint as a Gemini body. There is no
+        // Gemini stream translator either.
+        //
+        // The route stays, so a client pointed at it gets that refusal and its
+        // reason rather than a 404, and `gemini_unsupported` says why rather
+        // than leaving its absence to be read as an oversight. See
+        // `proxy::DeltaShape::Unparsed` for the full chain.
+        "protocols": ["anthropic", "openai", "openai-responses"],
+        "gemini_unsupported": "requests to /v1beta/ are refused: the model name is not read from the URL. Gemini models are served on /v1/messages, /v1/chat/completions and /v1/responses"
+    }))
+}
+
+/// `GET /intutic/egress` — the live egress posture. An operator (or a probe)
+/// can confirm the mode is what they set and watch the deny counters move.
+async fn egress_status() -> impl axum::response::IntoResponse {
+    use crate::egress_policy::{denied_count, global_policy, would_deny_count, EgressMode};
+    let mode = match global_policy().mode() {
+        EgressMode::Off => "off",
+        EgressMode::Monitor => "monitor",
+        EgressMode::Enforce => "enforce",
+    };
+    axum::Json(serde_json::json!({
+        "mode": mode,
+        "denied": denied_count(),
+        "would_deny": would_deny_count(),
+    }))
+}
+
+/// Whether a peer may read `/intutic/spend`. Pure so the refusal is
+/// unit-testable without standing up a listener or constructing a live TCP
+/// connection.
+///
+/// This route is the one place the on-disk daily spend total — a number that
+/// grows with what the developer is actually being charged — is exposed over
+/// HTTP, and the proxy's listener can be opened beyond loopback
+/// (`INTUTIC_PROXY_BIND`, `listen.rs`) with no
+/// authentication on this path (matching `/health` and `/intutic/egress`).
+/// Without this check, anyone on the same LAN or Wi-Fi could read a
+/// teammate's daily spend by hitting `<their-ip>:4000/intutic/spend`.
+fn spend_peer_allowed(addr: &SocketAddr) -> bool {
+    crate::listen::is_loopback_peer(addr.ip())
+}
+
+/// `GET /intutic/spend` — today's local-machine spend, loopback-only.
+///
+/// Sources every field from the existing local-budget accounting in
+/// `local_spend.rs` / `proxy::local_budget_enforced` — nothing here computes
+/// a new number, it only exposes what the budget gate already reads on every
+/// request. Kept deliberately distinct from `GET /api/v1/budget` on the
+/// control plane: that aggregates every member/machine in the workspace, this
+/// is just what this one machine has spent today (see `local_spend.rs`'s
+/// module docs for why the two numbers are not interchangeable).
+async fn spend_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl axum::response::IntoResponse {
+    if !spend_peer_allowed(&addr) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"error": "loopback only"})),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "local_spend_usd_today": crate::local_spend::get_local_spend(),
+            "local_cap_usd": crate::local_spend::get_max_daily_budget(),
+            "enforced": crate::proxy::local_budget_enforced(),
+        })),
+    )
+}
+
+/// The body `GET /intutic/instance` answers with. Pure, so the shape is
+/// unit-tested without a listener: the id carries the prefix `proxy_instance_id`
+/// mints (`proxy_` for a local process, `gw_` for a shared gateway) and
+/// `shared_gateway` says the same thing as a boolean, so a reader never has to
+/// parse the prefix to know whether the row behind this id is one developer's
+/// session or a pod-sized aggregate (`LEGACY_BUCKET` in the control plane).
+fn instance_body() -> serde_json::Value {
+    json!({
+        "proxy_instance_id": crate::proxy::proxy_instance_id(),
+        "shared_gateway": crate::proxy::is_shared_gateway_env(),
+    })
+}
+
+/// `GET /intutic/instance` — this process's instance id, loopback-only.
+async fn instance_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl axum::response::IntoResponse {
+    if !spend_peer_allowed(&addr) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"error": "loopback only"})),
+        );
+    }
+    (StatusCode::OK, axum::Json(instance_body()))
+}
+
+/// `GET /intutic/probes` — the last SCHEDULED guard-liveness run, loopback-only.
+///
+/// Deliberately does not run the suite itself. Timestamping at the fetch
+/// site would make a dead 15-minute loop (`main.rs`) indistinguishable from
+/// a healthy one — every request would mint a fresh "just ran, all clear"
+/// answer regardless of whether the scheduler was still alive. Reading
+/// `probes::last_run()` instead means `ran_at` only advances when the
+/// scheduled loop actually ticks; a stalled loop shows up here as a
+/// timestamp that stops moving, exactly the inert-control shape this whole
+/// module exists to catch.
+async fn run_probes(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl axum::response::IntoResponse {
+    if !spend_peer_allowed(&addr) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"error": "loopback only"})),
+        );
+    }
+
+    let Some(run) = crate::probes::last_run() else {
+        // Only reachable in the narrow window between process start and the
+        // startup run completing — the loop's first tick fires immediately.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"error": "guard-liveness probes have not run yet"})),
+        );
+    };
+    let failed = run.verdicts.iter().filter(|v| !v.passed).count();
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "probes": run.verdicts,
+            "total": run.verdicts.len(),
+            "failed": failed,
+            "ran_at": run.ran_at,
+        })),
+    )
+}
+
+/// `POST /intutic/attest-sandbox` — forwards a sandboxed agent's attestation
+/// callback to the control plane.
+///
+/// This exists because of what the sandbox's own firewall permits: the
+/// `entrypoint.sh` that calls this runs AFTER the container's egress firewall
+/// is installed and permits only the proxy and DNS — the sandboxed process
+/// cannot reach the control plane directly to attest itself, only through the
+/// one door its own isolation left open. That is the security property this
+/// route depends on, not merely convenience: a request reaching this handler
+/// came from something that, at minimum, resolved the proxy as its only
+/// egress path, which a host-side process spoofing "I am sandboxed" (as the
+/// pre-existing `executionMode: 'SANDBOX'` self-report from `intutic exec`
+/// could always do) has no reason to be routed through.
+///
+/// What this does NOT prove, stated plainly rather than left implicit: that
+/// the container's capability-drop and firewall-install steps in
+/// `entrypoint.sh` actually ran as written. A custom `--sandbox-image` built
+/// to skip those steps but still make this one call would still attest. Real
+/// defense against that needs measured/attested boot (TPM, confidential
+/// computing) that does not exist anywhere in this stack. What this closes is
+/// the concrete gap: a session recorded as `SANDBOX` because
+/// the host CLI said so, whether or not the sandboxed process ever started.
+/// What must be true before this handler forwards anything: a configured
+/// control plane, a caller that is this machine or on a network the listener
+/// was opened to (`INTUTIC_PROXY_BIND`: a sandbox reaches the proxy through
+/// the host gateway, which Docker Desktop delivers from loopback and a Linux
+/// bridge from the bridge network), a `sessionId` in the body, and an Intutic
+/// virtual key as the bearer. The sandbox attests with its `INTUTIC_API_KEY`;
+/// any other bearer is refused rather than forwarded, because the only other
+/// credential a caller of this proxy holds is a provider key, and that never
+/// goes to the control plane. The handler then authenticates the key the way
+/// a gateway request is, before forwarding. Pure so these checks — the entire
+/// request-shape contract — are unit-testable without constructing a full
+/// `AppState`. Returns the forward URL and the bearer to send on success, or
+/// the exact `(status, body)` this handler should return on failure.
+#[cfg(feature = "control-plane")]
+fn validate_attest_request(
+    control_plane_url: Option<&str>,
+    peer: std::net::IpAddr,
+    listener_open: bool,
+    body: &serde_json::Value,
+    headers: &HeaderMap,
+) -> Result<(String, VirtualKey), (StatusCode, serde_json::Value)> {
+    if let Some(refusal) = attest_peer_refusal(peer, listener_open) {
+        return Err(refusal);
+    }
+    let Some(control_plane_url) = control_plane_url else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "no control plane configured"}),
+        ));
+    };
+
+    let Some(session_id) = body.get("sessionId").and_then(|v| v.as_str()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "sessionId required"}),
+        ));
+    };
+
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if auth.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "authorization required"}),
+        ));
+    }
+    let token = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .unwrap_or(auth);
+    let Some(virtual_key) = RequestCredential::classify(token).virtual_key().cloned() else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "an Intutic virtual key is required"}),
+        ));
+    };
+
+    let url = format!(
+        "{}/api/v1/sessions/{}/attest-sandbox",
+        control_plane_url.trim_end_matches('/'),
+        session_id
+    );
+    Ok((url, virtual_key))
+}
+
+/// The refusal for a caller that is neither this machine nor on a network the
+/// listener was opened to.
+fn attest_peer_refusal(
+    peer: std::net::IpAddr,
+    listener_open: bool,
+) -> Option<(StatusCode, serde_json::Value)> {
+    (!crate::listen::is_loopback_peer(peer) && !listener_open).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            json!({"error": "attestation is accepted only from this machine or a network the proxy listens on"}),
+        )
+    })
+}
+
+/// A build without the `control-plane` feature has no control plane to forward
+/// an attestation to, so past the peer check it answers as a proxy with none
+/// configured does.
+#[cfg(not(feature = "control-plane"))]
+fn validate_attest_request(
+    _control_plane_url: Option<&str>,
+    peer: std::net::IpAddr,
+    listener_open: bool,
+    _body: &serde_json::Value,
+    _headers: &HeaderMap,
+) -> Result<(String, VirtualKey), (StatusCode, serde_json::Value)> {
+    Err(attest_peer_refusal(peer, listener_open).unwrap_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error": "no control plane configured"}),
+    )))
+}
+
+async fn attest_sandbox(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let control_plane_url = state
+        .config
+        .intutic_settings
+        .policy
+        .control_plane_url
+        .as_deref();
+    let (url, virtual_key) = match validate_attest_request(
+        control_plane_url,
+        addr.ip(),
+        crate::listen::listener_open(),
+        &body,
+        &headers,
+    ) {
+        Ok(v) => v,
+        Err((status, body)) => {
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                tracing::warn!("attest-sandbox called with no CONTROL_PLANE_URL configured");
+            }
+            return (status, axum::Json(body));
+        }
+    };
+
+    // The same key check a gateway request gets. The control plane checks the
+    // session belongs to the key's workspace before it records anything.
+    match crate::proxy::authenticate_virtual_key(&state, &virtual_key).await {
+        crate::proxy::KeyCheck::Valid => {}
+        crate::proxy::KeyCheck::Invalid => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(
+                    json!({"error": "Virtual API key is invalid, expired, revoked, or lacks the gateway:use scope."}),
+                ),
+            );
+        }
+        crate::proxy::KeyCheck::Unverifiable => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": "the key could not be checked; retry shortly"})),
+            );
+        }
+    }
+
+    // A build without the `control-plane` feature has no client to forward with.
+    #[cfg(not(feature = "control-plane"))]
+    {
+        let _ = (&url, &virtual_key);
+        (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(json!({"error": "control plane unreachable"})),
+        )
+    }
+    // `url` is built from `CONTROL_PLANE_URL`, operator configuration, and
+    // `http://localhost:3001` is the documented development value; the same
+    // header already travels to the same URL from the auth middleware.
+    #[cfg(feature = "control-plane")]
+    let resp = virtual_key
+        .authorize(state.http_client.patch(&url)) // codeql[rust/cleartext-transmission]
+        .timeout(std::time::Duration::from_millis(3000))
+        .send()
+        .await;
+
+    #[cfg(feature = "control-plane")]
+    match resp {
+        Ok(r) => {
+            let status =
+                StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            (status, axum::Json(json!({"attested": status.is_success()})))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "attest-sandbox forward to control plane failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": "control plane unreachable"})),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod attest_sandbox_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn local() -> std::net::IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
+    fn validate(
+        control_plane_url: Option<&str>,
+        body: &serde_json::Value,
+        headers: &HeaderMap,
+    ) -> Result<(String, VirtualKey), (StatusCode, serde_json::Value)> {
+        validate_attest_request(control_plane_url, local(), false, body, headers)
+    }
+
+    fn headers_with_auth(bearer: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if !bearer.is_empty() {
+            h.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {bearer}")).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn refuses_when_no_control_plane_is_configured() {
+        let body = json!({"sessionId": "ses_1"});
+        let err = validate(None, &body, &headers_with_auth("vk_x"))
+            .expect_err("must reject with no control plane configured");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "control-plane")]
+    #[test]
+    fn refuses_a_body_with_no_session_id() {
+        let body = json!({});
+        let err = validate(Some("http://cp"), &body, &headers_with_auth("vk_x"))
+            .expect_err("must reject a missing sessionId");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "control-plane")]
+    #[test]
+    fn refuses_a_request_with_no_authorization_header() {
+        let body = json!({"sessionId": "ses_1"});
+        let err = validate(Some("http://cp"), &body, &HeaderMap::new())
+            .expect_err("must reject an unauthenticated request");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "control-plane")]
+    #[test]
+    fn builds_the_forward_url_from_control_plane_and_session_id() {
+        let body = json!({"sessionId": "ses_abc123"});
+        let (url, auth) = validate(
+            Some("http://control-plane:3001"),
+            &body,
+            &headers_with_auth("vk_x"),
+        )
+        .expect("a well-formed request must validate");
+        assert_eq!(
+            url,
+            "http://control-plane:3001/api/v1/sessions/ses_abc123/attest-sandbox"
+        );
+        assert_eq!(auth.as_str(), "vk_x");
+    }
+
+    /// The sandbox attests with its virtual key. A provider key in the header
+    /// is refused, never forwarded to the control plane.
+    #[cfg(feature = "control-plane")]
+    #[test]
+    fn refuses_a_bearer_that_is_not_a_virtual_key() {
+        let body = json!({"sessionId": "ses_1"});
+        let provider_key = ["sk-ant-", "api03-", "fixture"].concat();
+        let err = validate(Some("http://cp"), &body, &headers_with_auth(&provider_key))
+            .expect_err("a provider key must not be forwarded");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "control-plane")]
+    #[test]
+    fn trims_a_trailing_slash_on_the_control_plane_url_so_the_path_has_no_double_slash() {
+        let body = json!({"sessionId": "ses_1"});
+        let (url, _) = validate(
+            Some("http://control-plane:3001/"),
+            &body,
+            &headers_with_auth("vk_x"),
+        )
+        .expect("a well-formed request must validate");
+        assert_eq!(
+            url,
+            "http://control-plane:3001/api/v1/sessions/ses_1/attest-sandbox"
+        );
+    }
+
+    /// A call with no bearer is refused before anything is forwarded, from
+    /// any peer.
+    #[cfg(feature = "control-plane")]
+    #[test]
+    fn refuses_an_unauthenticated_call() {
+        let body = json!({"sessionId": "ses_1"});
+        for open in [false, true] {
+            let err =
+                validate_attest_request(Some("http://cp"), local(), open, &body, &HeaderMap::new())
+                    .expect_err("no bearer");
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    /// From another machine, attestation needs a listener opened to its
+    /// network (a Linux sandbox's bridge); a loopback-only proxy refuses it.
+    #[cfg(feature = "control-plane")]
+    #[test]
+    fn refuses_a_network_peer_unless_the_listener_was_opened_to_it() {
+        let body = json!({"sessionId": "ses_1"});
+        let lan: std::net::IpAddr = "192.168.1.42".parse().unwrap();
+        let err = validate_attest_request(
+            Some("http://cp"),
+            lan,
+            false,
+            &body,
+            &headers_with_auth("vk_x"),
+        )
+        .expect_err("network peer on a loopback listener");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let bridge: std::net::IpAddr = "172.17.0.2".parse().unwrap();
+        validate_attest_request(
+            Some("http://cp"),
+            bridge,
+            true,
+            &body,
+            &headers_with_auth("vk_x"),
+        )
+        .expect("a peer on a network the listener was opened to");
+    }
+
+    /// The handler authenticates the key before forwarding; it does not trust
+    /// the `vk_` shape alone.
+    #[test]
+    fn the_handler_authenticates_the_key_before_forwarding() {
+        let src = include_str!("router.rs");
+        let handler = src
+            .split("async fn attest_sandbox(")
+            .nth(1)
+            .expect("handler present");
+        let auth = handler
+            .find("authenticate_virtual_key(&state, &virtual_key)")
+            .expect("handler authenticates the key");
+        let forward = handler.find(".authorize(state.http_client.patch").unwrap();
+        assert!(auth < forward, "the key is checked before the forward");
+    }
+}
+
+#[cfg(test)]
+mod spend_status_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn v4(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)
+    }
+
+    #[test]
+    fn allows_ipv4_loopback() {
+        assert!(spend_peer_allowed(&v4([127, 0, 0, 1], 54321)));
+    }
+
+    #[test]
+    fn allows_ipv6_loopback() {
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 54321);
+        assert!(spend_peer_allowed(&addr));
+    }
+
+    #[test]
+    fn refuses_a_lan_peer() {
+        // The exact scenario this guard exists for: a listener opened to
+        // the network, so a laptop on the same Wi-Fi reaches this route unless
+        // something besides "bound address" gates it.
+        assert!(!spend_peer_allowed(&v4([192, 168, 1, 42], 54321)));
+    }
+
+    #[test]
+    fn refuses_any_other_non_loopback_address() {
+        assert!(!spend_peer_allowed(&v4([10, 0, 0, 5], 1)));
+        assert!(!spend_peer_allowed(&v4([8, 8, 8, 8], 443)));
+    }
+
+    /// The handler itself, not just the pure predicate: a non-loopback peer
+    /// must actually get refused end to end, including the status code a
+    /// real client would see, not merely a predicate returning false in
+    /// isolation.
+    #[tokio::test]
+    async fn handler_refuses_a_non_loopback_peer_with_403() {
+        let addr = v4([192, 168, 1, 42], 54321);
+        let response = spend_status(ConnectInfo(addr)).await.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "loopback only");
+    }
+
+    /// A loopback peer gets the three documented fields back, not a subset
+    /// or a differently-named shape a client would need to guess at.
+    #[tokio::test]
+    async fn handler_serves_loopback_peers_the_documented_shape() {
+        let addr = v4([127, 0, 0, 1], 54321);
+        let response = spend_status(ConnectInfo(addr)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body
+            .get("local_spend_usd_today")
+            .is_some_and(|v| v.is_number()));
+        assert!(body.get("local_cap_usd").is_some_and(|v| v.is_number()));
+        assert!(body.get("enforced").is_some_and(|v| v.is_boolean()));
+    }
+}
+
+#[cfg(test)]
+mod run_probes_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn v4(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)
+    }
+
+    /// `run_probes` reuses `spend_peer_allowed` — its own predicate coverage
+    /// (IPv4/IPv6 loopback, LAN, other) lives in `spend_status_tests` above
+    /// and is not duplicated here. This test is the same end-to-end shape as
+    /// `handler_refuses_a_non_loopback_peer_with_403`, for the route the SOP
+    /// content leak (`GET /intutic/probes`) was actually found on.
+    #[tokio::test]
+    async fn handler_refuses_a_non_loopback_peer_with_403() {
+        let addr = v4([192, 168, 1, 42], 54321);
+        let response = run_probes(ConnectInfo(addr)).await.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "loopback only");
+    }
+
+    /// A loopback peer gets the last recorded run, not a fresh one computed
+    /// on this request — `run_probes` must never call the suite itself. Seeds
+    /// `LAST_RUN` first via the real recorder, since it is process-global and
+    /// this test cannot assume ordering against every other test in the
+    /// binary that might also seed it.
+    #[tokio::test]
+    async fn handler_serves_loopback_peers_the_last_recorded_run() {
+        let registry = crate::plugins::anomaly::DetectorRegistry::with_defaults();
+        let recorded = crate::probes::run_and_record(&registry, &[]);
+
+        let addr = v4([127, 0, 0, 1], 54321);
+        let response = run_probes(ConnectInfo(addr)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("probes").is_some_and(|v| v.is_array()));
+        assert_eq!(body["total"], recorded.verdicts.len());
+        assert!(body.get("failed").is_some_and(|v| v.is_number()));
+        assert!(body.get("ran_at").is_some_and(|v| v.is_number()));
+    }
+}
+
+#[cfg(test)]
+mod instance_status_tests {
+    use super::*;
+
+    #[test]
+    fn the_body_carries_the_minted_id_and_the_matching_gateway_flag() {
+        let body = instance_body();
+        let id = body["proxy_instance_id"].as_str().expect("id is a string");
+        let shared = body["shared_gateway"].as_bool().expect("flag is a bool");
+        // Whatever this test process's env says, the two fields must agree:
+        // the daemon refuses to register a `gw_` id, and it must be able to
+        // trust either field alone.
+        assert_eq!(id, crate::proxy::proxy_instance_id());
+        assert_eq!(shared, crate::proxy::is_shared_gateway_env());
+        assert_eq!(id.starts_with("gw_"), shared);
+        assert!(id.starts_with("proxy_") || id.starts_with("gw_"), "{id}");
+    }
+
+    #[test]
+    fn the_route_is_behind_the_same_loopback_guard_as_spend() {
+        // The guard is shared, not copied: a LAN peer is refused here for the
+        // reason `spend_peer_allowed` documents.
+        let src = include_str!("router.rs");
+        let handler = src
+            .split("async fn instance_status(")
+            .nth(1)
+            .expect("instance_status handler present");
+        let head = &handler[..handler
+            .find("instance_body()")
+            .expect("handler answers with instance_body")];
+        assert!(
+            head.contains("spend_peer_allowed(&addr)"),
+            "instance_status must check the peer before answering"
+        );
+    }
+}

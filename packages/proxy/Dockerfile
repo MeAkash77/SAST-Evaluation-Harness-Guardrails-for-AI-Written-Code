@@ -1,0 +1,65 @@
+# ─── Stage 1: Builder ──────────────────────────────────────────────────────────
+# The toolchain CI pins (the rust job in .github/workflows/ci.yml); bump both together.
+FROM rust:1.98.0-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Cache dependency compilation separately from application code
+COPY Cargo.toml Cargo.lock ./
+# Create a dummy main to cache deps
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs && echo "pub mod config;" > src/lib.rs
+RUN cargo build --release 2>/dev/null || true
+RUN rm -f target/release/deps/intutic_proxy* target/release/intutic-proxy
+
+# Now copy real source and build
+COPY src/ ./src/
+COPY build.rs ./build.rs
+COPY assets/ ./assets/
+COPY benches/ ./benches/
+RUN cargo build --release
+
+# ─── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+# Install runtime dependencies (OpenSSL, CA certs for HTTPS to upstream LLMs),
+# and wget for the health checks: this one and the Self-host compose file's.
+# bookworm-slim has neither wget nor curl, so both checks failed and the
+# compose stack's nginx, which waits for a healthy proxy, never started.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1001 intutic
+USER intutic
+WORKDIR /home/intutic
+
+# Copy compiled binary
+COPY --from=builder /build/target/release/intutic-proxy /usr/local/bin/intutic-proxy
+
+# Default config (overridden by ConfigMap mount at /etc/intutic/proxy-config.yaml)
+ENV CONFIG_PATH=/etc/intutic/proxy-config.yaml
+ENV PORT=4000
+# A container is reached through its own network interface, never its
+# loopback, so the image listens on every interface. Run outside a container,
+# the proxy listens on loopback unless INTUTIC_PROXY_BIND says otherwise.
+ENV INTUTIC_PROXY_BIND=0.0.0.0
+ENV RUST_LOG=intutic_proxy=info,tower_http=info
+
+EXPOSE 4000
+
+# Health check (maps to GET /health in router.rs)
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -qO- http://localhost:4000/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/intutic-proxy"]

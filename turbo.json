@@ -1,0 +1,113 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": [
+        "^build"
+      ],
+      "outputs": [
+        "dist/**"
+      ]
+    },
+    "@intutic/theme#build": {
+      "dependsOn": [
+        "^build"
+      ],
+      // The theme build also copies its fonts and brand marks into each app's
+      // public/ (src/tools/sync-assets.ts). Declared as outputs so a cache hit
+      // restores them too; with dist/** alone a replayed build left an app
+      // with no fonts.
+      "outputs": [
+        "dist/**",
+        "$TURBO_ROOT$/apps/dashboard/public/fonts/**",
+        "$TURBO_ROOT$/apps/dashboard/public/assets/brand/**",
+        "$TURBO_ROOT$/apps/dashboard/public/favicon.svg",
+        "$TURBO_ROOT$/apps/docs/public/fonts/**",
+        "$TURBO_ROOT$/apps/docs/public/logo.svg",
+        "$TURBO_ROOT$/apps/docs/public/logo-white.svg",
+        "$TURBO_ROOT$/apps/docs/public/logo-black.svg",
+        "$TURBO_ROOT$/apps/docs/public/favicon.svg"
+      ]
+    },
+    "test": {
+      "dependsOn": [
+        "build"
+      ]
+    },
+    "test:integration": {
+      "dependsOn": [
+        "build"
+      ]
+    },
+    "test:cross": {
+      "dependsOn": [
+        "build"
+      ]
+    },
+    "test:e2e": {
+      "dependsOn": [
+        "build"
+      ]
+    },
+    "bench": {
+      "dependsOn": [
+        "build"
+      ]
+    },
+    "lint": {},
+    "typecheck": {
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "docs": {
+      "dependsOn": [
+        "build"
+      ],
+      "outputs": [
+        "docs/api/**"
+      ]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "@intutic/docs#build": {
+      "dependsOn": [
+        "^build"
+      ],
+      "outputs": [
+        ".vitepress/dist/**"
+      ],
+      // Without these, turbo strips both vars before invoking vitepress.
+      // Functionally inert in this repo today — hasControlPlane in
+      // apps/docs/.vitepress/config.ts is always false here (no
+      // services/control-plane dir), so IS_OSS is always true regardless —
+      // but kept structurally identical to the enterprise repo's turbo.json
+      // rather than letting the two configs drift.
+      "passThroughEnv": [
+        "INTUTIC_ENTERPRISE_BUILD",
+        "INTUTIC_REQUIRE_FULL"
+      ]
+    },
+    "@intutic/wasm-sdk#build": {
+      "dependsOn": [
+        "^build"
+      ],
+      "outputs": [
+        "build/**"
+      ]
+    }
+  },
+  "ui": "stream",
+  "globalPassThroughEnv": [
+    "VITE_*",
+    "DATABASE_URL",
+    "VALKEY_URL",
+    "JWT_SECRET",
+    "ENCRYPTION_KEY",
+    "NODE_ENV",
+    "RESEND_API_KEY",
+    "RESEND_FROM_ADDRESS"
+  ]
+}

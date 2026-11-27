@@ -1,0 +1,966 @@
+//! WASM Plugin Registry — loads plugins from Valkey and the local rules
+//! directory (`~/.intutic/wasm`), both hot-reloaded on a 5 s TTL rescan.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::RwLock;
+use wasmtime::{Engine, Module};
+
+use super::context::{RequestContext, Verdict};
+use super::limits::Failure;
+use super::local_loader;
+use super::referenced_files::{self, ReferencedFiles};
+use super::runner::evaluate_wasm_rule;
+use crate::store::{ControlPlaneCache, RuleRefusalWire};
+
+/// Wall-clock ceiling on reading every file one request references.
+///
+/// Separate from the guest's limits, because it bounds something different:
+/// they bound untrusted code, this bounds the local filesystem. On expiry no
+/// file is readable, and a rule governing a manifest refuses what it cannot
+/// read — so, like the guest deadline, this must not expire because the
+/// machine is busy: eight cached reads take well under a millisecond, but a
+/// blocking-pool thread on a loaded machine can wait hundreds of milliseconds
+/// to run (see `limits`). One second still stops a stalled NFS mount from
+/// holding the request open.
+///
+/// On expiry the blocking task is abandoned, not cancelled — `spawn_blocking`
+/// work cannot be interrupted. A wedged filesystem therefore leaks one blocking
+/// thread per affected request until it recovers. Accepted: the alternative is
+/// blocking the request path on the same wedge, and a hung filesystem is a host
+/// problem the proxy can report but not fix.
+const PREFETCH_BUDGET: Duration = Duration::from_millis(1_000);
+
+/// Warn once, not once per request, when a rule wants files and no root is set.
+static NO_ROOT_WARNING: std::sync::Once = std::sync::Once::new();
+
+/// How a rule's verdict is treated.
+///
+/// `Enforce` is `#[serde(other)]`-free and the `Default`, so a descriptor
+/// written before this field existed keeps its meaning rather than silently
+/// falling into shadow — a rule that stops enforcing without saying so is the
+/// worse of the two failure directions.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RuleMode {
+    #[default]
+    #[serde(rename = "ENFORCE", alias = "enforce")]
+    Enforce,
+    /// Evaluate and report; the request proceeds unchanged.
+    #[serde(rename = "SHADOW", alias = "shadow")]
+    Shadow,
+}
+
+/// One shadowed rule's outcome on one request.
+///
+/// Carries the real verdict, not a `WOULD_HAVE` sentinel — the same reasoning
+/// `FindingWire.shadowed` documents: encoding shadow into the verdict makes
+/// every consumer matching on the real value silently miss the shadowed ones,
+/// and destroys the thing being measured.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShadowReport {
+    pub rule_id: String,
+    pub name: String,
+    /// False on a bypass. Both are reported; the bypasses are the denominator.
+    pub would_act: bool,
+    pub verdict: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct WasmPluginDescriptor {
+    #[serde(rename = "ruleId")]
+    pub rule_id: String,
+    pub name: String,
+    pub sha256: String,
+    pub priority: u32,
+    /// Absent on older descriptors, which must continue to enforce.
+    #[serde(default)]
+    pub mode: RuleMode,
+}
+
+#[derive(Clone)]
+pub struct LoadedModule {
+    pub rule_id: String,
+    pub name: String,
+    pub sha256: String,
+    pub priority: u32,
+    pub mode: RuleMode,
+    pub module: Module,
+    /// Whether this rule imports `env.read_referenced_file`.
+    ///
+    /// Decided once, at load, from the module's import section — see
+    /// [`super::host::module_reads_referenced_files`]. The registry reads it to
+    /// decide whether a request needs any disk I/O *before* doing any, which is
+    /// what makes a module that does not import the function cost exactly what
+    /// it cost before the function existed.
+    pub reads_referenced_files: bool,
+    /// A Rego policy compiled by OPA, evaluated through [`super::opa`]
+    /// instead of the native rule ABI. Resolved at load, wherever the rule
+    /// came from.
+    pub rego: Option<Arc<super::opa::OpaRule>>,
+}
+
+struct WorkspaceModules {
+    last_checked: Instant,
+    modules: Vec<LoadedModule>,
+}
+
+/// Rules loaded from the local directory (workspace-independent).
+#[derive(Default)]
+struct LocalRules {
+    last_checked: Option<Instant>,
+    signatures: HashMap<PathBuf, (SystemTime, u64)>,
+    modules: Vec<LoadedModule>,
+    /// Set by [`PluginRegistry::force_local_rescan`] to make the next scan
+    /// reload unconditionally, even when the on-disk signatures are unchanged
+    /// (mtime granularity can hide a same-second rewrite). Cleared on swap.
+    force: bool,
+}
+
+/// Plugin registry — manages loaded WASM plugins per workspace
+pub struct PluginRegistry {
+    engine: Engine,
+    workspace_modules: RwLock<HashMap<String, WorkspaceModules>>,
+    local_dir: PathBuf,
+    local_rules: RwLock<LocalRules>,
+    /// `(workspace, descriptor hash, what was wrong)` of every refused rule
+    /// version already reported. The sync reruns every 5 s and a bad binary
+    /// stays bad, so without this one bad upload would raise an incident every
+    /// five seconds for as long as it sat in the cache.
+    refusals_reported: std::sync::Mutex<HashSet<(String, String, String)>>,
+}
+
+/// Whether `bytes` are the binary a descriptor names. The control plane keys
+/// the binary by the lowercase hex SHA-256 of its bytes (`wasmRules.ts`); case
+/// is not significant in hex.
+fn binary_matches(bytes: &[u8], sha256: &str) -> (bool, String) {
+    use sha2::{Digest, Sha256};
+    let actual = hex::encode(Sha256::digest(bytes));
+    (actual.eq_ignore_ascii_case(sha256), actual)
+}
+
+impl PluginRegistry {
+    /// Create a new plugin registry. Local rules load from the rules directory
+    /// (see [`local_loader::resolve_local_dir`]); control-plane-distributed
+    /// rules are fetched lazily per workspace via [`Self::evaluate`].
+    pub async fn new(local_dir_override: Option<&str>) -> anyhow::Result<Arc<Self>> {
+        let engine = super::limits::engine()?;
+
+        let local_dir = local_loader::resolve_local_dir(local_dir_override);
+        tracing::info!(
+            local_dir = %local_dir.display(),
+            "WASM plugin registry initialized (local rules dir; control-plane rules load per workspace)"
+        );
+        Ok(Arc::new(Self {
+            engine,
+            workspace_modules: RwLock::new(HashMap::new()),
+            local_dir,
+            local_rules: RwLock::new(LocalRules::default()),
+            refusals_reported: std::sync::Mutex::new(HashSet::new()),
+        }))
+    }
+
+    /// Number of loaded plugins globally (control-plane-sourced + local).
+    pub async fn plugin_count(&self) -> usize {
+        let guard = self.workspace_modules.read().await;
+        let remote_count: usize = guard.values().map(|w| w.modules.len()).sum();
+        drop(guard);
+        remote_count + self.local_rules.read().await.modules.len()
+    }
+
+    /// Drop the local-dir rescan TTL and mark the next scan as forced, so the
+    /// next evaluation rescans and reloads unconditionally — even if a replaced
+    /// file kept an identical (mtime, size) signature. Used by integration
+    /// tests and manual reload triggers.
+    ///
+    /// The force flag must NOT be expressed by clearing `signatures`: doing so
+    /// makes an empty directory compare equal to the empty baseline, so the
+    /// "every rule was deleted" case short-circuits and leaves the previously
+    /// loaded modules enforcing forever.
+    pub async fn force_local_rescan(&self) {
+        let mut guard = self.local_rules.write().await;
+        guard.last_checked = None;
+        guard.force = true;
+    }
+
+    /// Run all plugins in priority order, short-circuit on KILL.
+    ///
+    /// Valkey-sourced and local rules are merged into one priority-ordered
+    /// list (stable sort — ties keep Valkey rules first). Because KILL
+    /// short-circuits and there is no verdict that overrides a block, the
+    /// union is most-restrictive-wins: local rules can only add restrictions.
+    /// What a shadowed rule would have done, for the caller to record.
+    ///
+    /// Returned rather than logged only, because a shadow period that produces
+    /// no counted evidence cannot support a promotion decision — and promotion
+    /// is gated on exactly that evidence. A `tracing::info!` line is not a
+    /// denominator.
+    pub async fn evaluate_with_shadow(
+        &self,
+        control_plane: &Arc<dyn ControlPlaneCache>,
+        ctx: &RequestContext,
+    ) -> (Verdict, Vec<ShadowReport>) {
+        self.evaluate_with_shadow_exempting(control_plane, ctx, None)
+            .await
+    }
+
+    /// `evaluate_with_shadow`, with one rule left unevaluated: a break-glass
+    /// token scoped to `exempt_rule_id` (`BreakGlassScope::WasmRule`) skips
+    /// exactly that rule. Every other rule runs and may still Kill or Reask.
+    /// An exempted rule is neither evaluated nor shadow-reported — a report
+    /// would record a verdict nobody computed.
+    pub async fn evaluate_with_shadow_exempting(
+        &self,
+        control_plane: &Arc<dyn ControlPlaneCache>,
+        ctx: &RequestContext,
+        exempt_rule_id: Option<&str>,
+    ) -> (Verdict, Vec<ShadowReport>) {
+        let mut shadow = Vec::new();
+        let verdict = self
+            .evaluate_inner(control_plane, ctx, &mut shadow, exempt_rule_id)
+            .await;
+        (verdict, shadow)
+    }
+
+    pub async fn evaluate(
+        &self,
+        control_plane: &Arc<dyn ControlPlaneCache>,
+        ctx: &RequestContext,
+    ) -> Verdict {
+        let mut sink = Vec::new();
+        self.evaluate_inner(control_plane, ctx, &mut sink, None)
+            .await
+    }
+
+    async fn evaluate_inner(
+        &self,
+        control_plane: &Arc<dyn ControlPlaneCache>,
+        ctx: &RequestContext,
+        shadow_out: &mut Vec<ShadowReport>,
+        exempt_rule_id: Option<&str>,
+    ) -> Verdict {
+        let workspace_id = &ctx.workspace_id;
+
+        // Sync rules on cache expiration
+        if let Err(e) = self.ensure_up_to_date(control_plane, workspace_id).await {
+            tracing::error!(
+                "Failed to sync WASM plugins for workspace {}: {}",
+                workspace_id,
+                e
+            );
+        }
+        self.ensure_local_up_to_date().await;
+
+        let mut modules: Vec<LoadedModule> = Vec::new();
+        {
+            let modules_guard = self.workspace_modules.read().await;
+            if let Some(ws_mods) = modules_guard.get(workspace_id) {
+                modules.extend(ws_mods.modules.iter().cloned());
+            }
+        }
+        {
+            let local_guard = self.local_rules.read().await;
+            modules.extend(local_guard.modules.iter().cloned());
+        }
+        modules.sort_by_key(|m| m.priority);
+
+        // Read the referenced manifests once for the whole request, not once
+        // per rule: the read is a property of the request, and two rules
+        // evaluating one request must not be able to see different bytes.
+        //
+        // Skipped entirely — not even a candidate-path scan — when no loaded
+        // rule imports the function. That is the backwards-compatibility
+        // guarantee expressed as code rather than as a promise.
+        let files = if modules.iter().any(|m| m.reads_referenced_files) {
+            self.prefetch_referenced_files(ctx).await
+        } else {
+            Arc::new(ReferencedFiles::empty())
+        };
+
+        // A reask from an earlier rule is held, not returned immediately: a
+        // later rule may still block, and a block outranks a retry. Returning
+        // the first reask would let a low-priority advisory rule mask a
+        // high-priority refusal simply by sorting first.
+        let mut pending_reask: Option<Verdict> = None;
+        let mut pending_hold: Option<Verdict> = None;
+        let mut unavailable: Option<Verdict> = None;
+
+        for m in modules {
+            if exempt_rule_id == Some(m.rule_id.as_str()) {
+                tracing::info!(
+                    workspace_id = %workspace_id,
+                    rule_id = %m.rule_id,
+                    "WASM rule not evaluated: a break-glass token scoped to this rule is active"
+                );
+                continue;
+            }
+            let (verdict, failure) = if let Some(rule) = &m.rego {
+                super::opa::evaluate(&self.engine, &m.module, rule, ctx)
+            } else {
+                match evaluate_wasm_rule(&self.engine, &m.module, ctx, &files) {
+                    Ok(verdict) => (verdict, None),
+                    Err(failure) => (Verdict::Bypass, Some(failure)),
+                }
+            };
+            let failure = failure.or_else(|| Self::unenforceable(&verdict));
+            let verdict = match failure {
+                Some(failure) => Self::no_verdict(&m, verdict, failure),
+                None => verdict,
+            };
+
+            // A shadowed rule reports and falls through. It is evaluated exactly
+            // as an enforcing one — same engine, same fuel, same timeout — so
+            // what the shadow report says is what enforcement would do, rather
+            // than what a cheaper approximation would.
+            //
+            // No WOULD_HAVE sentinel verdict: telemetry.rs rejected that shape
+            // deliberately, because a synthetic value hides shadowed events from
+            // every consumer that matches on the real one. The real verdict goes
+            // in the log line and the request is left alone.
+            if m.mode == RuleMode::Shadow {
+                // EVERY evaluation is reported, including the bypasses. The
+                // would-have-blocked count is only meaningful against a
+                // denominator, and reporting solely the blocks would make a
+                // rule that fires on one request in a thousand look identical
+                // to one that fires on the only request it ever saw.
+                let would_act = !matches!(verdict, Verdict::Bypass);
+                if would_act {
+                    tracing::info!(
+                        rule_id = %m.rule_id,
+                        rule = %m.name,
+                        shadowed = true,
+                        verdict = ?verdict,
+                        "WASM rule would have acted; shadow mode, request unchanged"
+                    );
+                }
+                shadow_out.push(ShadowReport {
+                    rule_id: m.rule_id.clone(),
+                    name: m.name.clone(),
+                    would_act,
+                    verdict: format!("{verdict:?}"),
+                });
+                continue;
+            }
+
+            match verdict {
+                // The runner has no rule identity — attribute here so logs and
+                // incidents name the rule that fired.
+                Verdict::Kill { reason, policy_id } => {
+                    return Verdict::Kill {
+                        reason,
+                        policy_id: policy_id.or_else(|| Some(m.rule_id.clone())),
+                    };
+                }
+                // Held rather than returned, like a hold: a later rule's block
+                // is the more useful refusal — it says what is wrong with the
+                // call, not that a rule could not tell. It still outranks a
+                // hold and a reask, because neither an approval nor a retry
+                // can clear a call a rule never judged.
+                v @ Verdict::Unavailable { .. } if unavailable.is_none() => {
+                    unavailable = Some(v);
+                }
+                // Attributed for the same reason, and one more: the request
+                // path keys the reask counter on this id. An unattributed reask
+                // would make every rule share one three-strike allowance, so an
+                // agent corrected once by two different rules would be blocked
+                // on its second *distinct* correction rather than on a repeated
+                // failure to correct — the exact inversion the counter exists to
+                // prevent, already documented for `detector_id` in proxy.rs.
+                // A hold waits for a person, which a retry cannot replace, so
+                // it outranks a reask; a later block still outranks it.
+                Verdict::Hold {
+                    reason,
+                    policy_id,
+                    risk_tier,
+                    tool,
+                    target_hash,
+                } if pending_hold.is_none() => {
+                    pending_hold = Some(Verdict::Hold {
+                        reason,
+                        policy_id: policy_id.or_else(|| Some(m.rule_id.clone())),
+                        risk_tier,
+                        tool,
+                        target_hash,
+                    });
+                }
+                Verdict::Reask {
+                    reason,
+                    attempts_remaining,
+                    policy_id,
+                } if pending_reask.is_none() => {
+                    pending_reask = Some(Verdict::Reask {
+                        reason,
+                        attempts_remaining,
+                        policy_id: policy_id.or_else(|| Some(m.rule_id.clone())),
+                    });
+                }
+                // An earlier rule's verdict on the same rung already holds the
+                // slot; the first one in priority order is the one reported.
+                Verdict::Unavailable { .. } | Verdict::Hold { .. } | Verdict::Reask { .. } => {}
+                // `Hijack` and `Enhance` never get here: `unenforceable` turned
+                // them into a rule that reached no verdict above.
+                Verdict::Bypass | Verdict::Hijack { .. } | Verdict::Enhance { .. } => {}
+            }
+        }
+
+        unavailable
+            .or(pending_hold)
+            .or(pending_reask)
+            .unwrap_or(Verdict::Bypass)
+    }
+
+    /// A verdict a custom rule cannot have reached, as a rule that reached none.
+    ///
+    /// `Hijack` and `Enhance` are rungs of the native plugin ladder. Neither
+    /// runner produces them — a native rule returns `0`, `1`, `2` or `3`, and
+    /// a Rego rule allow, deny, hold or reask — and neither carries what the
+    /// request path would need to act on one: a guest never sees the request
+    /// body to rewrite, and there is no guidance to inject. Merged as they
+    /// stood, they fell through to the ignore arm and allowed the call, the
+    /// same silent allow a non-verdict code would be. So they are refused like
+    /// one, named, and the request path never sees them.
+    fn unenforceable(verdict: &Verdict) -> Option<Failure> {
+        let name = match verdict {
+            Verdict::Hijack { .. } => "HIJACK",
+            Verdict::Enhance { .. } => "ENHANCE",
+            Verdict::Bypass
+            | Verdict::Kill { .. }
+            | Verdict::Reask { .. }
+            | Verdict::Hold { .. }
+            | Verdict::Unavailable { .. } => return None,
+        };
+        Some(Failure::result(format!(
+            "it returned {name}, which a custom rule cannot express (0 allow, 1 block, 3 reask)"
+        )))
+    }
+
+    /// What a rule that reached no verdict means for the request: a refusal,
+    /// whatever `intutic_settings.policy.fail_closed` says.
+    ///
+    /// The fail setting exists for control-plane outages, which an agent
+    /// cannot cause. A rule running out of time or budget is something an
+    /// agent can cause, by padding its input, so it must never become an
+    /// allow: a rule that never judged the call has not cleared it — the
+    /// `ext_authz` and admission-webhook default.
+    ///
+    /// A block the same rule reached on another call of the turn stands: it
+    /// refuses already, and says why.
+    fn no_verdict(m: &LoadedModule, verdict: Verdict, failure: Failure) -> Verdict {
+        let kind = if m.rego.is_some() {
+            "Rego rule"
+        } else {
+            "WASM rule"
+        };
+        let outcome = match m.mode {
+            RuleMode::Shadow => "shadow mode, request unchanged",
+            RuleMode::Enforce => "refusing",
+        };
+        tracing::warn!(
+            rule_id = %m.rule_id,
+            cause = failure.stop.as_str(),
+            "{kind} reached no verdict: {}; {outcome}",
+            failure.reason
+        );
+        if matches!(verdict, Verdict::Kill { .. }) {
+            return verdict;
+        }
+        Verdict::Unavailable {
+            reason: format!(
+                "Custom rule {} reached no verdict ({}): {}. Request blocked: a rule that \
+                 cannot decide never allows.",
+                m.rule_id,
+                failure.stop.as_str(),
+                failure.reason
+            ),
+            policy_id: Some(m.rule_id.clone()),
+        }
+    }
+
+    /// Resolve and read the files this request's tool calls reference.
+    ///
+    /// Runs entirely outside the runner's guest limits and on the blocking
+    /// pool, so that budget keeps meaning what it says — time spent executing
+    /// untrusted guest code — rather than quietly absorbing a disk read. The
+    /// cost lands on the request instead, bounded by [`PREFETCH_BUDGET`] and by
+    /// the per-file and per-request caps in [`referenced_files`].
+    ///
+    /// Every failure yields an empty table, so a rule sees "nothing readable"
+    /// and decides for itself. It is not a bypass: the rule still runs.
+    async fn prefetch_referenced_files(&self, ctx: &RequestContext) -> Arc<ReferencedFiles> {
+        // Cheap and pure, and the common answer is "no candidates" — done on
+        // this thread so a request with no manifest in it never touches the
+        // blocking pool.
+        let candidates = referenced_files::candidate_tokens(ctx);
+        if candidates.tokens.is_empty() && !candidates.past_limits {
+            return Arc::new(ReferencedFiles::empty());
+        }
+
+        let Some(root) = referenced_files::resolve_root() else {
+            NO_ROOT_WARNING.call_once(|| {
+                tracing::warn!(
+                    env = referenced_files::MANIFEST_ROOT_ENV,
+                    "a WASM rule imports env.read_referenced_file but no manifest root is \
+                     configured — every read will be refused. Set {} to the directory rules \
+                     may read manifests from.",
+                    referenced_files::MANIFEST_ROOT_ENV
+                );
+            });
+            return Arc::new(ReferencedFiles::empty());
+        };
+
+        let started = Instant::now();
+        let read = tokio::task::spawn_blocking(move || {
+            referenced_files::read_candidates(candidates, &root)
+        });
+        let files = match tokio::time::timeout(PREFETCH_BUDGET, read).await {
+            Ok(Ok(files)) => files,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "referenced-file prefetch task failed — no files exposed");
+                ReferencedFiles::empty()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    budget_ms = PREFETCH_BUDGET.as_millis(),
+                    "referenced-file prefetch exceeded its budget — no files exposed"
+                );
+                ReferencedFiles::empty()
+            }
+        };
+        tracing::debug!(
+            readable = files.readable_count(),
+            elapsed_us = started.elapsed().as_micros(),
+            "referenced-file prefetch complete"
+        );
+        Arc::new(files)
+    }
+
+    /// Rescan the local rules directory at most every 5 s (same TTL pattern
+    /// as the Valkey path). File I/O and compilation run on the blocking
+    /// pool and entirely OUTSIDE the lock, so request evaluation never
+    /// stalls behind a rescan. Any scan or load failure retains the
+    /// previously loaded rules — a transient EACCES/EIO must never be
+    /// mistaken for "all local rules deleted" (that would silently fail open
+    /// on locally-installed Kill rules).
+    async fn ensure_local_up_to_date(&self) {
+        {
+            let guard = self.local_rules.read().await;
+            if let Some(at) = guard.last_checked {
+                if at.elapsed() < Duration::from_secs(5) {
+                    return;
+                }
+            }
+        }
+        let entered = Instant::now();
+
+        let scan_dir = self.local_dir.clone();
+        let new_signatures = match tokio::task::spawn_blocking(move || {
+            local_loader::scan_signatures(&scan_dir)
+        })
+        .await
+        {
+            Ok(Ok(sigs)) => sigs,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    dir = %self.local_dir.display(),
+                    error = %e,
+                    "local WASM rule scan failed — keeping previous rules"
+                );
+                self.local_rules.write().await.last_checked = Some(Instant::now());
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "local WASM rule scan task failed — keeping previous rules");
+                self.local_rules.write().await.last_checked = Some(Instant::now());
+                return;
+            }
+        };
+
+        // Compare and snapshot the previous modules under a short read lock.
+        // An unchanged signature set means nothing on disk moved, so the loaded
+        // modules are already correct — unless a forced rescan was requested.
+        let previous = {
+            let guard = self.local_rules.read().await;
+            if !guard.force && new_signatures == guard.signatures {
+                drop(guard);
+                self.local_rules.write().await.last_checked = Some(Instant::now());
+                return;
+            }
+            guard.modules.clone()
+        };
+
+        // Compile outside the lock — a large rule set must not block readers.
+        let engine = self.engine.clone();
+        let sigs_for_load = new_signatures.clone();
+        let loaded = match tokio::task::spawn_blocking(move || {
+            local_loader::load_local_modules(&engine, &sigs_for_load, &previous)
+        })
+        .await
+        {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                tracing::warn!(error = %e, "local WASM rule load failed — keeping previous rules");
+                self.local_rules.write().await.last_checked = Some(Instant::now());
+                return;
+            }
+        };
+
+        // Swap in under a short write lock; if a concurrent rescan finished
+        // after we started, its result is fresher — keep it.
+        let mut guard = self.local_rules.write().await;
+        if let Some(at) = guard.last_checked {
+            if at > entered {
+                return;
+            }
+        }
+        tracing::info!(
+            dir = %self.local_dir.display(),
+            rules = loaded.len(),
+            "local WASM rules reloaded"
+        );
+        guard.modules = loaded;
+        guard.signatures = new_signatures;
+        guard.last_checked = Some(Instant::now());
+        guard.force = false;
+    }
+
+    async fn ensure_up_to_date(
+        &self,
+        control_plane: &Arc<dyn ControlPlaneCache>,
+        workspace_id: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let guard = self.workspace_modules.read().await;
+            if let Some(ws_mods) = guard.get(workspace_id) {
+                if ws_mods.last_checked.elapsed() < Duration::from_secs(5) {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Cache expired or missing -> update with write lock
+        let mut guard = self.workspace_modules.write().await;
+        if let Some(ws_mods) = guard.get(workspace_id) {
+            if ws_mods.last_checked.elapsed() < Duration::from_secs(5) {
+                return Ok(());
+            }
+        }
+
+        let plugins_json = control_plane.wasm_plugins(workspace_id).await?;
+
+        let mut new_modules = Vec::new();
+        if let Some(json_str) = plugins_json {
+            let descriptors: Vec<WasmPluginDescriptor> = serde_json::from_str(&json_str)?;
+
+            let mut existing_map = HashMap::new();
+            let mut previous_by_rule = HashMap::new();
+            if let Some(ws_mods) = guard.get(workspace_id) {
+                for m in &ws_mods.modules {
+                    existing_map.insert(m.sha256.clone(), (m.module.clone(), m.rego.clone()));
+                    previous_by_rule.insert(m.rule_id.clone(), m.clone());
+                }
+            }
+
+            for desc in descriptors {
+                if let Some((module, rego)) = existing_map.get(&desc.sha256) {
+                    new_modules.push(LoadedModule {
+                        rule_id: desc.rule_id,
+                        name: desc.name,
+                        sha256: desc.sha256,
+                        priority: desc.priority,
+                        mode: desc.mode,
+                        reads_referenced_files: super::host::module_reads_referenced_files(module),
+                        rego: rego.clone(),
+                        module: module.clone(),
+                    });
+                } else {
+                    let bin_bytes = control_plane.wasm_binary(&desc.sha256).await?;
+                    match self.load_descriptor(&desc, bin_bytes.as_deref()) {
+                        Ok((module, rego)) => new_modules.push(LoadedModule {
+                            rule_id: desc.rule_id,
+                            name: desc.name,
+                            sha256: desc.sha256,
+                            priority: desc.priority,
+                            mode: desc.mode,
+                            reads_referenced_files: super::host::module_reads_referenced_files(
+                                &module,
+                            ),
+                            rego,
+                            module,
+                        }),
+                        // A version that cannot load is refused, and the version
+                        // this workspace already enforces, if any, keeps
+                        // enforcing: a bad replacement is no reason to drop a
+                        // rule that loaded. A rule with no previous version
+                        // enforces nothing until one loads, which is exactly
+                        // what the incident has to say — the dashboard lists
+                        // the rule either way.
+                        Err(refusal) => {
+                            let previous = previous_by_rule.get(&desc.rule_id);
+                            self.report_refusal(
+                                control_plane,
+                                workspace_id,
+                                &desc,
+                                &refusal,
+                                previous.is_some(),
+                            )
+                            .await;
+                            if let Some(previous) = previous {
+                                new_modules.push(previous.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        guard.insert(
+            workspace_id.to_string(),
+            WorkspaceModules {
+                last_checked: Instant::now(),
+                modules: new_modules,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Compile and check the binary a control-plane descriptor names: the same
+    /// checks the local loader runs, plus the hash.
+    ///
+    /// Without the load checks a rule pushed from the dashboard installs, counts
+    /// as active, and then fails to link on every request. The hash check is
+    /// there because the binary is fetched by the hash its descriptor names,
+    /// but nothing about a cache key makes the bytes under it hash to it:
+    /// whoever can write that key could swap a governance rule for one that
+    /// allows everything, and the proxy would run it as the rule the dashboard
+    /// lists.
+    fn load_descriptor(
+        &self,
+        desc: &WasmPluginDescriptor,
+        bytes: Option<&[u8]>,
+    ) -> Result<(Module, Option<Arc<super::opa::OpaRule>>), Refusal> {
+        let bytes = bytes.ok_or(Refusal::Missing)?;
+        let (matches, actual) = binary_matches(bytes, &desc.sha256);
+        if !matches {
+            return Err(Refusal::HashMismatch { actual });
+        }
+        super::local_loader::compile_checked(&self.engine, bytes).map_err(Refusal::Load)
+    }
+
+    /// Logs a refused rule version and raises it with the control plane, which
+    /// files an incident under its reason, once per workspace, rule hash and
+    /// reason.
+    async fn report_refusal(
+        &self,
+        control_plane: &Arc<dyn ControlPlaneCache>,
+        workspace_id: &str,
+        desc: &WasmPluginDescriptor,
+        refusal: &Refusal,
+        has_previous: bool,
+    ) {
+        let first = self
+            .refusals_reported
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((workspace_id.to_string(), desc.sha256.clone(), refusal.key()));
+        if !first {
+            return;
+        }
+        let why = match refusal {
+            Refusal::Missing => "its binary is missing from the control plane's cache".to_string(),
+            Refusal::HashMismatch { actual } => format!(
+                "its binary hashes to {actual} but its descriptor names {}",
+                desc.sha256
+            ),
+            Refusal::Load(failure) => format!("it cannot be loaded: {failure}"),
+        };
+        let consequence = if has_previous {
+            "The previously loaded version stays in force."
+        } else {
+            "No version of this rule has loaded on this proxy, so it enforces nothing until one does."
+        };
+        tracing::error!(
+            workspace_id = %workspace_id,
+            rule_id = %desc.rule_id,
+            rule = %desc.name,
+            sha256 = %desc.sha256,
+            reason = refusal.reason(),
+            "Refusing control-plane WASM rule: {why}. {consequence}"
+        );
+        let description = format!(
+            "WASM rule '{}' ({}) was refused: {why}. {consequence}",
+            desc.name, desc.rule_id
+        );
+        control_plane
+            .publish_rule_refusal(
+                workspace_id,
+                &description,
+                &RuleRefusalWire {
+                    rule_id: desc.rule_id.clone(),
+                    name: desc.name.clone(),
+                    sha256: desc.sha256.clone(),
+                    refusal: refusal.reason(),
+                    actual_sha256: match refusal {
+                        Refusal::HashMismatch { actual } => Some(actual.clone()),
+                        _ => None,
+                    },
+                    previous_in_force: has_previous,
+                },
+            )
+            .await;
+    }
+}
+
+/// Why a control-plane rule version was not loaded.
+#[derive(Debug)]
+enum Refusal {
+    Missing,
+    HashMismatch { actual: String },
+    Load(super::local_loader::LoadFailure),
+}
+
+impl Refusal {
+    /// The reason the control plane files the incident under
+    /// (`RULE_LOAD_FAILURE_REASONS` in shared-types), as the MCP proxy names
+    /// it too.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::HashMismatch { .. } => "hash_mismatch",
+            Self::Load(failure) => failure.reason(),
+        }
+    }
+
+    /// What makes two refusals of one version the same report.
+    fn key(&self) -> String {
+        match self {
+            Self::HashMismatch { actual } => actual.clone(),
+            other => other.reason().to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Hijack` and `Enhance` from a custom rule are a rule that reached no
+    /// verdict, not an allow; every verdict a rule can express passes through.
+    #[test]
+    fn hijack_and_enhance_are_not_verdicts_a_rule_can_reach() {
+        for v in [
+            Verdict::Hijack {
+                reason: "steer".into(),
+                confidence: 0.9,
+            },
+            Verdict::Enhance {
+                context: "guidance".into(),
+            },
+        ] {
+            let failure = PluginRegistry::unenforceable(&v)
+                .unwrap_or_else(|| panic!("{v:?} must not merge as an allow"));
+            assert_eq!(failure.stop.as_str(), "result", "{v:?}");
+        }
+        for v in [
+            Verdict::Bypass,
+            Verdict::Kill {
+                reason: "x".into(),
+                policy_id: None,
+            },
+            Verdict::Reask {
+                reason: "x".into(),
+                attempts_remaining: 0,
+                policy_id: None,
+            },
+        ] {
+            assert!(PluginRegistry::unenforceable(&v).is_none(), "{v:?}");
+        }
+    }
+
+    /// A descriptor written before `mode` existed must keep enforcing.
+    ///
+    /// The default matters more than it looks. Defaulting to `Shadow` would
+    /// take every already-installed cloud rule out of enforcement on upgrade,
+    /// silently — a fleet that stops governing and reports nothing, which is the
+    /// worse of the two failure directions.
+    #[test]
+    fn a_descriptor_without_mode_enforces() {
+        let d: WasmPluginDescriptor =
+            serde_json::from_str(r#"{"ruleId":"r1","name":"n","sha256":"abc","priority":100}"#)
+                .expect("a descriptor without mode must still parse");
+        assert_eq!(d.mode, RuleMode::Enforce);
+    }
+
+    #[test]
+    fn mode_round_trips_in_both_spellings() {
+        for (json, expected) in [
+            (r#""SHADOW""#, RuleMode::Shadow),
+            (r#""shadow""#, RuleMode::Shadow),
+            (r#""ENFORCE""#, RuleMode::Enforce),
+            (r#""enforce""#, RuleMode::Enforce),
+        ] {
+            let m: RuleMode = serde_json::from_str(json).unwrap();
+            assert_eq!(m, expected, "{json} did not parse as expected");
+        }
+    }
+
+    /// The control plane sends `SHADOW`; the proxy must read it as shadow.
+    /// A mismatch here means a rule an operator believes is observing is
+    /// actually blocking.
+    #[test]
+    fn a_shadow_descriptor_parses_as_shadow() {
+        let d: WasmPluginDescriptor = serde_json::from_str(
+            r#"{"ruleId":"r1","name":"n","sha256":"abc","priority":100,"mode":"SHADOW"}"#,
+        )
+        .unwrap();
+        assert_eq!(d.mode, RuleMode::Shadow);
+    }
+
+    /// A shadow report carries the real verdict, not a sentinel.
+    ///
+    /// `telemetry.rs` rejected a `WOULD_HAVE` disposition for the detectors for
+    /// this reason: a synthetic value makes every consumer matching the real one
+    /// silently miss the shadowed events, and destroys the thing being measured.
+    #[test]
+    fn a_shadow_report_keeps_the_real_verdict() {
+        let r = ShadowReport {
+            rule_id: "r1".into(),
+            name: "n".into(),
+            would_act: true,
+            verdict: format!(
+                "{:?}",
+                Verdict::Kill {
+                    reason: "x".into(),
+                    policy_id: None
+                }
+            ),
+        };
+        assert!(
+            r.verdict.contains("Kill"),
+            "the real verdict must survive: {}",
+            r.verdict
+        );
+        assert!(!r.verdict.contains("WOULD_HAVE"));
+    }
+
+    /// Bypasses are reported too, because they are the denominator.
+    ///
+    /// Reporting only the blocks would make a rule that fires on one request in
+    /// a thousand indistinguishable from one that fired on the only request it
+    /// ever saw — and promotion is gated on that ratio.
+    #[test]
+    fn a_bypass_is_still_reported() {
+        let r = ShadowReport {
+            rule_id: "r1".into(),
+            name: "n".into(),
+            would_act: false,
+            verdict: format!("{:?}", Verdict::Bypass),
+        };
+        assert!(!r.would_act);
+        // Serialised, so the control plane can count it.
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("would_act"));
+    }
+}

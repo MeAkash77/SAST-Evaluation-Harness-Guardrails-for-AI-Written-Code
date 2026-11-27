@@ -1,0 +1,145 @@
+# Codex
+
+Integrate Intutic governance with [OpenAI Codex](https://openai.com/codex) — OpenAI's autonomous coding agent.
+
+## How it works
+
+Intutic governs Codex in three ways:
+
+- **Rules** — your SOPs in a marked section of the workspace's `AGENTS.md`, which Codex reads before any work. Your own text in `AGENTS.md` is kept. The section is shared with every other harness in the workspace that reads `AGENTS.md`, and holds the rule sets aimed at any of them (see [Where rule sets go](/guide/how-it-works#where-rule-sets-go)). Codex reads at most 32 KiB of `AGENTS.md` files in total.
+
+- **Proxy routing** (with `intutic gates install --route`) — it sets `openai_base_url` in Codex's user config, `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`), so Codex's built-in OpenAI provider sends its requests through the proxy. It also writes a `.env.intutic` file with the same proxy URLs for shells and scripts that source it.
+- **A blocking gate** — a PreToolUse hook registered in `~/.codex/hooks.json` and the project's `.codex/hooks.json` (see [Pre-tool hooks](#pre-tool-hooks-blocking) below).
+
+## Setup
+
+### 1. Codex detection
+
+Codex is detected by either:
+- The `CODEX_HOME` environment variable being set, **or**
+- The `codex` binary being found in your `PATH`
+
+No config file needs to exist beforehand.
+
+### 2. Initialize Intutic
+
+```bash
+intutic init
+```
+
+```
+  ✔ codex → /path/to/project/AGENTS.md
+```
+
+`intutic init` only detects the harness and records it in `~/.intutic/config.json`; it writes no harness files. The files described on this page are written by `intutic gates install` (open core, no control plane), from the rule sets in `.intutic/sops/` — see [What writes harness files](/integrations/#what-writes-harness-files):
+
+```bash
+intutic gates install
+```
+
+### 3. Start the proxy
+
+```bash
+intutic start
+```
+
+### 4. Route Codex through the proxy
+
+```bash
+intutic gates install --route
+```
+
+`--route` also writes the proxy routing described below; the proxy must be running. Without it, start Codex as `intutic exec -- codex` instead.
+
+### 5. Run Codex
+
+Start Codex as usual — `~/.codex/config.toml` now points it at the proxy:
+
+```bash
+codex
+```
+
+<!-- ENTERPRISE_ONLY_START -->
+> Have an Intutic account or run your own control plane? Use `intutic connect` instead. It writes the same files, starts the same proxy and adds bidirectional config sync.
+<!-- ENTERPRISE_ONLY_END -->
+
+## What gets written
+
+The rule sets, between two markers in `AGENTS.md`, when at least one SOP targets Codex or another `AGENTS.md` reader in the workspace:
+
+```markdown
+# Your own instructions stay as they are
+
+<!-- INTUTIC:RULES:START -->
+# Intutic Governance Rules (auto-generated)
+# DO NOT EDIT this section — managed by intutic sync daemon; edit outside the INTUTIC:RULES markers
+
+> **Proxy URL:** `http://localhost:4000`
+
+## Code Review Requirements
+...
+<!-- INTUTIC:RULES:END -->
+```
+
+`openai_base_url` in Codex's user config, with `--route`. Intutic adds or updates this one top-level line and keeps the rest of the file — MCP servers, profiles, model settings and comments — exactly as it was; a config that does not parse as TOML is left untouched:
+
+```toml
+# Set by Intutic: routes Codex's built-in OpenAI provider through the Intutic proxy.
+openai_base_url = "http://localhost:4000/v1"
+
+[mcp_servers.github]
+command = "npx"
+```
+
+`openai_base_url` applies to Codex's built-in `openai` provider. If you select a custom provider with `model_provider`, set that provider's `base_url` to `http://localhost:4000/v1` yourself.
+
+A `.env.intutic` file with proxy URLs and metadata:
+
+```bash
+# Intutic Governance Rules (auto-generated)
+# DO NOT EDIT — managed by intutic sync daemon
+# Last sync: 2026-06-11T22:24:00Z
+# Source this file: source .env.intutic
+
+export ANTHROPIC_BASE_URL="http://localhost:4000"
+export OPENAI_BASE_URL="http://localhost:4000/v1"
+export INTUTIC_PROXY_URL="http://localhost:4000"
+export INTUTIC_SOP_COUNT=5
+```
+
+::: tip Shell integration
+Add `source .env.intutic 2>/dev/null` to your shell profile or project's `.envrc` to auto-load on every session.
+:::
+
+To undo what `intutic gates install` writes here, run `intutic disconnect --harness codex`: each file goes back to what it held before Intutic first wrote it, or is deleted if Intutic created it, and edits you made since are kept. In `AGENTS.md` only the marked section is taken out. `AGENTS.md` and `.env.intutic` stay while another harness that writes them is still connected. See [`intutic disconnect`](/reference/cli#intutic-disconnect).
+
+## Pre-tool hooks (blocking)
+
+The routing above governs LLM egress only. Tool calls are gated
+natively: `intutic gates install` writes a governance gate at
+`.intutic/hooks/codex-check.js` and registers it as a **PreToolUse hook** in
+both `~/.codex/hooks.json` (user) and `<repo>/.codex/hooks.json` (project),
+merging non-destructively so your own hooks are preserved.
+
+Codex loads hooks by default (`[features] hooks = false` turns them off). It loads the project-level file only once you have trusted the project's `.codex/` folder; the user-level registration applies everywhere.
+
+An agent cannot remove the registration or turn hooks off: the Intutic gate refuses a tool call that names `.codex/hooks.json` or `.codex/config.toml`, reading them included, under Codex and under every other harness with a hook gate. If a `hooks.json` loses the gate anyway, run `intutic gates install` to put the entry back<!-- ENTERPRISE_ONLY_START -->; under `intutic connect` the sync daemon puts it back on its own<!-- ENTERPRISE_ONLY_END -->. Change the Codex config yourself.
+
+Codex invokes the hook before each tool call with JSON on stdin
+(`{tool_name, tool_use_id, tool_input}`); the gate evaluates the compiled
+protection floor plus your workspace's policy snapshot — including ` WHERE `
+(argPattern) rules matched against the serialized tool input — and refuses
+with exit code 2, with the reason on stderr. Every decision is appended to
+`.intutic/events/hook-events.jsonl`<!-- ENTERPRISE_ONLY_START --> and, under `intutic connect`, drained to the control plane<!-- ENTERPRISE_ONLY_END -->.
+
+## Config details
+
+| Property | Value |
+|----------|-------|
+| Harness type | `codex` |
+| Rules file | `AGENTS.md` (the section between `<!-- INTUTIC:RULES:START -->` and `<!-- INTUTIC:RULES:END -->`) |
+| Config file | `.env.intutic`, `~/.codex/config.toml` or `$CODEX_HOME/config.toml` (`openai_base_url`) |
+| Hook files | `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), `<repo>/.codex/hooks.json`, `.intutic/hooks/codex-check.js` |
+| Detection | `CODEX_HOME` env var or `codex` in `PATH` |
+| Format | Shell environment variables |
+| Write strategy | Atomic (write to `.intutic-tmp`, then rename) |

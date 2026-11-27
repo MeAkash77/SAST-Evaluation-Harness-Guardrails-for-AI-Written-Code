@@ -1,0 +1,175 @@
+/**
+ * The harness-count gate's gate-kind counts (tools/scripts/check-harness-counts.js).
+ *
+ * The docs said "native hook gates in 19" after Continue, whose hooks never
+ * fire, moved to the proxy-governed set and left 18. These run the real script
+ * against a fixture tree, since the thing under test is its exit code.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { spawn } from 'node:child_process'
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve, dirname } from 'node:path'
+
+const SCRIPT = resolve(import.meta.dirname, '../../scripts/check-harness-counts.js')
+
+function runGate(...args: string[]): Promise<{ status: number; out: string }> {
+  return new Promise((res, reject) => {
+    const child = spawn('node', [SCRIPT, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (d: string) => (out += d))
+    child.stderr.on('data', (d: string) => (out += d))
+    child.on('error', reject)
+    child.on('close', (code) => res({ status: code === null ? -1 : code, out }))
+  })
+}
+
+// 40 harnesses: 30 hook-gated, 6 SDK-gated, 4 neither. The last is a value
+// whose page has another slug (agent-framework → microsoft-agent-framework).
+const MEMBERS = Array.from({ length: 40 }, (_, i) => `H${i}`)
+const value = (m: string) => (m === 'H39' ? 'agent-framework' : m.toLowerCase())
+const slug = (m: string) => (m === 'H39' ? 'microsoft-agent-framework' : m.toLowerCase())
+const set = (name: string, members: string[]) =>
+  `export const ${name}: ReadonlySet<HarnessTypeT> = new Set([\n${members.map((m) => `  HarnessType.${m},`).join('\n')}\n])\n`
+
+let root: string
+const put = async (rel: string, body: string) => {
+  await mkdir(dirname(join(root, rel)), { recursive: true })
+  await writeFile(join(root, rel), body)
+}
+
+beforeEach(async () => {
+  root = await mkdtemp(join(tmpdir(), 'harnesscounts-'))
+  await put(
+    'packages/shared-types/src/enums.ts',
+    `export const HarnessType = {\n${MEMBERS.map((m) => `  ${m}: '${value(m)}',`).join('\n')}\n} as const\n\n` +
+      'export const HARNESS_COUNT = Object.keys(HarnessType).length\n' +
+      'export const HARNESS_HEADLINE_COUNT = HARNESS_COUNT - [].length\n',
+  )
+  await put(
+    'apps/docs/reference/harness-security-matrix.md',
+    MEMBERS.map((m, i) => `| ${i + 1} | **${m} Agent** |`).join('\n') + '\n',
+  )
+  for (const m of MEMBERS) await put(`apps/docs/integrations/${slug(m)}.md`, `# ${m} Agent <Badge type="tip" text="Preview" />\n`)
+  await put(
+    'packages/shared-types/src/gateKind.ts',
+    set('SDK_GATED_HARNESSES', MEMBERS.slice(30, 36)) +
+      set('NO_GATE_HARNESSES', MEMBERS.slice(36, 38)) +
+      set('DELEGATED_GATE_HARNESSES', MEMBERS.slice(38, 39)) +
+      'export const BRIDGE_GATED_HARNESSES: ReadonlySet<HarnessTypeT> = new Set([HarnessType.H39])\n',
+  )
+  await put('README.md', 'Intutic ships **40 harness adapters**: 30 install as native hook gates in the harness config.\n')
+  await put('services/sync-daemon/README.md', '# Sync daemon\n')
+})
+afterEach(async () => {
+  await rm(root, { recursive: true, force: true })
+})
+
+const page = (body: string) => put('apps/docs/compare/x.md', `# Compare\n\n${body}\n`)
+
+describe('gate-kind counts', () => {
+  it('passes counts that match gateKind.ts', async () => {
+    await page('Native hook gates in 30 of the 40 harnesses and in-process SDK gates in 6; the other four are governed through the proxies.')
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(0)
+    expect(r.out).toContain('30 hook-gated and 6 SDK-gated')
+  })
+
+  it.each([
+    ['native hook gates in 31 of them', 'says 31 harnesses are hook-gated', 'makes it 30'],
+    ['native hooks in 31, in-process SDK gates in 6', 'says 31 harnesses are hook-gated', 'makes it 30'],
+    ['in-process SDK gates in 7 agent frameworks', 'says 7 harnesses are SDK-gated', 'makes it 6'],
+    ['the other three are governed through the proxies', 'says 3 harnesses are neither hook- nor SDK-gated', 'makes it 4'],
+  ])('fails "%s"', async (claim, says, makes) => {
+    await page(claim)
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(1)
+    expect(r.out).toContain(says)
+    expect(r.out).toContain(makes)
+  })
+
+  it('checks the website category counts with --website', async () => {
+    await page('Native hook gates in 30.')
+    const site = join(root, 'site')
+    await mkdir(site)
+    await writeFile(
+      join(site, 'index.html'),
+      '<!-- HARNESS_COUNT:sync -->40<!-- /HARNESS_COUNT:sync --> harnesses\n' +
+        '<li><strong>Native hook gates</strong> (30, installed in the harness config)</li>\n' +
+        '<li><strong>SDK-gated frameworks</strong> (5, in-process)</li>\n',
+    )
+    const r = await runGate(root, '--website', site)
+    expect(r.status, r.out).toBe(1)
+    expect(r.out).toContain('says 5 harnesses are SDK-gated')
+    expect(r.out).not.toContain('says 30 harnesses')
+  })
+})
+
+describe('phrasings the 2026-10-14 audit found unwatched', () => {
+  // The fixture's 40 harnesses: 37 with a gate of their own (all but the two
+  // no-gate and one delegated), 39 the daemon writes for (all but the bridge).
+  it('passes them when they are right', async () => {
+    await page(
+      'In 37 of the 40 supported harnesses each tool call passes a gate; gates inside 37 of its 40 supported harnesses. ' +
+        "The daemon supports 39 of Intutic's 40 harness adapters. Guides for 40 supported agent tools. " +
+        'Intutic covers 40 harnesses. **Coverage:** 40 harnesses + 1 platform.',
+    )
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(0)
+  })
+
+  it.each([
+    ['In 36 of the 40 supported harnesses each tool call passes a gate.', 'says 36 harnesses are gated by a hook, SDK or bridge gate'],
+    ['gates inside 38 of its 40 supported harnesses', 'says 38 harnesses are gated by a hook, SDK or bridge gate'],
+    ["The daemon supports 40 of Intutic's 40 harness adapters.", 'says 40 harnesses are written for by the sync daemon'],
+    ['In 37 of the 41 supported harnesses each tool call passes a gate.', 'claims 41 harnesses'],
+    ["The daemon supports 39 of Intutic's 41 harness adapters.", 'claims 41 harnesses'],
+    ['Setup guides for 41 supported agent tools.', 'claims 41 harnesses'],
+    ['Intutic covers 39 harnesses.', 'claims 39 harnesses'],
+    ['**Coverage:** 38 harnesses + 1 platform.', 'claims 38 harnesses'],
+  ])('fails "%s"', async (claim, says) => {
+    await page(claim)
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(1)
+    expect(r.out).toContain(says)
+  })
+
+  it('leaves the hook count in "native hook gates in 30 of the 40 supported harnesses" to the hook check', async () => {
+    await page('Native hook gates in 30 of the 40 supported harnesses.')
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(0)
+  })
+})
+
+describe('one page and one named row per harness', () => {
+  it('passes when every harness has its page, under an aliased slug too, and its row', async () => {
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(0)
+    expect(r.out).toContain('every harness has a page and a named row')
+  })
+
+  it('fails a harness with no integration page', async () => {
+    await rm(join(root, 'apps/docs/integrations/h7.md'))
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(1)
+    expect(r.out).toContain("HarnessType 'h7' has no apps/docs/integrations/h7.md")
+  })
+
+  it('fails a harness whose matrix row names another harness, though the count is right', async () => {
+    await put(
+      'apps/docs/reference/harness-security-matrix.md',
+      MEMBERS.map((m, i) => `| ${i + 1} | **${m === 'H5' ? 'Something Else' : `${m} Agent`}** |`).join('\n') + '\n',
+    )
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(1)
+    expect(r.out).toContain(`HarnessType 'h5' has no "**H5 Agent**" row`)
+  })
+
+  it('takes the title from the front matter when the page has one', async () => {
+    await put('apps/docs/integrations/h3.md', '---\ntitle: H3 Agent\n---\n\nNo heading here.\n\n```sh\n# a comment\n```\n')
+    const r = await runGate(root)
+    expect(r.status, r.out).toBe(0)
+  })
+})

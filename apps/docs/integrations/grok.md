@@ -1,0 +1,102 @@
+# Grok Build
+
+Integrate Intutic governance with [Grok Build](https://x.ai/) — xAI's terminal coding agent (binary `grok`, GA since 2026-05, open-sourced 2026-07-15).
+
+## How it works
+
+Grok Build reads project rules from `AGENTS.md`, once the folder is trusted — the same cross-tool rules-file convention Codex/Amp read — and executes `PreToolUse` hooks registered as individual JSON files under `.grok/hooks/`. Intutic writes a blocking hook there, plus merges the local proxy `base_url` into `config.toml`'s `[model.*]` tables so LLM traffic routes through governance without needing an env var sourced first.
+
+## Setup
+
+### 1. Grok Build detection
+
+Grok Build is detected by any of:
+- A `.grok/` directory or `AGENTS.md` in the project, **or**
+- A `~/.grok/` directory (Grok Build installed and run at least once), **or**
+- The `grok` binary being found in your `PATH`
+
+No config file needs to exist beforehand.
+
+### 2. Initialize Intutic
+
+```bash
+intutic init
+```
+
+```
+  ✔ grok → /path/to/project/AGENTS.md
+```
+
+`intutic init` only detects the harness and records it in `~/.intutic/config.json`; it writes no harness files. The files described on this page are written by `intutic gates install` (open core, no control plane), from the rule sets in `.intutic/sops/` — see [What writes harness files](/integrations/#what-writes-harness-files):
+
+```bash
+intutic gates install
+```
+
+### 3. Start the proxy
+
+```bash
+intutic start
+```
+
+<!-- ENTERPRISE_ONLY_START -->
+> Have an Intutic account or run your own control plane? Use `intutic connect` instead. It writes the same files, starts the same proxy and adds bidirectional config sync.
+<!-- ENTERPRISE_ONLY_END -->
+
+## What gets written
+
+- **Rules:** the section between `<!-- INTUTIC:RULES:START -->` and `<!-- INTUTIC:RULES:END -->` in the workspace's `AGENTS.md`, written when at least one SOP targets Grok Build or another `AGENTS.md` reader in the workspace. Your own text in the file is kept, and the section is shared with every other harness that reads `AGENTS.md` (see [Where rule sets go](/guide/how-it-works#where-rule-sets-go)).
+- **Hook registration:** `.grok/hooks/intutic-governance.json` (project) and `~/.grok/hooks/intutic-governance.json` (user) — a `PreToolUse` entry with no matcher, so every tool call is evaluated. Grok Build's hook directory is a glob of independent files, so this write never touches any other hook file you may already have there.
+- **Hook script:** `.intutic/hooks/grok-check.js` — the same shared gate evaluator (compiled protection floor + policy snapshot + ` WHERE `/argPattern rules) every other JavaScript-family harness in this product runs.
+- **LLM egress** (with `intutic gates install --route`, the proxy running)**:** `base_url` (the proxy's `/v1` URL) merged into every existing `[model.*]` table in `config.toml`, at both `<repo>/.grok/config.toml` and `~/.grok/config.toml`; a file with no `[model.*]` table gets one for Grok Build's default model, `[model."grok-4.6"]`. `XAI_API_KEY` remains the auth mechanism — only the endpoint moves.
+<!-- ENTERPRISE_ONLY_START -->
+- **MCP servers** (with `intutic connect`; `intutic gates install` does not wrap MCP servers)**:** any `[mcp_servers.*]` table in either `config.toml` is proxy-wrapped the same way every other harness's `mcpServers` map is (stdio entries wrapped with `--`, remote/`url`-keyed entries bridged with `--remote-url`/`--remote-transport`).
+<!-- ENTERPRISE_ONLY_END -->
+
+To undo what `intutic gates install` writes here, run `intutic disconnect --harness grok`: each file goes back to what it held before Intutic first wrote it, or is deleted if Intutic created it, and edits you made since are kept. In `AGENTS.md` only the marked section is taken out, and it stays while another harness that writes it is still connected. See [`intutic disconnect`](/reference/cli#intutic-disconnect).
+
+## Pre-tool hooks (blocking)
+
+Grok Build's `PreToolUse` hook contract is **confirmed**, not assumed: the hook process writes `{"decision":"deny","reason":"..."}` as JSON on **stdout** and exits 0 to signal a block — a different shape from Cline's `{"cancel":true}`, so Intutic's gate for this harness carries its own dedicated block contract rather than reusing theirs. An allow prints nothing and exits 0. Grok Build's default hook `timeout` is 5 s; Intutic sets 10 s on the hook entry, and the gate refuses with `GATE_DEADLINE` at 9 s (see [Hook timeouts](/reference/harness-security-matrix#hook-timeouts)).
+
+Every decision is appended to `.intutic/events/hook-events.jsonl`<!-- ENTERPRISE_ONLY_START --> and, under `intutic connect`, drained to the control plane<!-- ENTERPRISE_ONLY_END -->, same as every other harness.
+
+::: warning Double-gating with Claude Code / Cursor compatibility hooks
+Grok Build also natively executes `.claude/settings.json` hooks and
+`.cursor/hooks.json` hooks if either is present in the workspace — a
+compatibility feature of Grok Build itself, not something Intutic adds. If a
+project is already connected to Claude Code or Cursor, that gate may already
+be evaluating Grok Build's tool calls *before* you ever install the Grok Build
+gate. Installing it natively adds a second, independent
+gate on top of that: a call blocked by either fires that gate's own refusal,
+and an operator may see the same block logged twice (once per gate). Neither
+gate is aware of the other's decision — this is the same "additive, not
+exclusive" posture the [MCP gate backstop](/guide/mcp-governance#the-gate-backstop)
+already documents for the proxy+gate combination, applied here to two client
+hooks instead of a proxy and a hook. It is redundancy, not a discrepancy to
+reconcile, and it cannot silently under-enforce: a call is blocked if either
+gate says so.
+:::
+
+## Config details
+
+| Property | Value |
+|----------|-------|
+| Harness type | `grok` |
+| Rules file | `AGENTS.md` (a marked section) |
+| Hook files | `.grok/hooks/intutic-governance.json`, `~/.grok/hooks/intutic-governance.json`, `.intutic/hooks/grok-check.js` |
+| Detection | `.grok/` or `AGENTS.md` in the project, `~/.grok/`, or `grok` in `PATH` |
+| Format | Markdown (rules), TOML (`config.toml`) |
+| Write strategy | Atomic (write to `.intutic-tmp`, then rename) |
+| Block contract | `{"decision":"deny","reason":"..."}` on stdout, exit 0 — confirmed; the object also carries the refusal's `code` and `ruleId` ([refusal codes](/reference/harness-security-matrix#hook-refusal-codes)) |
+
+::: tip Not live-verified
+Grok Build was not installable in the environment this integration was built
+and tested in. The blocking contract above is independently confirmed from
+Grok Build's own documentation, and the per-file hook-registration schema
+Intutic writes into `intutic-governance.json` (a top-level `hooks` key, then
+`PreToolUse` groups of `{type, command, timeout}` entries, the shape of Claude
+Code's `settings.json` hooks) is confirmed against the hook-file parser in
+Grok Build's open-sourced code. Neither has been exercised against a real
+install.
+:::

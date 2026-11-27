@@ -1,0 +1,298 @@
+# How It Works <Badge type="tip" text="Open-Core" />
+
+Intutic is a **transparent governance layer** that sits between your AI agents and the LLM providers they call. It enforces policies, detects anomalies, tracks costs, and records every decision — without adding meaningful latency.
+
+## Architecture Overview
+
+```
+┌──────────────────┐  re-read every 30 s
+│ .intutic/sops/   │────────────────────────────────────────────┐
+└────────┬─────────┘                                            │
+         │ intutic gates install, and                           │
+         │ intutic start on each change                         ▼
+         ▼                                         ┌───────────────────────┐      ┌───────────────┐
+┌──────────────────┐ ┌──────────────┐  LLM calls   │     Proxy :4000       │─────▶│  LLM Provider │
+│ Gates, rules     │ │  Claude Code │─────────────▶│ DLP · WASM/Rego       │      │  (Anthropic,  │
+│ files and policy │ │  Cursor      │              │ SOP rules · detectors │◀─────│   OpenAI, …)  │
+│ snapshot         │ │  Aider       │◀─────────────│ daily cap             │      └───────────────┘
+└────────┬─────────┘ │  Codex  …    │  response,   │ response gate         │
+         │ read by   └──────┬───────┘  or refusal  └───────────┬───────────┘
+         ▼                  │                                  │
+┌──────────────────┐        │ each tool call                   │ decide: rules on tool
+│ Hook / SDK gate: │◀───────┘                                  │ calls, on: response
+│ allow or refuse  │                                           │
+└────────┬─────────┘                                           ▼
+         │ decide: rules               ┌───────────────────────────────────────┐
+         └────────────────────────────▶│ Decide engine: your self-hosted model │
+                                       └───────────────────────────────────────┘
+
+┌──────────────┐  /v1/systemone   ┌───────────────────────┐  DLP · egress ·    ┌────────────────┐
+│   Your app   │─────────────────▶│     Proxy :4000       │───────────────────▶│ Decision model │
+│              │  /v1/decisions   │                       │  version pin · log │                │
+└──────────────┘                  └───────────────────────┘                    └────────────────┘
+
+┌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┐
+┆ Optional, not part of open core: a control plane (intutic login, then intutic connect).         ┆
+┆ It syncs SOPs into the same files and adds the proxy's policy pre-check, workspace budgets,     ┆
+┆ the hook-gate endpoint the gate SDKs call, and trace storage for review. Without one,           ┆
+┆ everything above runs as drawn.                                                                 ┆
+└╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘
+```
+
+Everything above the dashed box works with no account and no control plane:
+
+- **Tool calls.** `intutic gates install` compiles `.intutic/sops/` into a gate and a rules file for each harness and into the policy snapshot every gate reads (`~/.intutic/hooks/policy-snapshot.rules`); `intutic start` writes them again whenever `.intutic/sops/` changes. Before each tool call runs, the harness's hook gate, or a [gate SDK](/reference/gate-sdk) in your agent's code, decides it locally from the snapshot.
+- **Model calls.** The proxy on `:4000` checks each request (DLP, WASM/Rego rules, the SOPs it re-reads from `.intutic/sops/` every 30 seconds, anomaly detectors, the machine's daily spend cap) before forwarding it, and its response gate checks the tool calls in each response before the agent sees them.
+- **`decide:` rules.** A SOP rule that needs judgement is asked of a decide engine you host, on this machine or your own network. The gates ask it about a tool call every deterministic check allowed; the proxy asks it about a response's tool calls and, for `on: response` rules, its text. See [Decide](/guide/decide).
+- **Decision traffic.** Your own app's calls to a decision model (`/v1/systemone`, `/v1/decisions`) go through the proxy too: DLP on the state, the egress policy, a version pin and a local log. See [Decision Traffic](/guide/decision-traffic).
+
+## The Proxy Gateway
+
+Every LLM request from your agents flows through the Intutic proxy. The proxy is transparent — agents don't need to change their code. `intutic gates install --route` configures each harness that has a setting for it to route through the proxy, by setting the appropriate base URL or config variable<!-- ENTERPRISE_ONLY_START --> (`intutic connect` does the same)<!-- ENTERPRISE_ONLY_END -->; `intutic exec -- <agent>` sets the base-URL variables for one process.
+
+**How routing works per harness:**
+
+| Harness | Config File | Mechanism |
+|---------|-------------|-----------|
+| Cursor | `.cursor/hooks.json`, `~/.cursor/hooks.json` | Project and user hooks; see [Cursor](/integrations/cursor) |
+| Claude Code | `.claude/settings.json`, `~/.claude/settings.json` | PreToolUse hook and deny rules |
+| Windsurf | `~/.codeium/windsurf/hooks.json`, `.windsurf/hooks.json`, Windsurf's user `settings.json` | Cascade hooks + HTTP proxy setting |
+| Aider | `.aider.conf.yml` | `openai-api-base`, and `ANTHROPIC_BASE_URL` under `set-env` |
+| Antigravity | `~/.gemini/settings.json`, `~/.gemini/config/hooks.json` | BeforeTool / PreToolUse hooks |
+| Codex | `~/.codex/config.toml`, `~/.codex/hooks.json`, `.codex/hooks.json`, `.env.intutic` | `openai_base_url`, a PreToolUse hook, and `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` for shells that source the env file |
+| OpenHands | `config.toml` | `[llm] base_url` merged in, plus a PreToolUse hook in `.openhands/hooks.json` |
+| n8n | `~/.intutic/hooks/n8n-governance-hook.js` | External hook the n8n server loads through `EXTERNAL_HOOK_FILES` |
+| Cline | `.clinerules/hooks/PreToolUse` | PreToolUse hook; the base URL is set by hand in Cline's settings panel |
+| Roo Code | none | Base URL set by hand in Roo Code's settings panel; no hook system |
+| Continue | `~/.continue/config.yaml` | `apiBase` on each OpenAI and Anthropic model (no gate: `cn` never fires its PreToolUse hooks) |
+| Claude Desktop | `claude_desktop_config.json` | MCP server wrapping; no proxy override (the file is drift-watched) |
+| Goose | `~/.agents/plugins/intutic-governance/hooks/hooks.json`, `~/.config/goose/config.yaml` | JSON plugin hook structure, plus the proxy URL |
+| Open WebUI | `~/.open-webui/intutic-governance-filter.py` | Python inlet() filter hook |
+| OpenClaw | `~/.openclaw/openclaw.json`, `~/.intutic/hooks/openclaw/intutic-governance.cjs` | `before_tool_call` plugin, listed in `plugins.load.paths` and enabled in `plugins.entries` |
+| Hermes | `~/.hermes/config.yaml`, `~/.intutic/hooks/hermes-check.sh` | Shell hook registered under `hooks.pre_tool_call` |
+| Pi | `~/.pi/agent/extensions/intutic-governance.js`, `~/.pi/agent/models.json` | `tool_call` extension; `baseUrl` for the Anthropic and OpenAI providers |
+
+Where the rule sets themselves go is a separate question; see [Where rule sets go](#where-rule-sets-go).
+
+### Proxy Response Post-Processor
+
+The proxy gateway contains a dedicated Rust post-processing engine (`packages/proxy/src/postprocessor/` — `mod.rs`, `formatter.rs`, `formatters/`, `notification_client.rs`). It acts as a consumer for workspace-level Valkey notification queues (`gov:notify:workspace:{workspaceId}`), session-specific queues (`gov:notify:{sessionId}`) and, for a node in a multi-agent graph, its graph queue (`gov:notify:graph:{workspaceId}:{graphId}:{nodeId}`).
+
+When a streaming response from an LLM provider finishes (not on the OpenAI Responses API, where notifications stay queued):
+1. It queries Valkey to drain any pending policy or budget notifications queued for that session.
+2. It formats up to five notifications, most severe first, using markdown or plaintext formatters.
+3. It appends the compiled notifications block directly into the response stream, between `<!-- intutic:governance -->` markers (markdown) or `--- Intutic Governance ---` lines (plaintext).
+4. The agent harness displays the injected feedback inline, warning developers immediately of budget overruns, compliance score drops, or recommended fixes.
+
+## Enforcement Actions (PCAS)
+
+**PCAS** (Policy-Controlled Agent Sandbox) evaluates every request against your SOPs and applies one of these enforcement actions. The proxy decides BYPASS, HIJACK, REASK and KILL itself; ENHANCE comes only from a control plane's evaluator:
+
+| Action | What happens | When it's used |
+|--------|--------------|----------------|
+| **BYPASS** | Request passes through unmodified | Compliant with all SOPs |
+| **ENHANCE** | Request passes through with governance annotations or warnings attached | A control plane's evaluator suggests improvements |
+| **HIJACK** | Request is modified or steered rather than stopped: an advisory finding is recorded and the request goes ahead | Findings that should redirect the agent, not stop it |
+| **REASK** | Request is refused with the reason, so the agent can correct course and retry; repeated trips escalate to KILL | Structural thresholds (repeats, cycles, depth, fan-out) |
+| **KILL** | Request is blocked entirely | Policy violation, budget breach, deterministic anomaly (loop, forbidden succession, credential sweep) |
+
+## The Circuit Breaker
+
+The circuit breaker is the runtime enforcement mechanism. It evaluates each request against:
+
+1. **SOP rules** — Does this request comply with active SOPs and promoted [policy guardrails](/guide/policy-guardrails)?
+2. **Budget limits** — Is the workspace within its daily and monthly caps, and the key and its owner within their budgets?
+3. **Anomaly detectors** — Do the proxy's detectors (including findings promoted from the ARE) flag this request?
+
+Trust scores are kept per user and shown to administrators; they do not gate a request.
+
+If any check fails, the circuit breaker applies the appropriate enforcement action. When a check cannot run, the proxy's policy check refuses the request by default, and the control plane's hook gate always does (except in shadow mode); see [Circuit Breaker](/concepts/circuit-breaker) for each layer's fail mode.
+
+## SOP Lifecycle
+
+SOPs (Standard Operating Procedures) are the policy documents that define governance rules. They follow a 7-state lifecycle:
+
+```
+DRAFT ◀──▶ PENDING_REVIEW ──▶ GENERATED ──▶ HYPOTHESIZED ──▶ REFINED ──▶ VALIDATED
+                 ▲                                │             │            │
+                 │                                ▼             ▼            │
+                 │                         ┌───────────────────────────┐     │
+                 │                         │        INVALIDATED        │◀────┤
+                 │                         └───────────────────────────┘     │
+                 └────────────────────── cascade re-review ──────────────────┘
+```
+
+| State | Meaning |
+|-------|---------|
+| `DRAFT` | Initial authoring, not yet active |
+| `PENDING_REVIEW` | Submitted for team review |
+| `GENERATED` | Passed the Gödel score threshold on promotion from `PENDING_REVIEW` (auto-generated SOPs start as `DRAFT`) |
+| `HYPOTHESIZED` | Proposed rule in shadow: judged alongside the validated SOPs, with what it would have done recorded, enforcing nothing |
+| `REFINED` | Improved from its shadow results; still shadow only |
+| `VALIDATED` | Active and enforced |
+| `INVALIDATED` | Retired or superseded. A cascade can instead send a `VALIDATED` SOP back to `PENDING_REVIEW` |
+
+SOPs include:
+- **Risk tier** — `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`
+- **Complexity tier** — task complexity classification
+- **Dependencies** — other SOPs this one depends on
+- **Markdown content** — the actual policy rules
+
+Changes to SOPs are classified as `STRENGTHEN`, `CLARIFY`, `NARROW`, or `WEAKEN`; a `WEAKEN` edit needs an Owner, and the SOP Optimizer applies a change without review only when it is `STRENGTHEN`.
+
+## Anomaly Detection (ARE)
+
+The Autonomous Reasoning Engine detects 12 categories of runtime anomalies. It runs on the control plane over ingested traces and hook events (a heuristic classifier per trace plus a periodic baseline sweep), records findings and opens incidents; it is not on the request path, and a finding blocks only after [promotion](/concepts/enforcement-actions#the-promotion-rule). Request-time content checks are the proxy's detectors and DLP, the response judge, the MCP interceptor and the hook gates.
+
+| Anomaly Type | Description |
+|-------------|-------------|
+| `TOOL_ABUSE` | Excessive or inappropriate tool calls |
+| `TOKEN_WASTE` | Inefficient token usage patterns |
+| `LOOP_DETECTED` | Agent stuck in a retry/repeat loop |
+| `UNAUTHORIZED_TOOL` | Calling tools outside allowed set |
+| `DATA_EXFILTRATION` | Attempting to leak sensitive data |
+| `PROMPT_INJECTION` | Malicious prompt manipulation detected |
+| `HALLUCINATION` | An agent still working for a parent that is gone — its results have nowhere to go |
+| `SCOPE_VIOLATION` | Operating outside defined task scope |
+| `BUDGET_BREACH` | Exceeding allocated budget |
+| `SPAWN_BUDGET_BREACH` | Sub-agent spawning over limits |
+| `WORKFLOW_BUDGET_BREACH` | Multi-step workflow over budget |
+| `WORKFLOW_GOAL_DRIFT` | Workflow deviating from stated objective |
+
+An incident can also have a [system incident type](/guide/concepts#incident-types), which is not an anomaly: `WASM_RULE_REFUSED` when a proxy refused to load a version of a custom filter, and `SYSTEM_ANOMALY` when a proxy could not reach the LLM provider or a semantic cache dependency.
+
+## FinOps Ledger
+
+Every execution trace records:
+- Input/output token counts
+- Model used and actual cost in USD
+- Enforcement action applied
+- Token utility classification (`USEFUL` or `WASTED`)
+
+Spend is limited by the workspace's daily and monthly caps and by budgets on virtual keys and members, each one refusing requests or alerting only; the proxy checks the ones that refuse on every request. See [Budgets](/guide/budgets#setting-up-budget-limits).
+
+<!-- ENTERPRISE_ONLY_START -->
+## Sync Daemon
+
+The `intutic connect` command starts a long-lived sync daemon that:
+
+1. **Polls** the control plane for SOP updates (default: every 30 seconds)
+2. **Detects** which harnesses are present in the workspace
+3. **Writes** updated governance config to each harness's config file
+4. **Reports** sync state back to the control plane
+5. Uses **atomic writes** (tmp file + rename) to prevent file corruption
+
+The daemon supports 42 of Intutic's 43 harness adapters and handles each one's config format natively. The 43rd, TrueForge run as its own standalone/hosted server, is not something `intutic init` can detect in a repo at all (it's an operator-configured deployment, not a repo dependency) — it is governed instead by a separate, out-of-process service, `services/trueforge-bridge`. See the [TrueForge integration guide](/integrations/trueforge#server-mode-standalone-hosted).
+<!-- ENTERPRISE_ONLY_END -->
+
+## Where rule sets go
+
+`intutic gates install` writes the rule sets aimed at a harness<!-- ENTERPRISE_ONLY_START -->, and `intutic connect` also the [Governed Decisions Log](/guide/decisions-log) when the workspace turned it on,<!-- ENTERPRISE_ONLY_END --> into the file that product reads as standing instructions, and nowhere else. Three shapes:
+
+- **A file of Intutic's own** in a directory whose every file the product reads, such as `.cursor/rules/`. The decisions log gets a second file there. You keep your own rules in other files there.
+- **A marked section** of a file you also write, such as `AGENTS.md`. The rule sets sit between `<!-- INTUTIC:RULES:START -->` and `<!-- INTUTIC:RULES:END -->`, and the decisions log in a section of its own between `<!-- INTUTIC:DECISIONS_LOG:START -->` and `<!-- INTUTIC:DECISIONS_LOG:END -->`; the rest of the file is yours, and Intutic never touches it. You can move the sections within the file.
+- **No instructions file.** The product reads no file of standing instructions, so neither the rule-set text nor the decisions log can reach the model. A harness with a gate still enforces the rules compiled from your rule sets. The dashboard's Compliance Scope card for such a harness says so.
+
+Connect never creates or writes `CLAUDE.md`. Claude Code gets everything from `.claude/rules/`, which it loads at launch with or without a `CLAUDE.md`. When Claude Code also reads the workspace's `AGENTS.md` (by default, when no `CLAUDE.md`, `.claude/CLAUDE.md` or `CLAUDE.local.md` is in its working directory or above; always, if you chose `claude-md-and-agents-md` for **Project instructions** in your own `/config`), what `AGENTS.md` carries for the other harnesses is left out of `.claude/rules/`, so Claude Code reads each rule set and the decisions log once. See [Claude Code](/integrations/claude-code#rules-and-the-decisions-log).
+
+`AGENTS.md` is shared: every harness below that reads it gets one section holding every rule set aimed at any of them that is configured in the workspace. A rule set aimed at Codex is therefore also read by OpenCode in the same workspace. Muse Code, OpenCode, Pi and Hermes read `AGENTS.md` in place of a `CLAUDE.md` once both exist, so connect creating `AGENTS.md` in a workspace that only had `CLAUDE.md` changes what those harnesses read.
+
+`intutic disconnect` takes the section out, or puts back the file the rules file replaced, byte for byte when you have not edited it since. Earlier versions overwrote `CLAUDE.md`, `.cursorrules`, `.windsurfrules`, `.roorules` and `AGENTS.md` whole; the first sync with this version gives you your own copy of each back.
+
+| Harness | Id | Rule sets go to | Decisions log goes to | Notes |
+|---------|----|-----------------|-----------------------|-------|
+| Claude Code | `claude-code` | `.claude/rules/intutic-governance.md` | `.claude/rules/intutic-decisions.md` | Loaded at launch, with or without a `CLAUDE.md`. Not `CLAUDE.md`: by default a project `CLAUDE.md` stops Claude Code reading `AGENTS.md`. What also reaches it through `AGENTS.md` is left out. |
+| Cursor | `cursor` | `.cursor/rules/intutic-governance.mdc` | `.cursor/rules/intutic-decisions.mdc` | `alwaysApply: true`. |
+| Windsurf | `windsurf` | `.windsurf/rules/intutic-governance.md` | `.windsurf/rules/intutic-decisions.md` | `trigger: always_on`; 12,000 characters per rule file. |
+| Antigravity and Gemini CLI | `antigravity` | `GEMINI.md` (section) | Its own section of the same file | Gemini CLI reads it only in a trusted folder. |
+| Aider | `aider` | `.intutic/aider-sops.md` | `.intutic/aider-decisions.md` | Listed under `read:` in `.aider.conf.yml` by absolute path, so Aider finds it from any subdirectory. |
+| OpenHands | `openhands` | `.openhands/microagents/intutic-governance.md` | `.openhands/microagents/intutic-decisions.md` | A microagent with no triggers is always active. |
+| Codex | `codex` | `AGENTS.md` (section) | Its own section of the same file | Codex reads at most 32 KiB of `AGENTS.md` files in total. |
+| Muse Code | `muse-code` | `AGENTS.md` (section) | Its own section of the same file | Read once the workspace is trusted. |
+| Grok Build | `grok` | `AGENTS.md` (section) | Its own section of the same file | Read once the folder is trusted. |
+| OpenCode | `opencode` | `AGENTS.md` (section) | Its own section of the same file | |
+| Pi | `pi` | `AGENTS.md` (section) | Its own section of the same file | |
+| Hermes | `hermes` | `AGENTS.md` (section) | Its own section of the same file | A `.hermes.md` or `HERMES.md` between the working directory and the git root takes the place of `AGENTS.md`; keep your Hermes instructions in `AGENTS.md`. |
+| Roo Code | `roo-code` | `AGENTS.md` (section) | Its own section of the same file | Read unless `roo-cline.useAgentRules` is off. Not `.roo/rules/`, whose first file hides your `.roorules` and `.clinerules`. |
+| dsh | `dsh` | `AGENTS.md` (section) | Its own section of the same file | Read by the default profile's agent-instructions plugin. |
+| GitHub Copilot | `github-copilot` | `.github/copilot-instructions.md` (section) | Its own section of the same file | |
+| Cline | `cline` | `.clinerules/intutic-governance.md` | `.clinerules/intutic-decisions.md` | |
+| Continue | `continue` | `.continue/rules/intutic-governance.md` | `.continue/rules/intutic-decisions.md` | `alwaysApply: true`. The `cn` CLI reads the `.continue/rules/` of the directory it runs in. |
+| Goose | `goose` | `.goosehints` (section) | Its own section of the same file | |
+| OpenClaw | `openclaw` | `~/.openclaw/workspace/AGENTS.md` (section) | Its own section of the same file | OpenClaw reads instructions only from its agent workspace, never from a project: connect writes to the one `agents.defaults.workspace` names, or `OPENCLAW_WORKSPACE_DIR`. 20,000 characters per file. |
+| n8n | `n8n` | No instructions file | Does not reach it | An AI Agent node's system message is part of the workflow. The workflow gate still applies. |
+| Claude Desktop | `claude-desktop` | No instructions file | Does not reach it | Instructions live in the app's projects. |
+| Open WebUI | `open-webui` | No instructions file | Does not reach it | System prompts live in Open WebUI's settings. |
+| Xirp | `xirp` | No instructions file | Does not reach it | The harnesses it runs read their own files. |
+| Agentic Orchestrator | `agentic-orchestrator` | No instructions file | Does not reach it | The harnesses it runs read their own files. |
+| AWS Bedrock AgentCore | `agentcore-runtime` | No instructions file | Does not reach it | Your framework's SDK gate applies. |
+| TrueForge server | `trueforge-server` | No instructions file | Does not reach it | Governed by the TrueForge bridge. |
+| LangGraph | `langgraph` | No instructions file | Does not reach it | SDK framework: the instructions are your code; the SDK gate applies. |
+| LangChain | `langchain` | No instructions file | Does not reach it | SDK framework. |
+| CrewAI | `crewai` | No instructions file | Does not reach it | SDK framework. |
+| AutoGen | `autogen` | No instructions file | Does not reach it | SDK framework. |
+| AG2 | `ag2` | No instructions file | Does not reach it | SDK framework. |
+| Google ADK | `google-adk` | No instructions file | Does not reach it | SDK framework. |
+| OpenAI Agents SDK | `openai-agents` | No instructions file | Does not reach it | SDK framework. |
+| Pydantic AI | `pydantic-ai` | No instructions file | Does not reach it | SDK framework. |
+| smolagents | `smolagents` | No instructions file | Does not reach it | SDK framework. |
+| Strands Agents | `strands` | No instructions file | Does not reach it | SDK framework. |
+| Microsoft Agent Framework | `agent-framework` | No instructions file | Does not reach it | SDK framework. |
+| Mastra | `mastra` | No instructions file | Does not reach it | SDK framework. |
+| Vercel AI SDK | `vercel-ai-sdk` | No instructions file | Does not reach it | SDK framework. |
+| eve | `eve` | No instructions file | Does not reach it | SDK framework. |
+| TrueForge | `trueforge` | No instructions file | Does not reach it | SDK framework. |
+| AI SDK Harness | `ai-sdk-harness` | No instructions file | Does not reach it | SDK framework. |
+| AI SDK Workflow | `ai-sdk-workflow` | No instructions file | Does not reach it | SDK framework. |
+
+---
+
+## Dual-Path Telemetry Fallback
+
+To prevent data loss and bypasses during command executions, Intutic hooks implement a **dual-path telemetry reporting mechanism**:
+
+1. **Path A (Real-Time API):** When a command executes, the hook makes an asynchronous, non-blocking HTTP POST request directly to the control plane `/api/v1/hook-events` endpoint using the workspace API key.
+2. **Path B (Local Log Fallback):** Simultaneously, the event is appended to `.intutic/events/hook-events.jsonl` in the workspace root.
+
+The `sync-daemon` monitors this log file in real time using FSEvents/inotify (`chokidar`). As soon as a modification is detected, the daemon drains the log file and sends the events to the control plane, ensuring that even if Path A fails due to network isolation, all governance audits are preserved.
+
+Most events therefore arrive more than once: over both paths, and again whenever the daemon resends a batch whose response it did not get. Each event carries an `eventId`, generated when it is recorded and kept in the line that is resent, and the control plane processes each id once per workspace. A resend files no second incident, finding or plan deviation and exports no second gate decision. Events from gates and SDKs older than the `eventId` field are processed every time they arrive.
+
+---
+
+## Egress Enforcement & Runtime Isolation (opt-in)
+
+By default the proxy *mediates* the traffic pointed at it — an agent that does
+not route through it is not governed, and the [Active Network Probes](#active-network-probes)
+below exist to *detect* exactly that. Two opt-in layers turn mediation into
+enforcement, so bypass is not possible rather than merely detected:
+
+- **`intutic enforce apply`** installs a host-level default-deny egress firewall
+  (nftables/iptables/pf) that permits outbound only to the proxy, DNS, and
+  operator-declared infrastructure. Every other connection is dropped, so the
+  only path to the network is the governing proxy. The proxy itself can then run
+  in `enforce` mode (`intutic_settings.egress.mode`), where it denies — not just
+  inspects — any destination not on its allow policy.
+
+- **`intutic exec --sandbox`** runs an agent inside an isolated runtime — a
+  container today, a Firecracker microVM where KVM is available — with a dropped
+  capability set, a read-only root filesystem, resource caps, and its egress
+  locked to the proxy. The agent cannot reach the network except through
+  governance, and cannot alter the firewall it runs behind. The container
+  backend is the one to reach for by default; the Firecracker backend boots on
+  real KVM but has not yet been validated end-to-end for an agent running to
+  completion inside it — see [Sandboxed Execution](/guide/sandboxed-execution)
+  for the full backend-by-backend breakdown, what each does and doesn't cover,
+  and the platforms this does and doesn't reach.
+
+Both are off by default, so an existing install is unchanged.
+
+## Active Network Probes
+
+To detect a machine whose containment has stopped working, where containment is
+expected: the workspace's egress mode is **Enforce**, or the machine applied
+`intutic enforce`. On any other machine a direct connection to a provider is
+the normal state, so no probe runs.
+1. On every sync, the sync daemon, which runs with a control plane, sends an HTTPS `HEAD` request directly to `https://api.anthropic.com/` and `https://api2.cursor.sh/`, bypassing localhost routing.
+2. If this direct connection succeeds with a certificate the machine's Intutic CA (`~/.intutic/ca.crt`) did not issue, checked by the CA's fingerprint and signature rather than by name, the network is uncontained.
+3. The daemon records a `network_bypass` event, which the control plane files as a `CRITICAL` `DATA_EXFILTRATION` incident, shown to administrators under **Findings › Incidents**. One incident is filed per machine, host and UTC day; later detections that day add to its `occurrences` count.

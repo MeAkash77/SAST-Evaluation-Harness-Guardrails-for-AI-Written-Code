@@ -1,0 +1,252 @@
+---
+title: Security
+description: How Intutic protects your AI agent workflows — threat model, data flow, encryption, authentication, and compliance posture.
+---
+
+# Security
+
+Intutic is a governance layer that sits between your AI agents and LLM providers. Security is foundational — every design decision prioritizes the principle that **governance infrastructure must never become the attack surface it's meant to protect**.
+
+---
+
+## Threat Model
+
+Intutic defends against three categories of threat:
+
+| Threat | Vector | Mitigation |
+|---|---|---|
+| **Agent misuse** | AI agent executes destructive tool calls (file deletion, credential exposure, unauthorized API calls) | Real-time SOP evaluation with BYPASS/ENHANCE/HIJACK/REASK/KILL verdicts via the [circuit breaker](/guide/how-it-works) |
+| **Credential leakage** | API keys, tokens, or secrets exfiltrated through agent output or prompt injection | DLP scanning in the proxy hot path; secrets detected and redacted before reaching the LLM |
+| **Indirect prompt injection** | A web page, email or file the agent reads tells it what to do, such as sending data somewhere | The proxy puts a notice in front of a tool result that talks to the agent as if it were instructions, so the model reads it as data ([prompt injection](/guide/graph-guardrails)); pattern-based, and it does not refuse. A `forbid_after:` rule can refuse a send that follows a secret read before it runs |
+| **Unauthorized access** | Rogue agents or developers bypassing governance controls | Harness config drift detection with auto-revert, immutable local SOP rules, and local daily spend caps |
+| **Uncontrolled egress** | An agent (or a compromised dependency it pulls in) reaches the network by a path other than the governing proxy, so nothing above ever inspects the traffic | Proxy-level allow-list enforcement (`intutic_settings.egress.mode`), and — closing the gap where an agent simply doesn't route through the proxy at all — `intutic enforce`'s host-level default-deny firewall. See [Network Egress Control](/guide/policies#network-egress-control) |
+
+---
+
+## Data Flow
+
+Intutic runs in one of two modes, and they differ in one respect: whether anything is sent to Intutic.
+
+### Standalone (open-core default)
+
+```
+Developer → AI Agent → Intutic Proxy (:4000) → LLM Provider
+               │            │
+               │      ┌─────▼──────┐
+               │      │  Policy    │
+               │      │  Engine    │
+               │      │  (WASM +   │
+               │      │   SOPs)    │
+               │      └─────┬──────┘
+               ▼            │ decide: rules
+         ┌───────────┐      ▼
+         │ Hook gate │──▶ Decide engine (optional: your own
+         │ (policy   │    model, on this machine or your network)
+         │ snapshot) │
+         └───────────┘
+   (nothing is sent to Intutic; telemetry stays on this machine)
+```
+
+1. Every LLM request from an AI agent is routed through the **local Intutic proxy** on port 4000
+2. The proxy evaluates tool calls against the SOPs' [front matter](/reference/sop-front-matter) and against **WASM rules** (sandboxed, with an enforced instruction budget and a wasmtime deadline)
+3. Verdicts and telemetry stay **on the local machine**. Bandit routing state is written to your own Valkey, or to `~/.intutic/bandit-state.json` when there is none; nothing is transmitted to Intutic or anyone else
+4. Traces carry **no prompts or completions** — only structured telemetry (tool names, verdicts, token counts, timing). Two things the proxy keeps go further, and both are limited by default; see [What the proxy keeps](#what-the-proxy-keeps)
+
+This is what you get by default. Open core ships no control plane, and with `policy.control_plane_url` unset the policy pre-check is skipped entirely.
+
+<!-- ENTERPRISE_ONLY_START -->
+### Connected (self-hosted control plane)
+
+Setting `policy.control_plane_url` — or the `CONTROL_PLANE_URL` environment variable — adds a control plane for storage, analysis and centrally managed policy:
+
+```
+Developer → AI Agent → Intutic Proxy (:4000) → LLM Provider
+                            │
+                      ┌─────▼──────┐
+                      │  Policy    │
+                      │  Engine    │
+                      └─────┬──────┘
+                            │  policy checks + telemetry
+                      ┌─────▼──────┐
+                      │  Control   │
+                      │  Plane     │
+                      └────────────┘
+```
+
+In this mode, and only in this mode, verdicts and traces are sent to the control plane. Point it at a control plane you host yourself. Prompts and completions are not part of that telemetry. The exception is a judged request — `/intutic judge` in a prompt, or auto-judge turned on for a session or loop — whose response text goes to the control plane's judge.
+
+The sync daemon (`intutic connect`) also records each harness rules file in the workspace's config history: its path, a hash, its size and the time. It uploads a file's text only when the workspace turns on **Upload config file content**, and redacts credential-shaped strings in it before it leaves the machine. See [Config content upload](/reference/cli#config-content-upload).
+
+---
+
+<!-- ENTERPRISE_ONLY_END -->
+
+## Data Locality
+
+The proxy runs **locally on the developer's machine**. LLM traffic is never rerouted anywhere — it flows directly from the proxy to the LLM provider.
+
+Standalone, nothing leaves the machine: no telemetry, no verdicts, no traces. Prompts and completions are never transmitted anywhere by the proxy.
+
+---
+
+## Encryption
+
+### In Transit
+
+All network communication is encrypted with TLS 1.2+:
+
+| Path | Protocol |
+|---|---|
+| Proxy → LLM Provider | HTTPS (TLS 1.2+) |
+
+<!-- ENTERPRISE_ONLY_START -->
+**Intutic Cloud.** The dashboard, the API, the docs, the hosted gateway and managed cells accept HTTPS only: a plain HTTP request is redirected (301) to HTTPS, or not served at all. Their load balancers accept TLS 1.2 and 1.3 with AEAD cipher suites (AES-GCM, ChaCha20-Poly1305) and nothing older, and browser-facing hosts send `Strict-Transport-Security` with a one-year lifetime.
+
+Inside the cluster, connections to PostgreSQL use TLS 1.2 or later, every client checks the server's certificate against Intutic's own CA and host name, and the database refuses connections without TLS. Valkey accepts commands only from clients that authenticate with its password. Calls between Intutic's own services inside the cluster, and to its self-hosted judge models inside the same private network, are not encrypted.
+
+<!-- ENTERPRISE_ONLY_END -->
+### At Rest
+
+| Data | Storage | Encryption |
+|---|---|---|
+| Session state & caches | Valkey (Redis-compatible) | None from Intutic. The `intutic-valkey` container `intutic start` runs keeps Valkey's default snapshots on disk, in its `/data` volume |
+| Bandit learning (no Valkey) | `~/.intutic/bandit-state.json` | None — a plain JSON file with your default file permissions |
+| Local config & credentials | `~/.intutic/credentials.json` | File permissions (`0600`) + system keychain; the hook gates refuse an agent tool call that names the file |
+| Provider credentials in flight | Process memory only | Never written to disk |
+
+### What the proxy keeps
+
+Beyond the trace fields above, the proxy keeps two things that come from request content:
+
+- **Replay contexts.** A sampled 5% of requests (`WASM_CONTEXT_SNAPSHOT_RATE`) attach their rule-evaluation context to the trace, so a new rule can be replayed against real traffic. Each tool call in it carries its name and its arguments' top-level keys and size, not the argument values. A connected workspace can opt in to keeping the values with [`storeToolArguments`](/reference/workspace-settings); they are then kept with every secret and PII match redacted. Contexts a connected workspace stored before 2.5.1 are reduced to keys and sizes when its control plane upgrades.
+- **The response cache**, when a workspace or config turns it on (off by default; every [cost posture](/guide/settings#postures) turns exact matching on). An entry holds the prompt text and the answer for 24 hours. An exchange in which DLP finds a secret or personal data is never written to it.
+
+Whatever the live PII detector actions, everything the proxy keeps is redacted for every [PII detector](/guide/policies#pii-detectors), email and phone included, and for every secret pattern: replay contexts and the targets in a trace's change manifest (the commands, paths and URLs tool calls named). Live redaction of email and phone stays off by default because an agent editing a real address would write the placeholder back into the file. Change manifests a connected workspace stored before 2.6.0 have their targets withheld (`[WITHHELD]`) when its control plane upgrades; each entry keeps its tool, operation, kind, risk and size, and integrity roots sealed over those traces still verify (see [Trace Integrity](/concepts/trace-integrity)).
+
+---
+
+<!-- ENTERPRISE_ONLY_START -->
+::: tip Which plan
+The capabilities below come with a connected workspace on Intutic Cloud or Self-host, except where a section names a plan: single sign-on from **Biz Org** up, SCIM provisioning on **Enterprise** and **Self-host**. See [Plans & pricing](/guide/plans).
+:::
+
+## Authentication & Identity <Badge type="tip" text="Cloud" />
+
+Intutic provides enterprise-grade identity and access management:
+
+- **Single Sign-On (SSO)** — SAML 2.0 and OIDC integration with Okta, Microsoft Entra ID, Google Workspace, Ping Identity, and custom providers. Available from the Biz Org plan upward.
+- **API Keys** — Virtual keys (`vk_` prefix) for programmatic access, with rotation and revocation
+- **OBO Tokens** — Short-lived, employee-scoped credentials that name the tools they cover; not a session, and checked with a verification call. See [On-Behalf-Of (OBO) Tokens](/guide/security#on-behalf-of-obo-tokens)
+- **RBAC Roles** — Five-tier role hierarchy (Owner → Admin → EM → Developer → Viewer) with feature-level gating
+
+---
+
+## Stored Credentials <Badge type="tip" text="Cloud" />
+
+**Provider keys** (Settings › Provider Keys) are encrypted before they are stored. Each key gets its own random 256-bit data key and is sealed with AES-256-GCM; the data key is sealed in turn under a key encryption key derived from the deployment's `ENCRYPTION_KEY` with HKDF-SHA256. Both seals are bound to the workspace and the field the key belongs to, so a stored value copied to another workspace does not open there. Each stored value names the key that sealed it, which is what lets `ENCRYPTION_KEY` be rotated (see [Rotate the encryption key](/guide/self-host#rotate-the-encryption-key)). Only the control plane and the gateway proxy hold the key and open stored values; the API and the dashboard show the last four characters at most.
+
+**Other secrets you give Intutic** (SSO client secrets, connector and task-tracker tokens, SIEM destination settings, webhook signing secrets, trace storage credentials, Slack bot tokens) are sealed with AES-256-GCM under a key derived from the same `ENCRYPTION_KEY`. Rotating `ENCRYPTION_KEY` re-encrypts every one of them, and the provider keys, under the new key.
+
+**Credentials Intutic issues** (virtual keys, self-hosted gateway tokens, SCIM tokens) are stored only as hashes. Each is shown once, when it is created.
+
+**Every change is recorded.** Creating, rotating or revoking a virtual key, a gateway token or a SCIM token, and adding, replacing or removing a provider key, is recorded with who made the change and which credential it was, never its value. A change no member made names the system instead: `system:offboarding` for keys revoked when a member is offboarded, `system:gateway-rotation` for a gateway token rotated on its schedule. The records appear on the [audit timeline](/guide/audit-timeline#what-it-shows), stream to [SIEM export](/guide/siem-export#what-gets-streamed) as `credential_changes`, and send the `credential.changed` [notification](/guide/settings#rule-filters). They are append-only.
+
+The key encryption key is derived from `ENCRYPTION_KEY`, which you keep in your own secret store. Holding it in a cloud KMS (Google Cloud KMS, AWS KMS) is not available yet.
+
+**Secrets in blocked tool calls are not stored.** When a gate refuses a tool call, the control plane records the block — session, tool, verdict, reason, time — with a copy of the call's arguments in which every credential the DLP patterns detect is replaced by `[REDACTED <kind>]`, for example `[REDACTED AWS access key]`; a private key is removed header to footer. A DLP block therefore never stores the secret that caused it, and neither does any other block. Blocks recorded before this release had their arguments withheld whole (`{"withheld": "Tool arguments withheld: AWS access key detected"}`) by a one-off migration; the rest of each record is unchanged.
+
+---
+
+## Dashboard Sessions & Browser Security <Badge type="tip" text="Cloud" />
+
+**Sessions live in HttpOnly cookies.** Signing in sets two cookies, both `HttpOnly`, `Secure` and `SameSite=Strict`, so no script on the page can read either: the access token (`__Host-intutic_session`, 15 minutes by default) and the refresh token (`__Secure-intutic_refresh`, `REFRESH_TOKEN_EXPIRY_DAYS`, 30 days by default), which is sent only to `/api/v1/auth/` and nowhere else. The dashboard stores no token in `localStorage` or `sessionStorage`. Refreshing from the cookie requires the `X-Intutic-CSRF` request header, which a plain form cannot send and which only the dashboard's own origin may send cross-origin. Signing out revokes the member's refresh tokens, expires both cookies, and clears the profile and the trace and policy lists the dashboard cached for offline viewing.
+
+API clients are unchanged: the CLI and scripts still send a refresh token in the request body (`POST /api/v1/auth/refresh` with `{ "refreshToken": "..." }`) and receive one in the response. A request carrying `X-Intutic-CSRF` gets its refresh token as the cookie only. A browser that signed in before this release keeps its session: its next refresh sends the stored token once, moves the session onto the cookie, and deletes the stored copy.
+
+**Cross-origin access is an exact allow-list.** Only the dashboard's own origin (`APP_URL`) may call the API from a browser with credentials, plus any exact origins listed in `CORS_ALLOWED_ORIGINS`. Wildcard hosting domains are not allowed.
+
+**Content-Security-Policy.** The dashboard and these docs are served with a strict CSP: scripts only from their own origin (the docs also allow, by hash, the three inline scripts every page carries), no plugins, no framing (`frame-ancestors 'none'`), fonts self-hosted, and the dashboard connects only to its own origin and the API's. Both also send `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and a `Permissions-Policy` that turns off the camera, microphone, geolocation, payment and USB APIs.
+
+---
+
+## Compliance <Badge type="tip" text="Cloud" />
+
+Intutic helps your organization meet regulatory requirements for AI governance:
+
+- **SOC 2 Probes** — Eleven compliance probes (workspace policy completeness, MFA enforcement, data-residency violations, audit-log integrity, API-key rotation, SOP coverage, auto-apply provenance, SOP git drift, guard liveness, guardrail authority and provider availability), each scored 0–100 with structured findings, run hourly and on demand — with a queryable probe history and a hash-manifested SOC 2 evidence export built on top of them, signed when the deployment has a signing key (see [Compliance Evidence](/guide/compliance-evidence)), mapped to the EU AI Act, ISO/IEC 42001, NIST AI RMF and MITRE ATLAS (see [Framework Mapping](/guide/framework-mapping))
+- **GDPR** — Article 17 erasure, consent management, and data processing
+  agreements. Erasure is fulfilled by our team on request rather than through a
+  self-service endpoint, within the one-month window Article 12(3) allows.
+  Identity and credential records are purged, and so are the account's
+  sign-in records; execution traces are retained
+  under their 3-year compliance obligation but de-identified, so they can no
+  longer be attributed to the subject. Traces are deleted once they are 3 years
+  old. Free-text and structured content is
+  scrubbed on **exact identifier match** (name, email, account identifiers);
+  indirect references — "the engineer who approved this" — are handled on
+  specific request.
+- **Retention** — Traces are kept for 3 years while the workspace exists.
+  Sign-in records (time, method, IP address, user agent) are kept for 12
+  months, and deleted with the account; expired refresh tokens are deleted 12
+  months after they expire. Workspace audit records are kept for
+  as long as the workspace exists. Deleting a workspace deletes its data with
+  it: traces and the records stored with them, audit records, findings,
+  policies and settings. The few rows that outlive that delete (sign-in
+  records, the notification log, derived statistics, and policy text no other
+  workspace shares) are deleted within 90 days. Billing records are kept for
+  7 years, including after the workspace is deleted, as a tax record. A daily
+  sweep applies each period; the append-only guards let it delete only rows
+  past their period. Database backups expire 7 days after they are taken.
+- **Data Residency** — Intutic Cloud keeps governance data in the US; EU
+  residency is available on request. With enforcement on, a write served from
+  outside the workspace's region is blocked and recorded as a violation.
+
+---
+<!-- ENTERPRISE_ONLY_END -->
+
+### Enforcement Coverage
+
+Connected harnesses get an enforcement tier from the governance layers found active in their config (see [Compliance Scope](/guide/policies#compliance-scope)):
+
+| Tier | Active layers |
+|---|---|
+| **A** | MCP proxy and a native hook gate: every tool call enforced in process |
+| **B** | MCP proxy only |
+| **C** | LLM proxy only |
+| **D** | A rules file only: guidance the agent reads, checked after the fact |
+| none | Nothing detected |
+
+---
+
+<!-- ENTERPRISE_ONLY_START -->
+## Infrastructure Security
+
+| Layer | Controls |
+|---|---|
+| **Network** | VPC isolation, private subnets, no public database endpoints |
+| **Transport** | HTTPS only on every public endpoint (TLS 1.2+, HSTS); TLS with certificate verification to PostgreSQL; password-authenticated Valkey |
+| **Compute** | GKE with node auto-upgrade, workload identity, pod security standards |
+| **Secrets** | A managed secret store — never committed to source control |
+| **Monitoring** | Structured logging with trace context |
+| **Supply chain** | Dependabot, lockfile integrity, CodeQL on every PR |
+
+→ Self-hosted deployment: [Deployment guide](/guide/how-it-works)
+→ CLI configuration: [CLI Reference](/reference/cli)
+
+---
+
+<!-- ENTERPRISE_ONLY_END -->
+## Responsible Disclosure
+
+If you discover a security vulnerability, please report it to **support@intutic.ai**. We aim to acknowledge reports within 24 hours and to patch critical and high-severity issues within 72 hours; see [SECURITY.md](https://github.com/intutic/intutic/blob/main/SECURITY.md).
+
+---
+
+| Page | What it covers |
+|---|---|
+| [Getting Started](/guide/getting-started) | Quickstart guide, local CLI setup, and harness connection |
+| [How It Works](/guide/how-it-works) | Full architecture walkthrough — proxy, policy engine, control plane |
+| [Governance Controls Checklist](/guide/governance-controls) | A control-by-control mapping against a standard enterprise evaluation checklist |
+| [Custom Filters (WASM)](/external/wasm-rules) | WASM policy rules engine for custom tool-call filtering |
+| [CLI Reference](/reference/cli) | CLI commands, doctor diagnostic tool, and local configuration |
+| [Integrations Hub](/integrations/) | Harness setup guides for 43 supported agent tools |

@@ -1,0 +1,462 @@
+//! tls_mitm.rs — HTTP CONNECT tunnel handler with selective TLS interception.
+//!
+//! When the proxy receives an HTTP CONNECT request:
+//!   - AI provider hostname → TLS MITM (terminate, inspect via governance pipeline, re-encrypt)
+//!   - All other hosts     → transparent TCP tunnel (no inspection)
+//!
+//! Safety invariant: we NEVER inspect non-AI traffic. The hostname_filter
+//! module defines the strict allowlist. Fail-closed: if MITM setup fails,
+//! we return 502 Bad Gateway.
+
+use anyhow::Result;
+use axum::{
+    body::Body,
+    http::{Request, Response, StatusCode},
+};
+use hyper_util::rt::TokioIo;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, error, info};
+
+use crate::ca_manager::{ensure_ca_exists, sign_cert_for_host};
+use crate::credential::{RequestCredential, VirtualKey};
+use crate::egress_policy::{global_policy, record_denied, record_would_deny, EgressDecision};
+use crate::listen::{is_loopback_peer, listener_open};
+use crate::proxy::{authenticate_virtual_key, AppState, KeyCheck};
+
+/// Whether a `CONNECT` may open a tunnel, before its key (if any) is checked.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnectAdmission {
+    /// From this machine.
+    Allow,
+    /// From another machine, on a listener opened to it, carrying this key:
+    /// admitted once the key authenticates.
+    Authenticate(VirtualKey),
+    /// Refused with this status and message.
+    Refuse(StatusCode, &'static str),
+}
+
+/// Who may open a `CONNECT` tunnel. With the egress policy off (the default)
+/// a tunnel reaches any host, so an unauthenticated tunnel for any peer that
+/// can reach the port is an open proxy.
+///
+/// - `peer` unknown: refused, since nothing says it is this machine.
+/// - This machine: allowed, as before.
+/// - Another machine: refused unless the listener was opened beyond loopback
+///   (`INTUTIC_PROXY_BIND`, or a gateway) AND the request carries an Intutic
+///   key in `Proxy-Authorization` (`Bearer vk_…`, or Basic with the key as
+///   user name or password), which the caller then authenticates as a gateway
+///   request is.
+pub fn connect_admission(
+    peer: Option<std::net::IpAddr>,
+    listener_open: bool,
+    proxy_authorization: Option<&str>,
+) -> ConnectAdmission {
+    let Some(peer) = peer else {
+        return ConnectAdmission::Refuse(StatusCode::FORBIDDEN, "peer address unknown");
+    };
+    if is_loopback_peer(peer) {
+        return ConnectAdmission::Allow;
+    }
+    if !listener_open {
+        return ConnectAdmission::Refuse(
+            StatusCode::FORBIDDEN,
+            "CONNECT is accepted only from this machine",
+        );
+    }
+    match proxy_authorization.and_then(proxy_virtual_key) {
+        Some(key) => ConnectAdmission::Authenticate(key),
+        None => ConnectAdmission::Refuse(
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "CONNECT from another machine needs an Intutic key in Proxy-Authorization",
+        ),
+    }
+}
+
+/// The virtual key in a `Proxy-Authorization` value: `Bearer vk_…`, or `Basic`
+/// credentials whose user name or password is the key (what a client builds
+/// from a proxy URL such as `http://vk_…@host:4000`).
+fn proxy_virtual_key(header: &str) -> Option<VirtualKey> {
+    use base64::Engine;
+    let (scheme, value) = header.trim().split_once(' ')?;
+    let value = value.trim();
+    let candidates: Vec<String> = if scheme.eq_ignore_ascii_case("bearer") {
+        vec![value.to_string()]
+    } else if scheme.eq_ignore_ascii_case("basic") {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        let (user, pass) = text.split_once(':').unwrap_or((text.as_str(), ""));
+        vec![user.to_string(), pass.to_string()]
+    } else {
+        return None;
+    };
+    candidates
+        .iter()
+        .find_map(|c| RequestCredential::classify(c).virtual_key().cloned())
+}
+
+/// Apply [`connect_admission`] to a `CONNECT`, authenticating its key when it
+/// carries one. `None` admits it; `Some` is the refusal to send.
+pub fn admit_connect<'a>(
+    state: &'a AppState,
+    req: &Request<Body>,
+) -> impl std::future::Future<Output = Option<Response<Body>>> + Send + 'a {
+    // Read out before the future: the request body is not `Sync`, so the
+    // future must not hold the request.
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    let auth = req
+        .headers()
+        .get("proxy-authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    async move { admit(state, peer, auth.as_deref()).await }
+}
+
+async fn admit(
+    state: &AppState,
+    peer: Option<std::net::IpAddr>,
+    auth: Option<&str>,
+) -> Option<Response<Body>> {
+    let refuse = |status: StatusCode, msg: &str| {
+        tracing::warn!(peer = ?peer, %status, "CONNECT refused: {msg}");
+        let mut response = Response::builder().status(status);
+        if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+            response = response.header("proxy-authenticate", "Basic realm=\"intutic\"");
+        }
+        Some(
+            response
+                .body(Body::from(format!("{status}: {msg}")))
+                .unwrap(),
+        )
+    };
+    match connect_admission(peer, listener_open(), auth) {
+        ConnectAdmission::Allow => None,
+        ConnectAdmission::Refuse(status, msg) => refuse(status, msg),
+        ConnectAdmission::Authenticate(key) => match authenticate_virtual_key(state, &key).await {
+            KeyCheck::Valid => None,
+            KeyCheck::Invalid => refuse(
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "the Intutic key in Proxy-Authorization is invalid, expired or revoked",
+            ),
+            KeyCheck::Unverifiable => refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the Intutic key could not be checked against the control plane; retry shortly",
+            ),
+        },
+    }
+}
+
+/// Handle an HTTP CONNECT request.
+///
+/// Upgrades the connection to a raw TCP tunnel. If the target hostname
+/// is an AI provider, performs TLS MITM to inspect the request.
+/// Otherwise, acts as a transparent passthrough.
+pub async fn handle_connect(mut req: Request<Body>) -> Response<Body> {
+    let (host, port) = match req.uri().authority() {
+        Some(a) => {
+            let host = a.host().to_string();
+            let port = a.port_u16().unwrap_or(443);
+            (host, port)
+        }
+        None => {
+            error!("CONNECT request missing authority");
+            return bad_gateway("Missing authority in CONNECT request");
+        }
+    };
+
+    let target = format!("{}:{}", host, port);
+
+    // L1 egress decision. AI hosts → MITM (unchanged); allowed
+    // hosts → tunnel; denied hosts (Enforce) → 403 with no tunnel opened.
+    let decision = global_policy().decide(&host, port);
+    let should_mitm = matches!(decision, EgressDecision::Mitm);
+
+    match decision {
+        EgressDecision::Mitm => {
+            info!(host = %host, "MITM: intercepting AI provider TLS connection");
+        }
+        EgressDecision::Allow => {
+            debug!(host = %host, "Passthrough: transparent TCP tunnel");
+        }
+        EgressDecision::WouldDeny => {
+            // Monitor mode: let it through, but make the blast radius visible.
+            record_would_deny();
+            tracing::warn!(
+                action = "egress_would_deny",
+                host = %host,
+                port = %port,
+                "Egress MONITOR: connection would be denied under Enforce — tunnelling and logging"
+            );
+        }
+        EgressDecision::Deny => {
+            record_denied();
+            tracing::warn!(
+                action = "egress_denied",
+                host = %host,
+                port = %port,
+                "Egress ENFORCE: connection denied — host not on the allow policy"
+            );
+            return forbidden(&host);
+        }
+    }
+
+    // Chaos egress faults, only on a CONNECT the policy above let through: a
+    // denied host was answered already and never reaches a fault. See
+    // `Chaos::apply_connect` for why a credential fault on an opaque tunnel
+    // refuses the CONNECT instead of answering inside it.
+    if let Some(chaos) = crate::chaos::active() {
+        if let Some(refusal) = chaos.apply_connect(&host, should_mitm) {
+            return refusal;
+        }
+    }
+
+    // Take the upgrade before answering: hyper hands the connection over once
+    // the 200 below is written, to whoever holds this.
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    drop(req);
+
+    // Send 200 Connection Established to the client.
+    //
+    // Not `Body::empty()`. axum's router adds `content-length` to every
+    // response whose body has an exact size, `0` for an empty one, and hyper
+    // refuses a 2xx answer to CONNECT that carries one (RFC 9110 §9.3.6): it
+    // drops the connection without writing anything, and the upgrade above is
+    // cancelled. A body of unknown size gets no `content-length`; it ends at
+    // once, so nothing follows the status line.
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from_stream(futures_util::stream::empty::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >()))
+        .unwrap();
+
+    // Spawn the tunnel in the background using hyper's upgrade mechanism
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let client_io = TokioIo::new(upgraded);
+                if should_mitm {
+                    if let Err(e) = run_mitm_tunnel(client_io, &host).await {
+                        tracing::warn!(host = %host, err = %e, "MITM tunnel error");
+                    }
+                } else {
+                    // Connect to the upstream server for transparent passthrough
+                    match TcpStream::connect(&target).await {
+                        Ok(upstream) => {
+                            let (mut client_read, mut client_write) = tokio::io::split(client_io);
+                            let (mut upstream_read, mut upstream_write) =
+                                tokio::io::split(upstream);
+                            let client_to_upstream =
+                                tokio::io::copy(&mut client_read, &mut upstream_write);
+                            let upstream_to_client =
+                                tokio::io::copy(&mut upstream_read, &mut client_write);
+                            let _ = tokio::try_join!(client_to_upstream, upstream_to_client);
+                        }
+                        Err(e) => {
+                            error!(target = %target, err = %e, "Failed to connect to upstream during passthrough");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to upgrade CONNECT request: {}", e);
+            }
+        }
+    });
+
+    response
+}
+
+/// Perform TLS MITM for an AI provider connection.
+///
+/// Terminates the client's TLS, signs a fresh cert for the hostname,
+/// and pipes the decrypted connection to the local proxy HTTP listener.
+async fn run_mitm_tunnel(
+    client_io: TokioIo<hyper::upgrade::Upgraded>,
+    hostname: &str,
+) -> Result<()> {
+    // 1. Load CA keypair
+    let ca = ensure_ca_exists().await?;
+
+    // 2. Sign a leaf cert for this hostname
+    let signed = sign_cert_for_host(&ca, hostname)?;
+
+    // 3. Parse certificate and private key from PEM bytes
+    let mut cert_reader = std::io::Cursor::new(signed.cert_pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+    let mut key_reader = std::io::Cursor::new(signed.key_pem.as_bytes());
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+
+    // 4. Build ServerConfig using rustls 0.23 (requires default crypto provider)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    // 5. Accept TLS connection from client (upgraded socket)
+    let client_tls = acceptor.accept(client_io).await?;
+
+    // 6. Connect to our local HTTP server loopback address
+    let local_port = std::env::var("PORT")
+        .unwrap_or_else(|_| "4000".to_string())
+        .parse::<u16>()
+        .unwrap_or(4000);
+    let local_addr = format!("127.0.0.1:{}", local_port);
+    let local_stream = TcpStream::connect(local_addr).await?;
+
+    // 7. Pipe decrypted client_tls and local_stream bidirectionally
+    let (mut client_read, mut client_write) = tokio::io::split(client_tls);
+    let (mut local_read, mut local_write) = tokio::io::split(local_stream);
+
+    let client_to_local = tokio::io::copy(&mut client_read, &mut local_write);
+    let local_to_client = tokio::io::copy(&mut local_read, &mut client_write);
+
+    tokio::select! {
+        res = client_to_local => {
+            if let Err(e) = res {
+                debug!("MITM client-to-local closed with error: {}", e);
+            }
+        }
+        res = local_to_client => {
+            if let Err(e) = res {
+                debug!("MITM local-to-client closed with error: {}", e);
+            }
+        }
+    }
+
+    info!(
+        hostname = %hostname,
+        "TLS MITM: intercepted AI provider request — governance pipeline applied"
+    );
+
+    Ok(())
+}
+
+fn bad_gateway(msg: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::from(format!("502 Bad Gateway: {}", msg)))
+        .unwrap()
+}
+
+/// Refuse a CONNECT whose target the egress policy denies. 403 rather than a
+/// silent tunnel close, so the client sees a governance decision, not a network
+/// error it might retry around.
+fn forbidden(host: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Body::from(format!(
+            "403 Forbidden: egress to {host} is denied by Intutic egress policy"
+        )))
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{connect_admission, ConnectAdmission};
+    use crate::hostname_filter::is_ai_provider_host;
+    use axum::http::StatusCode;
+    use base64::Engine;
+
+    fn ip(s: &str) -> Option<std::net::IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    fn vk() -> String {
+        ["vk_", "0123456789abcdef0123456789abcdef"].concat()
+    }
+
+    fn refused_with(a: ConnectAdmission) -> StatusCode {
+        match a {
+            ConnectAdmission::Refuse(status, _) => status,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_from_this_machine_is_allowed() {
+        for peer in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(
+                connect_admission(ip(peer), false, None),
+                ConnectAdmission::Allow
+            );
+            assert_eq!(
+                connect_admission(ip(peer), true, None),
+                ConnectAdmission::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn connect_from_the_network_is_refused_on_a_listener_not_opened() {
+        let bearer = format!("Bearer {}", vk());
+        let status = refused_with(connect_admission(ip("192.168.1.42"), false, Some(&bearer)));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn connect_from_the_network_without_a_key_is_refused_on_an_opened_listener() {
+        assert_eq!(
+            refused_with(connect_admission(ip("10.0.0.5"), true, None)),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+        let provider = ["Bearer sk-ant-", "api03-", "fixture"].concat();
+        assert_eq!(
+            refused_with(connect_admission(ip("10.0.0.5"), true, Some(&provider))),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+    }
+
+    #[test]
+    fn connect_from_the_network_with_a_key_on_an_opened_listener_is_authenticated() {
+        let bearer = format!("Bearer {}", vk());
+        let basic_user = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:", vk()))
+        );
+        let basic_pass = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("me:{}", vk()))
+        );
+        for header in [bearer, basic_user, basic_pass] {
+            match connect_admission(ip("10.0.0.5"), true, Some(&header)) {
+                ConnectAdmission::Authenticate(key) => assert_eq!(key.as_str(), vk()),
+                other => panic!("{header}: expected Authenticate, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn connect_with_no_known_peer_is_refused() {
+        assert_eq!(
+            refused_with(connect_admission(None, true, None)),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn test_ai_host_gets_mitm() {
+        assert!(is_ai_provider_host("api.anthropic.com"));
+        assert!(is_ai_provider_host("api.openai.com"));
+        assert!(is_ai_provider_host("api2.cursor.sh"));
+    }
+
+    #[test]
+    fn test_non_ai_host_passes_through() {
+        assert!(!is_ai_provider_host("google.com"));
+        assert!(!is_ai_provider_host("github.com"));
+    }
+}

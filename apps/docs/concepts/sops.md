@@ -1,0 +1,116 @@
+# Standard Operating Procedures (SOPs)
+
+Standard Operating Procedures (SOPs) form the core policy layer of Intutic. They define corporate compliance rules, architectural guidelines, security policies, and cost caps that govern autonomous AI coding agents at runtime.
+
+---
+
+## SOP Data Model Schema
+
+Every SOP is stored in the database registry and projects the following data structure:
+
+```typescript
+interface SopRegistryEntry {
+  sopId: string;               // Unique ID prefixed with 'sp_'
+  workspaceId: string;         // Owning workspace reference
+  title: string;               // Human-readable title
+  version: string;             // SemVer string (default: 1.0.0)
+  markdownContent: string;     // The natural language rule body
+  contentHash: string;         // SHA-256 integrity hash of content
+  riskTier: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  complexityTier: 'TIER_0' | 'TIER_1' | 'TIER_2'; // simplest to most complex work;
+                               // routing learns per tier (see the REST API reference)
+  isActive: boolean;           // false for superseded versions and deleted SOPs
+  lifecycleState: 'DRAFT' | 'PENDING_REVIEW' | 'GENERATED' | 'HYPOTHESIZED'
+    | 'REFINED' | 'VALIDATED' | 'INVALIDATED';
+  versionCounter: number;      // bumped on every save; send it back to detect conflicts
+  // `sopType` and `hookPhase` are vestigial: the columns exist, nothing sets
+  // them, and the executor they fed has been removed (see "SOP Formats" below).
+  sopType: 'standard' | 'hook';
+  hookPhase?: 'PRE_TOOL' | 'POST_TOOL' | 'PRE_RESPONSE' | 'POST_RESPONSE';
+}
+```
+
+---
+
+## SOP Formats
+
+Intutic supports two distinct formats of SOPs depending on whether the rule is meant for
+human-in-the-loop validation or in-process local interception:
+
+### Comparison: Local Harness Rules vs. LLM-as-a-Judge
+
+| Feature | Local Harness Rules (rules files / WASM) | LLM-as-a-Judge (response judge) |
+| :--- | :--- | :--- |
+| **Execution Timing** | **Pre-flight (Before execution)** | **Post-flight / Async (During/After execution)** |
+| **Latency** | **No model call and no network hop**: checked on the machine before the action runs (WASM rules are stopped by an instruction budget) | **A model call**: seconds, while or after the response streams |
+| **Purpose** | **Hard Prevention**: The hook gate blocks writes to its own hook files and settings, governance-bypass commands and secrets; `rm -rf /`, `mkfs` and similar are flagged there, not blocked, and the LLM proxy refuses them in a model's code-execution tool call. Force pushes and other recursive deletes are refused once a rule you add names them (an SOP's `hook_rule:`, which the proxy enforces, or a WASM or Rego rule). The MCP governance proxy blocks a `DROP TABLE` in an MCP tool call (at the hook gate it is flagged, not blocked; at the LLM proxy a SOP's [`sql_guard:`](/reference/sop-front-matter#destructive-sql) refuses one aimed at a database outside its allowlist), and redacts API keys before destruction occurs. | **Semantic Audit**: Evaluates whether the agent followed complex, subjective guidelines (e.g. *"Did the refactored code maintain proper architectural layering?"*). |
+
+*Without local harness rules, an agent would execute destructive commands before an LLM judge even finishes thinking!*
+
+### 1. Standard SOPs
+Standard SOPs are authored in natural language markdown. They represent corporate policies (e.g., "Do not use deprecated cryptographic functions") and are used by:
+- **The response judge:** the proxy sends each model response to the control plane, chunk by chunk as it streams and again when it ends, where a self-hosted judge model grades it against the workspace's SOPs and records an incident for a violation.
+- **The harnesses and the proxy:** `intutic gates install` writes the rule sets in `.intutic/sops/` into each harness's rules file<!-- ENTERPRISE_ONLY_START --> (`intutic connect` also the workspace's)<!-- ENTERPRISE_ONLY_END -->, and the proxy enforces the keys in their [front matter](/reference/sop-front-matter).
+
+### 2. WASM Rules
+For programmatic enforcement, rules compile to WebAssembly and run in the proxy with an
+explicit host-import allowlist. See [WASM Rules](/guide/wasm-rules).
+
+This section previously described a third format, **Hook SOPs** — JavaScript executed "inside
+Node's sandboxed V8 execution context" — along with a phase model, an `intutic.verdict()` API
+and a list of sandbox guarantees. That feature has been removed. It ran in Node's `vm` module,
+which is not a security boundary; it received the host's own intrinsics, so a script could
+reach `Object.prototype`; it failed open on every error including the documented CPU timeout;
+and no route, UI or front-matter key could ever create one, so no hook script ever ran against
+a real tool call. WASM rules are the supported answer.
+
+---
+
+## Lifecycle Transitions
+
+SOP lifecycle states are tracked in the database (`lifecycleState` above), and only these transitions are allowed (`POST /api/v1/sops/:sopId/transition`, Owners and Admins):
+
+```
+[ DRAFT ] ──> [ PENDING_REVIEW ] ──> [ GENERATED ] ──> [ HYPOTHESIZED ] ──> [ REFINED ] ──> [ VALIDATED ]
+
+PENDING_REVIEW ──> DRAFT
+HYPOTHESIZED, REFINED, VALIDATED ──> INVALIDATED
+VALIDATED ──> PENDING_REVIEW
+```
+
+`PENDING_REVIEW → GENERATED` must pass a Gödel score threshold; `REFINED → VALIDATED` is refused while the SOP's compiled graph is missing or stale, unless the admin acknowledges it with a reason. `HYPOTHESIZED` and `REFINED` SOPs are evaluated in shadow; only `VALIDATED` enforces. Deleting a SOP, or replacing it with a new version, stops it enforcing at once: it keeps its state, but every gate reads only active SOPs. Invalidating a SOP sends the SOPs that depend on it back to `PENDING_REVIEW`.
+
+Each change emits a `sop.lifecycle.transitioned` event carrying the acting user, the from and to states, and the reason.
+
+---
+
+## SOP Examples Library
+
+Below are copy-pasteable examples of Standard Markdown SOPs covering common security and
+operational guardrails. For the programmatic equivalents — blocking `rm -rf`, force pushes and
+unqualified `DELETE` — see the [starter rule library](/guide/wasm-rules), which ships rules
+that are tested in both directions rather than examples that were never executable.
+
+### 1. Secret & Credential Redaction (Markdown SOP)
+
+Save under `.intutic/sops/` (for example `.intutic/sops/secrets-dlp/rules.md`, or `.intutic/sops/secrets-dlp.md` directly in it); the proxy reads it from there, and `intutic gates install` writes it into each harness's rules file (see [Where rule sets go](/guide/how-it-works#where-rule-sets-go)):
+
+```markdown
+# SOP: Secrets DLP & Credential Protection
+
+## Rules
+1. AI agents must never output raw API keys, tokens, or private credentials (e.g., `API_KEY`, `AWS_SECRET_ACCESS_KEY`, `POSTGRES_PASSWORD`).
+2. Do not read configuration files containing raw credentials (e.g., `.env`, `.env.production`, `~/.ssh/id_rsa`).
+3. If credentials are identified in prompt context or tool outputs, mask them with `[REDACTED_SECRET]` before processing.
+```
+
+### 2. Code Quality & Steering Rule (Markdown SOP)
+
+```markdown
+# SOP: Code Quality & Safety Wrappers
+
+## Rules
+1. **Dynamic Execution Sanitization**: Any dynamic code execution (`eval()` or `exec()`) must be wrapped in `remedy.sanitize()`.
+2. **Strict Type Safety**: All TypeScript code must pass strict typechecks without using `any`.
+3. **API Domain Allowlist**: Outbound network requests are restricted to internal microservices and approved third-party APIs.
+```

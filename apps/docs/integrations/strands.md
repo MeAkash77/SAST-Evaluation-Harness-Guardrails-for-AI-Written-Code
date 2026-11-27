@@ -1,0 +1,127 @@
+# AWS Strands Agents
+
+Integrate Intutic governance with [Strands Agents](https://strandsagents.com) — AWS's flagship open-source agent framework and the default in Bedrock AgentCore's quickstarts.
+
+Strands is governed on two independent surfaces:
+
+1. **LLM egress** — routable through the Intutic proxy **only for some model providers**; the framework's *default* provider (Bedrock) is not one of them. See the per-provider table below — this is the first framework in the SDK-gated family whose default egress cannot traverse the proxy, and this page says so plainly rather than implying otherwise.
+2. **Local tool execution** — Strands tools run as plain decorated callables (or MCP-materialised tools) inside *your* Python process. No config or hook file can gate them, so the blocking gate ships SDK-side in `intutic-clawde`.
+
+## How it works
+
+The `strands` adapter is detected when `pyproject.toml`, `requirements.txt`, or `uv.lock` declares a `strands-agents` dependency (this also matches `strands-agents-tools` and the `bedrock-agentcore` package's `strands-agents` extra — all of which imply the framework is in use). It writes a `.env.intutic` file with proxy base-URL env vars plus a comment block pointing at the SDK gate.
+
+## Setup
+
+### 1. Initialize Intutic
+
+```bash
+intutic init
+```
+
+### 2. Route LLM traffic through the proxy — per-provider honesty {#route-llm-traffic-through-the-proxy-per-provider-honesty}
+
+Strands supports multiple model providers, and whether the Intutic proxy can see the traffic depends entirely on which one you construct:
+
+| Provider | Proxy-routable? | How |
+|---|---|---|
+| **Bedrock** (`BedrockModel` — the DEFAULT when you pass no `model`) | ❌ **No** | Bedrock traffic is SigV4-signed boto3 calls to `bedrock-runtime.<region>.amazonaws.com`. The Intutic proxy does not accept Bedrock's wire protocol from a client and cannot re-sign your SigV4 requests — there is no base-URL env var that makes this traffic governable by the proxy. To have the proxy govern a Bedrock-hosted model, use `AnthropicModel` or `OpenAIModel` pointed at the proxy and name the model `bedrock/<model id>`: the proxy signs the Bedrock call with the AWS credentials it is configured with (see [AWS Bedrock](/integrations/aws-bedrock)). Vector B and the [response gate](/reference/harness-security-matrix#vector-d--response-gate) do **not** apply; the SDK tool gate below is the enforcement point. |
+| `AnthropicModel` | ✅ Yes | The Anthropic Python SDK honors `ANTHROPIC_BASE_URL` (written by `.env.intutic`) when no explicit `base_url` is passed, or pass `client_args={"base_url": ...}`. |
+| `OpenAIModel` | ✅ Yes | The OpenAI Python SDK honors `OPENAI_BASE_URL` (written by `.env.intutic`), or pass `client_args={"base_url": ...}`. |
+| `LiteLLMModel` | ⚠️ Per-model | Set `client_args={"api_base": "<proxy>"}`; whether env-var routing applies depends on the underlying provider LiteLLM dispatches to. |
+| Gemini / Mistral / Ollama / Writer / LlamaAPI / SageMaker | ❌ Not via `.env.intutic` | No Intutic-written env var routes these today. Ollama is local egress by definition; SageMaker is SigV4 like Bedrock. |
+
+If you deploy on **Bedrock AgentCore Runtime**, the same per-provider reality applies inside the runtime; see [AWS Bedrock AgentCore](/integrations/agentcore) — this page is scoped to the framework.
+
+### 3. Gate local tool execution (SDK)
+
+```bash
+pip install intutic-clawde[strands]
+```
+
+Strands has a typed hooks system with a documented pre-tool-call veto: `strands.hooks.BeforeToolCallEvent.cancel_tool` (verified against a real `strands-agents` install — source read, then driven through a full agent loop, not inferred from docs; the `strands` extra requires `strands-agents>=1.57.2`). `IntuticHookProvider` subscribes to that event and cancels denied calls:
+
+```python
+from strands import Agent
+from intutic_clawde.gate import Gate, GateConfig, install as install_gate
+from intutic_clawde.gate.adapters.strands import IntuticHookProvider
+
+install_gate(Gate(GateConfig()))
+agent = Agent(model=..., tools=[...], hooks=[IntuticHookProvider()])
+```
+
+Or attach to an already-constructed agent:
+
+```python
+from intutic_clawde.gate.adapters.strands import install
+
+install(agent)
+```
+
+On a deny, the tool body never runs; the model receives an error-status tool result carrying the `[Intutic Governance] BLOCKED: ...` message and the run continues — Strands' own documented cancel contract, not an exception hack.
+
+**Fail-closed posture:** unlike CrewAI's dispatcher (which swallows hook exceptions and *allows* the call), Strands propagates a raising hook and aborts the whole run — confirmed empirically against the real dispatcher. So an unexpected gate error, or a missing `install_gate(...)`, aborts loudly instead of running tools unguarded.
+
+**Registration is per-Agent, not process-global.** Each `Agent` needs the hook passed to it — for multi-agent orchestrators use `install_multiagent()` (below).
+
+**Bidirectional streaming agents (`BidiAgent`).** `strands.bidi.BidiAgent` dispatches tools through the same executor and fires the same `BeforeToolCallEvent`, so it is gated the same way — `BidiAgent(model=..., tools=[...], hooks=[IntuticHookProvider()])` or `install(bidi_agent)`. This covers both tool calls the model requests during a live session and direct `bidi_agent.tool.<name>(...)` calls. (Bidi moved from `strands.experimental` to the stable `strands.bidi` namespace in strands-agents 1.57.2, which is why that is the extra's floor.)
+
+### Multi-agent `Graph` / `Swarm`
+
+A Strands hook lives on one agent, and every node of a `Graph` or `Swarm` wraps its own agent — a node built without the hook would run its tools ungoverned. `install_multiagent()` gates the whole orchestrator in one call:
+
+```python
+from strands.multiagent import GraphBuilder, Swarm
+from intutic_clawde.gate.adapters.strands import install_multiagent
+
+graph = builder.build()
+install_multiagent(graph)   # or install_multiagent(swarm)
+```
+
+- **Every node, nested ones included.** It walks the orchestrator's nodes, recursing into nested `Graph`/`Swarm` executors, and installs the gate on every agent that does not already carry an `IntuticHookProvider`. Calling it twice is a no-op; agents constructed with `hooks=[IntuticHookProvider()]` are left as they are.
+- **Refuses what it cannot gate.** A node whose executor runs its tools outside this process — e.g. a remote A2A agent — raises a `TypeError` naming the node, before anything is installed. Gate that agent in its own runtime, or remove the node.
+- **Fail-closed for later changes.** It also registers a `BeforeNodeCallEvent` hook on each orchestrator: if a node is about to run and its agent carries no Intutic gate (a node added or replaced after the call), the node is cancelled with a `[Intutic Governance] BLOCKED: ...` message — a `Graph` fails and stops, a `Swarm` ends with status `FAILED`. Re-run `install_multiagent()` after changing nodes.
+
+The per-tool `BeforeToolCallEvent` gate is still what evaluates policy inside each node; the node hook only guarantees that gate is present.
+
+### 4. MCP tools
+
+Strands materialises MCP tools as regular agent tools (`MCPAgentTool`), and they dispatch through the **same** `BeforeToolCallEvent` — the gate sees them identically to native tools (verified with a real stdio MCP server in this adapter's test suite). Tool-name and argument-level (`WHERE`) rules apply unchanged.
+
+### 5. Trace attribution
+
+```python
+from intutic_clawde.gate import intutic_headers
+from strands.models.anthropic import AnthropicModel
+
+model = AnthropicModel(client_args={
+    "base_url": "http://localhost:4000",
+    "default_headers": intutic_headers(session_id=run_id, harness="strands"),
+})
+```
+
+(Only meaningful on proxy-routable providers — see the table above.)
+
+## What gets written
+
+Same shape as LangGraph's `.env.intutic` — proxy URLs plus a pointer at `intutic_clawde.gate.adapters.strands.IntuticHookProvider`. Remember: the base-URL vars in that file are inert under the default Bedrock provider.
+
+To undo what `intutic gates install` writes here, run `intutic disconnect --harness strands`: each file goes back to what it held before Intutic first wrote it, or is deleted if Intutic created it, and edits you made since are kept. `.env.intutic` stays while another harness that writes it is still connected. See [`intutic disconnect`](/reference/cli#intutic-disconnect).
+
+## What the adapter does NOT do
+
+Same structural gaps as every SDK-gated framework — see [LangGraph's "What the adapter does NOT do"](/integrations/langgraph#what-the-adapter-does-not-do) — plus Strands-specific limits:
+
+- **Bedrock/SageMaker egress is ungoverned by the proxy** (see the table above). Tool calls remain fully gated; prompts/responses to those providers are not inspected.
+- **Hook ordering:** another hook registered to run after this one could mutate `tool_use` post-approval; Strands offers no "always last" guarantee (the adapter registers late, at order 99, to narrow this; pass `order=` to `IntuticHookProvider` or `install()` to change it).
+
+## Config details
+
+| Property | Value |
+|----------|-------|
+| Harness type | `strands` |
+| Config file | `.env.intutic` |
+| Detection | `strands-agents` in `pyproject.toml`, `requirements.txt`, or `uv.lock` |
+| Format | Shell environment variables |
+| Write strategy | Atomic (write to `.intutic-tmp`, then rename) |
+| Tool gate | SDK-side (`intutic_clawde.gate.adapters.strands.IntuticHookProvider`, a `BeforeToolCallEvent.cancel_tool` hook; `install_multiagent()` for `Graph`/`Swarm`) — no sync-daemon hook file |

@@ -1,0 +1,88 @@
+# Kitkat Agent Custom Skill
+
+Integrate Intutic governance within developer environments using a workspace-level custom agent skill.
+
+Claude Code, Cursor, Google Antigravity, OpenAI Codex, and other compatible agentic coding assistants natively load specialized instructions, guidelines, and system personalities from a structured customization directory in the workspace.
+
+---
+
+## How it works
+
+Instead of merging rules globally into host machine config files, you can place a pre-configured `SKILL.md` directly into your workspace. When the AI agent connects, it automatically reads the Kitkat skill rules to structure its prompts, FinOps attributes, and safety overrides locally.
+
+The skill also tells the agent what to do when Intutic refuses or holds a call: what every refusal code means, which ones it may retry and which it must not, that a held call needs an owner, admin or engineering manager to approve it (and that the retry passes only while the workspace's review-hold bypass is on), and how to tell the user.
+
+<!-- ENTERPRISE_ONLY_START -->
+`intutic connect` writes it to `.agents/skills/intutic-governance-kitkat/SKILL.md` in the workspace when it is missing, next to the [Rule Author skill](/integrations/rule-author), and never overwrites a copy that is already there. `intutic disconnect` deletes the copy connect wrote, unless you have edited it. The steps below are for a workspace that does not run `intutic connect`.
+<!-- ENTERPRISE_ONLY_END -->
+
+[`intutic gates install`](/reference/cli#intutic-gates-install) writes it to `.agents/skills/intutic-governance-kitkat/SKILL.md` in the workspace when it is missing, with no control plane needed, next to the [Rule Author skill](/integrations/rule-author), and never overwrites a copy that is already there (`--dry-run` names it and writes nothing). `intutic disconnect` deletes the copy it wrote, unless you have edited it.
+
+The steps below add it to a workspace by hand.
+
+---
+
+## Setup
+
+### 1. Create the skill directory
+
+Create the target skill directory at the root of your workspace:
+
+```bash
+mkdir -p .agents/skills/intutic-governance-kitkat
+```
+
+### 2. Download the SKILL.md file
+
+Download the pre-configured skill instruction template and save it directly in that directory:
+
+<a href="../downloads/SKILL.md" download="SKILL.md" class="download-button" style="display: inline-block; padding: 6px 12px; background: var(--vp-c-brand); color: white; border-radius: 4px; text-decoration: none; font-weight: 500; font-size: 0.85rem; margin-top: 8px; margin-bottom: 12px;">Download SKILL.md</a>
+
+### 3. Start the proxy
+
+Boot the proxy to begin intercepting requests:
+
+```bash
+intutic start
+```
+
+<!-- ENTERPRISE_ONLY_START -->
+> Have an Intutic account or run your own control plane? Use `intutic connect` instead. It writes the same files, starts the same proxy and adds bidirectional config sync.
+<!-- ENTERPRISE_ONLY_END -->
+
+*Your agentic assistant will now detect the Kitkat governance persona, apply token predictions, and prompt-intercept through the local proxy port (`4000`).*
+
+---
+
+## 🤖 AI-First Autonomous Self-Configuration
+
+Intutic is designed **AI-first**: AI coding agents (such as Claude Code, Antigravity, Cursor, or custom framework agents) can configure, audit, and manage their own governance sessions directly through terminal commands or in-stream slash commands without needing human intervention.
+
+### In-Stream Slash Commands (`@intutic` / `/intutic`)
+
+When interacting with model providers through the Intutic proxy, agents can issue commands directly inside prompt payloads by prepending `@intutic` or `/intutic`. The proxy intercepts these commands **pre-flight**, before the request reaches the provider, executes the governance action, and returns formatted response blocks:
+
+#### 1. Cost & Task Attribution
+* **`@intutic initialize`**: Lists the open tickets on the workspace's Jira and Linear connections, and the local rule sets under `.intutic/sops/` (folders and single SOP files), as numbered options, and marks the ticket your git branch names as Recommended.
+* **`@intutic start [<option_number_or_ticket_key>] [--sops=<names>] [--auto-judge]`**: Locks cost attribution to a ticket (an option number from `initialize`, or the ticket key) and selects which local rule sets (folders or single SOP files, by option number or name) are written into the rules files, without changing what is enforced; `--auto-judge` (or `-j`) judges every later prompt in the session.
+  * *Example:* `@intutic start 12 --sops=security-rules --auto-judge`
+
+#### 2. FinOps & Token Projections
+* **`@intutic predict <prompt>`**: Calculates pre-flight input/output token projections and USD cost before submitting the request to upstream LLM providers.
+* **`@intutic recommend`**: Returns the corrective prompt for the most recent anomaly detected in the session, with its evidence; with no anomaly, general tips for keeping prompts and spend down.
+
+#### 3. Policy Verification & Automated E2E Judging
+* **`@intutic verify <prompt>`**: Audits the prompt pre-flight against active SOPs and guidelines, returning pass/fail verdicts before submitting requests to the LLM.
+* **`@intutic review <prompt>`**: Quick heuristic check of the prompt (length, action verbs, SOP or policy reference) with a letter grade and suggestions.
+* **`@intutic judge <prompt>`**: Runs real-time LLM-as-a-judge compliance checkers on model responses out-of-band. LLM judging, here and with `--auto-judge`, runs only on a plan that includes it; on a plan without it (Free) the response passes through unjudged.
+* **`@intutic status`**: Displays active session statistics, spent token budget, and average compliance score.
+* **`@intutic budget`**: Displays daily spend limits and remaining quota.
+
+#### 4. Posture & Visualization
+
+These two are handled entirely by the proxy from what it can see on the machine — no control plane required, so they work offline and in the open-source build.
+
+* **`/fix <prompt>`** (also `@fix`, `/intutic-fix`, `@intutic fix`): Rewrites the prompt and scores the workspace's governance posture against OWASP categories, reading the DLP and WASM configuration, the SOPs on disk for the caller's role, and the skills and MCP servers in play. Returns the enhanced prompt plus specific recommendations — enable input or output DLP, add a WASM rule, write a role SOP, connect a memory provider.
+  * Blocking by default. It can be configured to forward the enhanced prompt upstream instead, in which case the recommendations still come back.
+  * A recommendation to *add a WASM rule* is the entry point to the [Rule Author skill](/integrations/rule-author).
+* **`/draw`** (also `@draw`, `/intutic-draw`, `@intutic draw`): Renders a Mermaid diagram and text summary of the agent's trajectory and the guardrails currently around it. Always blocking — there is nothing to forward upstream for a visualization.

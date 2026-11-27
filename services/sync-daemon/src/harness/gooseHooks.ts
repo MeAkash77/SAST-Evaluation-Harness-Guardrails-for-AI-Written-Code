@@ -1,0 +1,286 @@
+/**
+ * gooseHooks.ts — Goose PreToolUse governance plugin injection.
+ *
+ * Writes the Intutic governance plugin to the Goose plugin directory:
+ *   ~/.agents/plugins/intutic-governance/plugin.json
+ *   ~/.agents/plugins/intutic-governance/hooks/hooks.json
+ *   ~/.agents/plugins/intutic-governance/scripts/intutic-check.sh
+ *
+ * Also merges the Intutic proxy URL into ~/.config/goose/config.yaml.
+ * After writing, calls gooseHardener to apply chmod 444 + immutable flags.
+ *
+ * HLD §3.14 — Three-Tier Defense Cascade
+ *
+ * @module
+ */
+
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import * as os from 'node:os'
+import { createLogger } from '@intutic/logger'
+import { keepOriginal, noteWritten } from '../disconnect/originals.js'
+import { newIso } from '@intutic/id'
+import { hardenGoosePlugin, unharden } from './gooseHardener.js'
+import { HOOK_TIMEOUT_SECONDS } from '@intutic/shared-types'
+import { emitShellGate, SHELL_EXTRACT, emitShellFailClosed, REVIEW_REQUESTS_BASENAME } from './gateBody.js'
+import { parseDocument, isMap, isScalar } from 'yaml'
+import { writeFileAtomic } from '../lib/atomicWrite.js'
+import { hookHostFallback } from '../lib/hookHost.js'
+
+const log = createLogger('sync-goose-hooks')
+
+const PLUGIN_DIR = path.join(os.homedir(), '.agents', 'plugins', 'intutic-governance')
+const GOOSE_CONFIG = path.join(os.homedir(), '.config', 'goose', 'config.yaml')
+
+/** The plugin manifest Goose identifies the plugin by. */
+export function gooseManifest(): Record<string, unknown> {
+  return {
+    name: 'intutic-governance',
+    version: '1.0.0',
+    description: 'Intutic governance gate — auto-generated. DO NOT EDIT.',
+  }
+}
+
+/**
+ * The plugin's `hooks/hooks.json`, in Goose's schema: each event a list of
+ * rules, each rule a list of command actions. Every tool call goes to the
+ * gate (no matcher). \`on_failure: "block"\` makes Goose deny a call whose
+ * gate fails — times out, crashes, or answers nothing it reads — where the
+ * default would run it; \`timeout\` replaces Goose's 30 s default, and the gate
+ * refuses at its own deadline inside it. A PostToolUse action cannot block,
+ * so it carries neither. The shape used before (\`{PreToolUse: {command,
+ * failClosed}}\`) is not one Goose loads: it skipped the file with a warning.
+ */
+export function gooseHooksConfig(scriptPath: string): Record<string, unknown> {
+  const command = shellQuote(scriptPath)
+  return {
+    _comment: 'Intutic governance plugin — auto-generated. DO NOT EDIT.',
+    _lastSync: newIso(),
+    hooks: {
+      PreToolUse: [{ hooks: [{ type: 'command', command, timeout: HOOK_TIMEOUT_SECONDS, on_failure: 'block' }] }],
+      PostToolUse: [{ hooks: [{ type: 'command', command: `${command} --event post`, timeout: HOOK_TIMEOUT_SECONDS }] }],
+    },
+  }
+}
+
+/** Single-quotes a path for the shell Goose runs a command through. */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Write Goose governance plugin and harden it.
+ *
+ * @param proxyUrl    - Intutic proxy URL written into the plugin script.
+ * @param workspaceRoot - Absolute workspace root (for hook events log path).
+ * @param workspaceId - Workspace ID embedded in hook event payloads.
+ * @param routing     - Also point goose's provider hosts at the proxy. False
+ *                      registers the gate in config.yaml and leaves the hosts.
+ */
+export async function writeGooseHooks(
+  proxyUrl: string,
+  workspaceRoot = os.homedir(),
+  workspaceId = '',
+  routing = true,
+): Promise<void> {
+  const hooksDir = path.join(PLUGIN_DIR, 'hooks')
+  const scriptsDir = path.join(PLUGIN_DIR, 'scripts')
+  await keepOriginal(path.join(PLUGIN_DIR, 'plugin.json'), workspaceRoot)
+  await keepOriginal(path.join(hooksDir, 'hooks.json'), workspaceRoot)
+  await keepOriginal(path.join(scriptsDir, 'intutic-check.sh'), workspaceRoot)
+  await fs.mkdir(hooksDir, { recursive: true })
+  await fs.mkdir(scriptsDir, { recursive: true })
+
+  // ── plugin.json + hooks.json ────────────────────────────────────────
+  for (const [file, content] of [
+    [path.join(PLUGIN_DIR, 'plugin.json'), JSON.stringify(gooseManifest(), null, 2) + '\n'],
+    [path.join(hooksDir, 'hooks.json'), JSON.stringify(gooseHooksConfig(path.join(scriptsDir, 'intutic-check.sh')), null, 2) + '\n'],
+  ] as const) {
+    // Unharden before writing (in case we're refreshing an existing install)
+    await unharden(file)
+    await writeFileAtomic(file, content)
+    await noteWritten(file, workspaceRoot, content)
+  }
+
+  // ── intutic-check.sh ─────────────────────────────────────────────────
+  const checkScriptPath = path.join(scriptsDir, 'intutic-check.sh')
+  await unharden(checkScriptPath)
+
+  const hookEventsLog = path.join(workspaceRoot, '.intutic', 'events', 'hook-events.jsonl')
+  // Ensure events dir exists
+  await fs.mkdir(path.join(workspaceRoot, '.intutic', 'events'), { recursive: true })
+
+  const checkScript = `#!/usr/bin/env bash
+# Intutic Goose PreToolUse governance gate.
+# Auto-generated by intutic sync-daemon. DO NOT EDIT.
+# Proxy: ${proxyUrl}
+# Generated: ${newIso()}
+set -euo pipefail
+${emitShellFailClosed('goose')}
+# The hook event: PreToolUse invokes this script bare, PostToolUse with
+# "--event post". It used to read EVENT="\${1:-pre}", which is "--event" on the
+# post call, and the post call then ran the pre-tool gate again. The fail-closed
+# prelude above sets INTUTIC_POST_MODE from the same arguments; the gate body
+# returns at once in post mode, and records nothing for goose, whose post-tool
+# payload has not been captured (POST_TOOL_OBSERVABLE).
+EVENT=pre
+if [ "\${1:-}" = "--event" ]; then EVENT="\${2:-pre}"; fi
+INPUT="\$(cat)"
+${SHELL_EXTRACT}
+
+HOOK_EVENTS_LOG=${JSON.stringify(hookEventsLog)}
+
+# ── Runtime credentials (sourced from ~/.intutic/env/runtime.env) ────────────────────────
+# These are defaults, and they are also the only thing standing between
+# \`set -u\` and a fatal unbound-variable error: log_event reads all three, so on
+# a machine with no runtime.env to source, an unset name kills the gate before
+# it can exit 2. Spelling matters — INTUTIC_, never INTUITIC_.
+RUNTIME_ENV="$HOME/.intutic/env/runtime.env"
+INTUTIC_HOST=${JSON.stringify(hookHostFallback())}
+INTUTIC_API_KEY=""
+INTUTIC_WORKSPACE_ID=${JSON.stringify(workspaceId)}
+[ -f "$RUNTIME_ENV" ] && source "$RUNTIME_ENV" 2>/dev/null || true
+
+log_event() {
+  local verdict="\$1" tool="\$2" reason="\$3"
+  # \`tool\` and \`reason\` carry agent-controlled text — the tool name, and the
+  # target path quoted into the block reason — and both are spliced into the
+  # JSON string below. Escape first: one unescaped quote yields a line
+  # JSON.parse rejects, and drainHookEvents drops malformed lines then wipes the
+  # log on a successful drain, so the record of a block is destroyed rather than
+  # delayed. A crafted path could otherwise close the string and forge fields.
+  tool="\${tool//\\\\/\\\\\\\\}";     tool="\${tool//\\"/\\\\\\"}"
+  reason="\${reason//\\\\/\\\\\\\\}"; reason="\${reason//\\"/\\\\\\"}"
+  # Every C0 control character, not just newline and carriage return. JSON
+  # forbids all of U+0000-U+001F unescaped, so a plain TAB in a filename — no
+  # adversary required — was still enough to produce a line JSON.parse rejects.
+  # (NUL cannot appear in a bash variable, so the range starts at \\x01.)
+  tool="\${tool//[\$'\\x01'-\$'\\x1f']/ }"; reason="\${reason//[\$'\\x01'-\$'\\x1f']/ }"
+  # The workspace id is spliced into the same JSON string. It comes from
+  # runtime.env on disk rather than from the agent, so it is lower risk — but a
+  # value with a quote in it breaks every audit line the same way, and "lower
+  # risk" is not "cannot happen" for a file the operator edits by hand.
+  local ws="\${INTUTIC_WORKSPACE_ID}"
+  ws="\${ws//\\\\/\\\\\\\\}"; ws="\${ws//\\"/\\\\\\"}"; ws="\${ws//[\$'\\x01'-\$'\\x1f']/ }"
+  local ts; ts="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local incident_id; incident_id="\$(printf '%s' "\${ts}\${tool}\${INTUTIC_WORKSPACE_ID}" | sha1sum 2>/dev/null | cut -c1-16 || echo \"\$(date +%s)\")"
+  # The event's id: random, made once here, and resent with the line it is
+  # written into, so the control plane processes the event once.
+  local event_id; event_id="\$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \\n' || true)"
+  [ -n "\$event_id" ] || event_id="\$(date +%s)\$\$\${RANDOM}\${RANDOM}\${RANDOM}"
+  local entry="{\\"event\\":\\"\${verdict}\\",\\"toolName\\":\\"\${tool}\\",\\"reason\\":\\"\${reason}\\",\\"workspaceId\\":\\"\${ws}\\",\\"harnessType\\":\\"goose\\",\\"timestamp\\":\\"\${ts}\\",\\"incidentId\\":\\"\${incident_id}\\",\\"eventId\\":\\"\${event_id}\\"}"
+  # Path B: reliable file append
+  printf '%s\\n' "\$entry" >> "\$HOOK_EVENTS_LOG" 2>/dev/null || true
+  # Path A: fire-and-forget HTTP (non-blocking, near-real-time)
+  if [ -n "\$INTUTIC_API_KEY" ]; then
+    curl -s -o /dev/null --max-time 3 -X POST \\
+      -H "Content-Type: application/json" \\
+      -H "Authorization: Bearer \$INTUTIC_API_KEY" \\
+      -d "{\\"events\\":[\$entry]}" \\
+      "\${INTUTIC_HOST}/api/v1/hook-events" & disown 2>/dev/null || true
+  fi
+}
+
+${emitShellGate({ harness: 'goose', reviewRequestFile: path.join(workspaceRoot, '.intutic', 'events', REVIEW_REQUESTS_BASENAME) })}
+
+log_event "tool_allowed" "\$TOOL" ""
+exit 0
+`
+
+  await writeFileAtomic(checkScriptPath, checkScript, { mode: 0o755 })
+  await noteWritten(checkScriptPath, workspaceRoot, checkScript)
+
+  // Apply immutable flags after writing
+  await hardenGoosePlugin(PLUGIN_DIR)
+
+  log.info(
+    { action: 'goose_plugin_written', pluginDir: PLUGIN_DIR },
+    'Goose governance plugin written and hardened',
+  )
+
+  // ── Merge proxy URL into goose config.yaml ───────────────────────────
+  // An empty URL registers the gate and leaves the provider hosts alone.
+  await mergeGooseConfig(routing ? proxyUrl : '')
+}
+
+/**
+ * Set Intutic's keys in goose's `config.yaml` text: the provider hosts (the
+ * proxy) and `hooks.pre_tool_use` (the gate script). Edited through the
+ * `yaml` document model, so every other key, comment and list is kept. A text
+ * replace of the first `host:` line used to rewrite whichever key of that name
+ * came first, such as an extension's or an MCP server's.
+ *
+ * The hosts are goose's own top-level keys, which its providers read through
+ * `Config::get_param` (environment first, then this file): `ANTHROPIC_HOST`
+ * (the Anthropic provider posts to `{host}/v1/messages`) and `OPENAI_HOST`
+ * (the OpenAI provider appends `OPENAI_BASE_PATH`, by default
+ * `v1/chat/completions`) — goose's `anthropic_def.rs` and `openai_def.rs`. An
+ * `OPENAI_BASE_URL` in the file outranks `OPENAI_HOST` there, so one that is
+ * present is pointed at the proxy too. Earlier versions wrote `provider.host`,
+ * which goose never reads; that key is removed when it still holds the proxy.
+ *
+ * An empty `proxyUrl` leaves the hosts alone: the settings guard re-runs this
+ * writer to restore the plugin without a URL to hand.
+ *
+ * Returns `null`, to leave the file untouched, when the text is not YAML, is
+ * not a mapping, or holds `hooks` as something other than a mapping.
+ */
+export function mergeGooseConfigYaml(raw: string, proxyUrl: string, hookScript: string): string | null {
+  const doc = parseDocument(raw)
+  if (doc.errors.length > 0) return null
+  if (doc.contents !== null && !isMap(doc.contents)) return null
+  const hooks = doc.get('hooks', true)
+  if (hooks !== undefined && !isMap(hooks)) {
+    // `hooks:` with no value: replaced by the mapping below.
+    if (isScalar(hooks) && hooks.value === null) doc.delete('hooks')
+    else return null
+  }
+  if (proxyUrl) {
+    // A loop, not `/\/+$/`: CodeQL flags that regex as polynomial on a long run of slashes.
+    let host = proxyUrl
+    while (host.endsWith('/')) host = host.slice(0, -1)
+    doc.set('ANTHROPIC_HOST', host)
+    doc.set('OPENAI_HOST', host)
+    if (doc.has('OPENAI_BASE_URL')) doc.set('OPENAI_BASE_URL', `${host}/v1`)
+    const provider = doc.get('provider', true)
+    if (isMap(provider) && provider.get('host') === proxyUrl) {
+      provider.delete('host')
+      if (provider.items.length === 0) doc.delete('provider')
+    }
+  }
+  doc.setIn(['hooks', 'pre_tool_use'], hookScript)
+  return doc.toString()
+}
+
+/**
+ * Merge the provider host **and** the `hooks.pre_tool_use` registration into
+ * `~/.config/goose/config.yaml`.
+ *
+ * The hook registration used to live in a second module, `gooseHooksWriter.ts`,
+ * which wrote its own gate script and registered *that* one here — so goose had
+ * two co-installed gates with contradictory models: this one, which enforces
+ * locally and fails closed, and that one, which POSTed to the control plane and
+ * failed open. Absorbing the registration here settles it: both mechanisms
+ * name the same script.
+ */
+async function mergeGooseConfig(proxyUrl: string): Promise<void> {
+  let raw = ''
+  try {
+    raw = await fs.readFile(GOOSE_CONFIG, 'utf-8')
+  } catch {
+    // No config.yaml yet (first run) or unreadable: written fresh below.
+  }
+
+  const existing = mergeGooseConfigYaml(raw, proxyUrl, path.join(PLUGIN_DIR, 'scripts', 'intutic-check.sh'))
+  if (existing === null) {
+    log.warn({ action: 'goose_config_merge_skipped', path: GOOSE_CONFIG }, `${GOOSE_CONFIG} is not a YAML mapping Intutic can merge into — left untouched`)
+    return
+  }
+  if (existing === raw) return
+
+  await keepOriginal(GOOSE_CONFIG, os.homedir())
+  await fs.mkdir(path.dirname(GOOSE_CONFIG), { recursive: true })
+  await writeFileAtomic(GOOSE_CONFIG, existing)
+
+  log.info({ action: 'goose_config_written', path: GOOSE_CONFIG }, 'Goose config.yaml updated with the proxy hosts')
+}

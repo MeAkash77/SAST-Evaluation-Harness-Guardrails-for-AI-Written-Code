@@ -1,0 +1,307 @@
+/**
+ * `intutic disconnect` — undo what `intutic connect` (or `intutic gates
+ * install`, which writes the same gates without a control plane) set up on
+ * this machine.
+ *
+ * Every harness config connect wrote is put back (see
+ * `@intutic/sync-daemon`'s `planDisconnect` for the files), and on a full
+ * disconnect the machine-level pieces go too: the background services, the
+ * Intutic CA connect trusted (login keychain; Linux system store), the Valkey container it
+ * started, the gate caches and, unless `--keep-login`, the stored
+ * credentials.
+ *
+ * A real run with a login tells the control plane before it removes the
+ * credentials (`reportDisconnect`), so the silent-gate check, the devices
+ * list and the AI inventory treat the machine as disconnected rather than
+ * broken. With no login there is no control plane to tell.
+ *
+ * Everything is planned before anything changes, so `--dry-run` prints
+ * exactly what a real run does. Running connect would write it all straight
+ * back, so a real run stops the services first and refuses while another
+ * `intutic connect` is still running.
+ *
+ * @module
+ */
+
+import * as node_fs from 'node:fs/promises'
+import * as node_path from 'node:path'
+import * as node_os from 'node:os'
+import { X509Certificate } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { DisconnectPlan, planDisconnect, HARNESS_REVERSERS } from '@intutic/sync-daemon'
+import { HarnessType } from '@intutic/shared-types'
+import type { IntuticConfig } from '@intutic/shared-types'
+import { log } from '../lib/logger.js'
+import { reportDisconnect } from '../lib/deviceReport.js'
+import { linuxConnectCaRemoval, removeLinuxConnectCaTrust } from '../lib/caTrust.js'
+import { getRawProcessList } from '../lib/process.js'
+import { clearCredentials, loadConfig, loadCredentials, saveConfig } from '../config/store.js'
+import { getCredentialsPath, getIntuticDir } from '../config/paths.js'
+import { getServicePaths, uninstallDaemon, uninstallMcpDaemon, uninstallProxyService, type ServiceTarget } from './install-daemon.js'
+
+export interface DisconnectOptions {
+  /** One harness id; every harness when omitted. */
+  harness?: string
+  dryRun?: boolean
+  keepLogin?: boolean
+}
+
+const SERVICE_UNINSTALL: Record<ServiceTarget, () => Promise<void>> = {
+  sync: () => uninstallDaemon(),
+  mcp: () => uninstallMcpDaemon(),
+  proxy: () => uninstallProxyService(),
+}
+
+/** The workspaces to clean: the one `intutic init` recorded, and the current one if connect wrote into it. */
+async function workspaceRoots(config: IntuticConfig | null): Promise<string[]> {
+  const roots = new Set<string>()
+  if (config?.workspaceRoot) roots.add(config.workspaceRoot)
+  try {
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    await node_fs.access(node_path.join(top, '.intutic'))
+    roots.add(top)
+  } catch {
+    // Not in a repository, or not one connect wrote into.
+  }
+  return [...roots]
+}
+
+/** Services `intutic daemon install` set up for this user; a system-level one needs root and is only reported. */
+async function planServices(plan: DisconnectPlan): Promise<void> {
+  for (const target of Object.keys(SERVICE_UNINSTALL) as ServiceTarget[]) {
+    const user = getServicePaths(false, target)
+    try {
+      await node_fs.access(user.targetPath)
+      plan.change(user.targetPath, `stop and remove the ${user.label} service`, SERVICE_UNINSTALL[target])
+    } catch {
+      // Not installed for this user.
+    }
+    const system = getServicePaths(true, target)
+    try {
+      await node_fs.access(system.targetPath)
+      plan.note(system.targetPath, `a system-wide service; remove it with \`sudo intutic daemon uninstall --system${target === 'sync' ? '' : ` --${target}`}\``)
+    } catch {
+      // Not installed system-wide.
+    }
+  }
+}
+
+/**
+ * The Intutic CA connect trusts in the macOS login keychain when the proxy's
+ * certificate is not trusted yet. The administrator's machine-wide install
+ * trusts it in the System keychain instead, so a copy in the login keychain
+ * is connect's. On Linux connect's copy has its own file name in the system
+ * store (`linuxConnectCaRemoval`); removing it needs root, as installing it
+ * did, so without root the commands are printed instead.
+ */
+export async function planCaTrust(plan: DisconnectPlan): Promise<void> {
+  if (process.platform === 'linux') {
+    const removal = await linuxConnectCaRemoval()
+    if (!removal) return
+    if (process.getuid?.() === 0) {
+      plan.change(removal.dest, 'remove the Intutic CA certificate connect trusted, and rebuild the system CA bundle', () =>
+        removeLinuxConnectCaTrust(removal),
+      )
+    } else {
+      plan.note(removal.dest, `the Intutic CA certificate connect trusted; removing it needs root: ${removal.commands.join(' && ')}`)
+    }
+    return
+  }
+  const certPath = node_path.join(getIntuticDir(), 'ca.crt')
+  let sha1: string
+  try {
+    sha1 = new X509Certificate(await node_fs.readFile(certPath)).fingerprint.replace(/:/g, '')
+  } catch {
+    return
+  }
+  if (process.platform === 'darwin') {
+    const keychain = node_path.join(node_os.homedir(), 'Library', 'Keychains', 'login.keychain-db')
+    let listed: string
+    try {
+      listed = execFileSync('security', ['find-certificate', '-a', '-Z', keychain], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch {
+      return
+    }
+    if (!listed.toUpperCase().includes(sha1.toUpperCase())) return
+    plan.change(keychain, 'remove the Intutic CA certificate connect trusted', async () => {
+      try {
+        execFileSync('security', ['remove-trusted-cert', '-d', certPath], { stdio: ['ignore', 'ignore', 'pipe'], timeout: SECURITY_PROMPT_MS })
+      } catch (err) {
+        if (caStaysTrusted(err)) {
+          // The certificate stays too: without it, a second disconnect would find nothing to undo.
+          log.warn(`The Intutic CA is still trusted. Run intutic disconnect again at this Mac and enter your password, or run: sudo security remove-trusted-cert -d ${certPath}`)
+          return
+        }
+      }
+      execFileSync('security', ['delete-certificate', '-Z', sha1, keychain], { stdio: 'ignore', timeout: SECURITY_PROMPT_MS })
+    })
+  } else if (process.platform === 'win32') {
+    plan.note(
+      'Root certificate store',
+      `connect may have added the Intutic CA (thumbprint ${sha1}); unless an administrator's machine-wide install put it there, remove it with \`certutil -delstore Root ${sha1}\``,
+    )
+  }
+}
+
+/** The Valkey container connect starts when nothing answers on 6379. */
+function planValkeyContainer(plan: DisconnectPlan): void {
+  let name: string
+  try {
+    name = execFileSync('docker', ['ps', '-a', '--filter', 'name=^/intutic-valkey$', '--format', '{{.Names}}'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10_000,
+    }).trim()
+  } catch {
+    return
+  }
+  if (name !== 'intutic-valkey') return
+  plan.change('docker container intutic-valkey', 'stop and remove the Valkey container connect started', async () => {
+    execFileSync('docker', ['rm', '-f', 'intutic-valkey'], { stdio: 'ignore' })
+  })
+}
+
+/** `~/.intutic/config.json`: a later connect must rewrite everything, and must leave a disconnected harness alone. */
+function planConfig(plan: DisconnectPlan, config: IntuticConfig | null, harness: string | undefined): void {
+  if (!config) return
+  const file = node_path.join(getIntuticDir(), 'config.json')
+  if (harness === undefined) {
+    if (config.configVersion === 0 && config.disconnectedHarnesses === undefined) return
+    plan.change(file, 'reset the synced config version, so `intutic connect` writes everything again', async () => {
+      saveConfig({ ...config, configVersion: 0, disconnectedHarnesses: undefined })
+    })
+    return
+  }
+  const id = harness as HarnessType
+  if (!config.harnesses.includes(id) && config.disconnectedHarnesses?.includes(id)) return
+  plan.change(file, `stop connect managing ${harness} (\`intutic init\` adds it back)`, async () => {
+    saveConfig({
+      ...config,
+      harnesses: config.harnesses.filter((h) => h !== id),
+      disconnectedHarnesses: [...new Set([...(config.disconnectedHarnesses ?? []), id])],
+    })
+  })
+}
+
+/**
+ * Whether a failed `security remove-trusted-cert` left the CA trusted: a cancelled
+ * prompt or a timeout did. Only "could not be found" means there was nothing to remove.
+ */
+export function caStaysTrusted(err: unknown): boolean {
+  return !String((err as { stderr?: unknown }).stderr ?? '').includes('could not be found')
+}
+
+/** Long enough to type a password at the keychain prompt; with no screen to show it on, `security` waits forever. */
+const SECURITY_PROMPT_MS = 120_000
+
+/** PIDs of `intutic connect` processes other than this one. */
+function runningConnects(): number[] {
+  if (process.platform === 'win32') return []
+  return getRawProcessList()
+    .filter(({ pid, command }) => pid !== process.pid && /(?:^|[\\/\s])intutic(?:\.js|\.cjs|\.mjs)?\s+connect\b|cli\.js\s+connect\b/.test(command))
+    .map(({ pid }) => pid)
+}
+
+function show(p: string): string {
+  const home = node_os.homedir()
+  return p === home || p.startsWith(home + node_path.sep) ? `~${p.slice(home.length)}` : p
+}
+
+function printPlan(plans: DisconnectPlan[], dryRun: boolean): number {
+  const changes = plans.flatMap((p) => p.visible())
+  const notes = plans.flatMap((p) => p.notes)
+  if (changes.length === 0) {
+    log.info('Nothing to undo: no Intutic changes were found.')
+  } else {
+    log.header(dryRun ? 'intutic disconnect would:' : 'intutic disconnect will:')
+    for (const c of changes) console.log(`  ${c.describe}: ${show(c.path)}`)
+  }
+  if (notes.length > 0) {
+    log.header('Left as they are:')
+    for (const n of notes) console.log(`  ${show(n.path)}: ${n.message}`)
+  }
+  return changes.length
+}
+
+export async function runDisconnect(opts: DisconnectOptions): Promise<void> {
+  // Every harness id is accepted; one connect writes nothing for has nothing to undo.
+  const known: string[] = [...new Set([...Object.values(HarnessType), ...Object.keys(HARNESS_REVERSERS)])]
+  if (opts.harness !== undefined && !known.includes(opts.harness)) {
+    log.error(`Unknown harness "${opts.harness}". Known harnesses: ${known.sort().join(', ')}`)
+    process.exitCode = 1
+    return
+  }
+  const full = opts.harness === undefined
+  const config = loadConfig()
+  const loggedIn = (await loadCredentials()) !== null
+
+  // Services first: while one runs, connect would write the files straight back.
+  const services = new DisconnectPlan()
+  if (full) await planServices(services)
+
+  const files = await planDisconnect({
+    workspaceRoots: await workspaceRoots(config),
+    harnesses: full ? undefined : [opts.harness!],
+    remaining: full ? [] : (config?.harnesses ?? []).filter((h) => h !== opts.harness),
+  })
+
+  const machine = new DisconnectPlan()
+  if (full) {
+    await planCaTrust(machine)
+    planValkeyContainer(machine)
+  }
+  planConfig(machine, config, opts.harness)
+  if (full && !opts.keepLogin) {
+    try {
+      await node_fs.access(getCredentialsPath())
+      machine.change(getCredentialsPath(), 'log out (remove the stored credentials and keychain entry)', clearCredentials)
+    } catch {
+      // Not logged in.
+    }
+  }
+
+  const count = printPlan([services, files, machine], Boolean(opts.dryRun))
+  const others = runningConnects()
+  if (opts.dryRun) {
+    if (others.length > 0) log.warn(`intutic connect is running (pid ${others.join(', ')}); stop it before a real run, or it writes everything back.`)
+    return
+  }
+  if (count === 0) return
+
+  await services.apply()
+  const still = runningConnects()
+  if (still.length > 0) {
+    log.error(`intutic connect is still running (pid ${still.join(', ')}) and would write everything back. Stop it, then run intutic disconnect again.`)
+    process.exitCode = 1
+    return
+  }
+  await files.apply()
+  // Before the credentials go: the control plane stops expecting this
+  // machine's gates, and does not alert on it going quiet. With no login
+  // there is none to tell.
+  if (loggedIn) {
+    const reported = await reportDisconnect({
+      scope: full ? 'machine' : 'harness',
+      harnesses: full ? (config?.harnesses ?? []) : [opts.harness!],
+    })
+    if (reported.reported) {
+      log.info('Told the control plane, so it no longer expects events from this machine.')
+    } else {
+      log.warn(`Could not tell the control plane (${reported.reason}). It may report this machine's gates as silent.`)
+    }
+  }
+  await machine.apply()
+  if (!loggedIn) {
+    log.success(
+      full
+        ? 'Removed. Run `intutic gates install` to install the gates again.'
+        : `Removed ${opts.harness}. Run \`intutic init\`, then \`intutic gates install\`, to gate it again.`,
+    )
+    return
+  }
+  log.success(
+    full
+      ? 'Disconnected. Run `intutic init` and `intutic connect` to connect again.'
+      : `Disconnected ${opts.harness}. Run \`intutic init\` to manage it again.`,
+  )
+}

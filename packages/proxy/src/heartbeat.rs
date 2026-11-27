@@ -1,0 +1,999 @@
+//! heartbeat.rs — self-hosted gateway heartbeat client.
+//!
+//! A self-hosted deployment (Docker/Kubernetes/bare-metal) is
+//! registered from the dashboard, which mints a `gwk_...` token
+//! (the control plane's `POST /api/v1/gateways`).
+//! This module is what makes that registration *live*: once the operator sets
+//! `INTUTIC_GATEWAY_TOKEN`/`INTUTIC_GATEWAY_ID` in the deployment's env, the
+//! proxy periodically calls `POST /api/v1/gateways/:id/heartbeat`
+//! (the control plane) so the org's
+//! dashboard can see the gateway is alive.
+//!
+//! Opt-in, mirroring `gateway.rs`'s absent-flag-means-unchanged-behavior
+//! discipline: a proxy with neither env var set behaves exactly as it does
+//! today (no outbound calls to this module at all). Both `INTUTIC_GATEWAY_TOKEN`
+//! and `INTUTIC_GATEWAY_ID` are required together — the heartbeat endpoint is
+//! per-gateway (`:id` in the URL, checked against the token's resolved
+//! identity server-side), so a token with no known ID has nothing to call.
+//!
+//! v1 is deliberately status-up only: firing a heartbeat means "this process
+//! is alive and looping," nothing more. There is no local health signal
+//! (upstream LiteLLM reachability, active workspace count) collected yet —
+//! `status` is always `"online"`, and `activeWorkspaces`/`litellmReachable`
+//! are omitted rather than reported as a value this code doesn't actually
+//! know. A failed heartbeat call is logged and retried on the next tick; it
+//! never panics or blocks request handling, since a control-plane outage on
+//! the operator's side must not take down request serving on this pod.
+//!
+//! Automatic rotation: each heartbeat response carries
+//! `keyRotatedAt` (the control plane).
+//! When the current token's age reaches `INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS`
+//! (default 30, well under the 24h `previousKeyExpiresAt` grace window used
+//! by a single rotation, so a missed tick is never urgent), this loop calls
+//! `POST .../self-rotate` (`gatewayAuthMiddleware`-gated, same token this
+//! loop already holds) and swaps its in-memory token for the new one. This
+//! extends a long-lived process's effective credential lifetime; BY DEFAULT
+//! it does not persist the new token anywhere durable — a restart boots
+//! from whatever `INTUTIC_GATEWAY_TOKEN` the deployment's env holds, same
+//! limitation the control-plane route's own doc comment states.
+//!
+//! Opt-in exception: if `INTUTIC_GATEWAY_TOKEN_STATE_FILE` is set, every
+//! successful self-rotation also writes the new token to that path
+//! (write-then-rename, so a reader never observes a half-written file).
+//!
+//! Durability across restarts: `from_env()` also READS the state file back,
+//! at proxy startup, if it's set — preferring its contents over
+//! `INTUTIC_GATEWAY_TOKEN` when the two differ, non-empty persisted value
+//! only (ENOENT is silent — first boot, nothing rotated yet; any other read
+//! error warns and falls back to the configured token). It works for any
+//! deployment target that gives the process a durable path at the same
+//! location across restarts: a Docker named volume
+//! (`infra/compose/docker-compose.gateway.yml`), the systemd unit's
+//! `StateDirectory` on bare metal (`infra/systemd/intutic-gateway.service`), or
+//! a Kubernetes `emptyDir` surviving an in-place container restart.
+//!
+//! Kubernetes additionally gets [`crate::k8s_token_writer::K8sSecretWriter`]
+//! — a `emptyDir`/state-file still only survives a restart WITHIN the same
+//! pod, not a reschedule or a rolling redeploy (a new pod is a fresh
+//! filesystem). When `INTUTIC_GATEWAY_K8S_SECRET_NAME` is set, every
+//! successful self-rotation additionally PATCHes that Secret via the
+//! in-cluster K8s API — independent of, not a replacement for, the
+//! state-file write; a Kubernetes deployment sets both.
+//!
+//! Live config: each heartbeat response also carries
+//! `desiredConfigVersion`, a counter the control plane bumps whenever an
+//! owner or admin changes this gateway's config (`intutic gateway config
+//! set`, i.e. `PATCH /api/v1/gateways/:id/config`). When it differs from the
+//! version this process last applied (or nothing has been applied yet, so a
+//! restarted proxy pulls once), the loop pulls `GET
+//! /api/v1/gateways/:id/config` with the same token and swaps the result into
+//! the running proxy (`gateway::apply_remote_gateway_config`): the next
+//! request is checked against it, nothing restarts. The applied version goes
+//! back in the next heartbeat as `appliedConfigVersion`, which is how the
+//! dashboard shows applied against desired. A failed pull, or a config that
+//! does not parse, leaves the current config in place and is retried on the
+//! next beat.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+/// How often the client proactively refreshes its own token, absent an
+/// operator override. Far below the 24h rotation grace period — this is
+/// about spreading routine rotations out, not racing an expiry.
+const DEFAULT_ROTATION_INTERVAL_DAYS: u64 = 30;
+
+/// Heartbeat client configuration, built once at boot from the environment.
+#[derive(Debug, Clone)]
+pub struct HeartbeatConfig {
+    pub gateway_id: String,
+    pub gateway_token: String,
+    pub control_plane_url: String,
+    pub interval: Duration,
+    /// `None` means automatic self-rotation is off (operator set
+    /// `INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS=0` explicitly) — heartbeating
+    /// still runs, only the age-triggered `POST .../self-rotate` call is
+    /// skipped. The operator's manual `intutic gateway rotate` flow is
+    /// unaffected either way.
+    pub rotation_interval: Option<Duration>,
+    /// `INTUTIC_GATEWAY_TOKEN_STATE_FILE`, if set — see module doc.
+    pub token_state_file: Option<PathBuf>,
+    /// Set when `INTUTIC_GATEWAY_K8S_SECRET_NAME` is configured AND the pod's
+    /// ServiceAccount is actually mounted — see `k8s_token_writer` module doc.
+    pub k8s_secret_writer: Option<crate::k8s_token_writer::K8sSecretWriter>,
+}
+
+impl HeartbeatConfig {
+    /// `None` means the heartbeat client stays off — either because the
+    /// operator hasn't registered this deployment as a self-hosted gateway
+    /// (the common case: SaaS gateway, single-tenant local proxy, enterprise
+    /// deployment that hasn't opted in yet), or because the env is only
+    /// partially configured, which is logged as a warning rather than
+    /// silently ignored so a typo doesn't read as "heartbeat just isn't
+    /// running for no reason."
+    pub fn from_env() -> Option<Self> {
+        let mut gateway_token = std::env::var("INTUTIC_GATEWAY_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())?;
+
+        let gateway_id = match std::env::var("INTUTIC_GATEWAY_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(id) => id,
+            None => {
+                tracing::warn!(
+                    "INTUTIC_GATEWAY_TOKEN is set but INTUTIC_GATEWAY_ID is not — self-hosted \
+                     gateway heartbeat disabled. Both are required (see the instructions \
+                     returned when the gateway was registered from the dashboard)."
+                );
+                return None;
+            }
+        };
+
+        let control_plane_url = match std::env::var("CONTROL_PLANE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(u) => u,
+            None => {
+                tracing::warn!(
+                    "INTUTIC_GATEWAY_TOKEN is set but CONTROL_PLANE_URL is not — self-hosted \
+                     gateway heartbeat disabled. Set CONTROL_PLANE_URL to the org's Intutic \
+                     control plane (e.g. https://api.intutic.ai)."
+                );
+                return None;
+            }
+        };
+
+        let interval_secs = std::env::var("INTUTIC_GATEWAY_HEARTBEAT_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            // Well under GATEWAY_HEARTBEAT_TTL=90s on the control-plane side
+            // (the control plane) so a
+            // single dropped tick doesn't flip the dashboard to unreachable.
+            .unwrap_or(30);
+
+        let rotation_interval = match std::env::var("INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(0) => None, // explicit opt-out
+            Some(days) => Some(Duration::from_secs(days * 86_400)),
+            // Unset or unparseable both fall back to the default rather than
+            // silently disabling rotation on a typo — mirrors the interval
+            // guard above.
+            None => Some(Duration::from_secs(DEFAULT_ROTATION_INTERVAL_DAYS * 86_400)),
+        };
+
+        let token_state_file = std::env::var("INTUTIC_GATEWAY_TOKEN_STATE_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from);
+
+        if let Some(path) = &token_state_file {
+            match std::fs::read_to_string(path) {
+                Ok(raw) => {
+                    let persisted = raw.trim();
+                    if !persisted.is_empty() && persisted != gateway_token {
+                        tracing::info!(
+                            path = %path.display(),
+                            "Booting with a self-rotated gateway token from state file, newer than the configured INTUTIC_GATEWAY_TOKEN"
+                        );
+                        gateway_token = persisted.to_string();
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // First boot, or nothing has self-rotated yet — expected, silent.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to read gateway token state file -- falling back to the configured INTUTIC_GATEWAY_TOKEN"
+                    );
+                }
+            }
+        }
+
+        let k8s_secret_writer = crate::k8s_token_writer::K8sSecretWriter::from_env();
+
+        Some(Self {
+            gateway_id,
+            gateway_token,
+            control_plane_url,
+            interval: Duration::from_secs(interval_secs),
+            rotation_interval,
+            token_state_file,
+            k8s_secret_writer,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct HeartbeatBody {
+    status: &'static str,
+    #[serde(rename = "proxyVersion")]
+    proxy_version: &'static str,
+    #[serde(rename = "uptimeSeconds")]
+    uptime_seconds: u64,
+    /// Status leg (gateway-mode only): a gateway-level
+    /// aggregate SOP count across every workspace this process currently
+    /// holds a fresh cache entry for — see `sops::sop_status_snapshot`.
+    /// `skip_serializing_if` omits the key entirely rather than sending a
+    /// JSON `null` when unavailable, matching this struct's existing
+    /// discipline for optional fields (`activeWorkspaces`/`litellmReachable`
+    /// don't exist as fields here at all, for the same reason).
+    #[serde(rename = "sopCount", skip_serializing_if = "Option::is_none")]
+    sop_count: Option<u32>,
+    #[serde(rename = "sopHash", skip_serializing_if = "Option::is_none")]
+    sop_hash: Option<String>,
+    /// The remote config version this process is running, once it has
+    /// pulled one. Omitted before the first pull, which the status route
+    /// reports as "not reported" rather than as version 0.
+    #[serde(
+        rename = "appliedConfigVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    applied_config_version: Option<u64>,
+}
+
+/// Pure — no I/O, no global state — so the payload shape is unit-testable
+/// without a running server, same discipline as `gateway::token_allowed`.
+/// SOP status is passed in rather than read from inside this function, so
+/// purity holds regardless of what `sops::sop_status_snapshot` does.
+fn build_heartbeat_body(
+    uptime_seconds: u64,
+    sop_count: Option<u32>,
+    sop_hash: Option<String>,
+    applied_config_version: Option<u64>,
+) -> HeartbeatBody {
+    HeartbeatBody {
+        status: "online",
+        proxy_version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds,
+        sop_count,
+        sop_hash,
+        applied_config_version,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatResponse {
+    #[serde(rename = "keyRotatedAt")]
+    key_rotated_at: Option<String>,
+    /// Absent from a control plane that predates config versions: then the
+    /// loop never pulls.
+    #[serde(rename = "desiredConfigVersion")]
+    desired_config_version: Option<u64>,
+}
+
+/// `GET /api/v1/gateways/:id/config`. Both fields are required: a body
+/// missing either is a failed pull, never a partial apply.
+#[derive(Debug, Deserialize)]
+struct GatewayConfigResponse {
+    #[serde(rename = "configVersion")]
+    config_version: u64,
+    config: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Pure: does this beat pull the config? Whenever the desired version differs
+/// from the applied one. `applied` is `None` until the first pull succeeds, so
+/// a booted or restarted proxy pulls once whatever the desired version is.
+/// A desired version LOWER than the applied one is not stale: the control
+/// plane's counter lives in Valkey and starts again from 0 if that key is
+/// lost, while the config itself is in Postgres. Ignoring it would leave the
+/// proxy deaf to every change until the new counter climbed past the old one.
+fn config_pull_due(desired: Option<u64>, applied: Option<u64>) -> bool {
+    match (desired, applied) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(desired), Some(applied)) => desired != applied,
+    }
+}
+
+/// What the loop knows about the remote config it has applied.
+#[derive(Debug, Default)]
+struct ConfigReconciler {
+    applied_version: Option<u64>,
+    /// Unknown fields already warned about: a newer control plane's field is
+    /// logged once per process, not on every pull.
+    logged_unknown: HashSet<String>,
+    /// Whether a version-counter reset has been warned about (once per
+    /// process).
+    warned_reset: bool,
+}
+
+impl ConfigReconciler {
+    async fn reconcile(
+        &mut self,
+        http_client: &reqwest::Client,
+        config_url: &str,
+        token: &str,
+        gateway_id: &str,
+        desired: Option<u64>,
+    ) {
+        if !config_pull_due(desired, self.applied_version) {
+            return;
+        }
+        let fetched = match fetch_gateway_config(http_client, config_url, token).await {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                tracing::warn!(
+                    gateway_id = %gateway_id,
+                    error = %e,
+                    "gateway config pull failed — keeping the current config, will retry next tick"
+                );
+                return;
+            }
+        };
+        // The version it already runs: nothing to apply.
+        if self.applied_version == Some(fetched.config_version) {
+            return;
+        }
+        let (remote, unknown) =
+            match crate::gateway::RemoteGatewayConfig::from_json(&fetched.config) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    tracing::warn!(
+                        gateway_id = %gateway_id,
+                        config_version = fetched.config_version,
+                        error = %e,
+                        "gateway config rejected — keeping the current config, will retry next tick"
+                    );
+                    return;
+                }
+            };
+        for field in unknown {
+            if self.logged_unknown.insert(field.clone()) {
+                tracing::warn!(
+                    gateway_id = %gateway_id,
+                    field = %field,
+                    "gateway config has a field this proxy version does not apply — ignored"
+                );
+            }
+        }
+        // Lower than what it runs: the control plane's counter was reset. The
+        // config it serves is still the current one, so it is applied and its
+        // version adopted, and the proxy follows the new counter from here.
+        if let Some(applied) = self
+            .applied_version
+            .filter(|&applied| fetched.config_version < applied)
+        {
+            if !self.warned_reset {
+                self.warned_reset = true;
+                tracing::warn!(
+                    gateway_id = %gateway_id,
+                    applied_version = applied,
+                    config_version = fetched.config_version,
+                    "gateway config version went backwards — the control plane's counter was reset; applying its config and adopting its version"
+                );
+            }
+        }
+        let live = crate::gateway::apply_remote_gateway_config(&remote);
+        self.applied_version = Some(fetched.config_version);
+        tracing::info!(
+            gateway_id = %gateway_id,
+            config_version = fetched.config_version,
+            require_vk = live.require_vk,
+            require_provisioned_key = live.require_provisioned_key,
+            provisioned_key_paid_only = live.provisioned_key_paid_only,
+            "gateway config applied"
+        );
+    }
+}
+
+async fn fetch_gateway_config(
+    http_client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<GatewayConfigResponse, String> {
+    let resp = http_client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("control plane answered {}", resp.status()));
+    }
+    resp.json::<GatewayConfigResponse>()
+        .await
+        .map_err(|e| format!("unparsable body: {e}"))
+}
+
+#[derive(Debug, Deserialize)]
+struct SelfRotateResponse {
+    token: String,
+}
+
+/// Pure — given the heartbeat response's `keyRotatedAt` and the configured
+/// rotation interval, decides whether this tick should call `self-rotate`.
+/// A missing or unparseable timestamp reads as "don't rotate" rather than
+/// "rotate immediately" — a control-plane response shape this code doesn't
+/// recognize should never be interpreted as license to mutate a credential.
+/// Same for a negative age (clock skew): `to_std()` fails on a negative
+/// `chrono::Duration`, which this treats as "not yet due," not an error.
+fn should_self_rotate(key_rotated_at: Option<&str>, rotation_interval: Duration) -> bool {
+    let Some(ts) = key_rotated_at else {
+        return false;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    age.to_std()
+        .map(|age| age >= rotation_interval)
+        .unwrap_or(false)
+}
+
+/// Writes `token` to `path` via write-then-rename: the temp file is written
+/// fully, then renamed into place, so a concurrent reader (another proxy
+/// process starting up and reading it in `from_env()`) never observes a
+/// partially written token. The temp path lives beside the target so the
+/// rename stays within one filesystem (a cross-filesystem rename is not atomic
+/// on every OS).
+async fn write_token_state_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    tokio::fs::write(&tmp_path, token).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
+/// Spawns the background heartbeat loop. Fire-and-forget: the returned
+/// `JoinHandle` is intentionally dropped by callers (`main.rs` doesn't need
+/// to await or cancel it — it runs for the lifetime of the process, same as
+/// the guard-liveness probe loop it sits next to).
+pub fn spawn_heartbeat_loop(http_client: Arc<reqwest::Client>, cfg: HeartbeatConfig) {
+    let heartbeat_url = format!(
+        "{}/api/v1/gateways/{}/heartbeat",
+        cfg.control_plane_url.trim_end_matches('/'),
+        cfg.gateway_id
+    );
+    let self_rotate_url = format!(
+        "{}/api/v1/gateways/{}/self-rotate",
+        cfg.control_plane_url.trim_end_matches('/'),
+        cfg.gateway_id
+    );
+    let config_url = format!(
+        "{}/api/v1/gateways/{}/config",
+        cfg.control_plane_url.trim_end_matches('/'),
+        cfg.gateway_id
+    );
+    let gateway_id = cfg.gateway_id.clone();
+    let rotation_interval = cfg.rotation_interval;
+    let token_state_file = cfg.token_state_file.clone();
+    let k8s_secret_writer = cfg.k8s_secret_writer.clone();
+    let started = Instant::now();
+    // The token changes over the process's lifetime once self-rotation
+    // fires, so it can't stay a plain `String` captured by the loop —
+    // every tick reads the latest value, and a successful self-rotate
+    // writes the new one back before the next tick reads it.
+    let current_token = Arc::new(RwLock::new(cfg.gateway_token));
+    let mut reconciler = ConfigReconciler::default();
+
+    tokio::spawn(async move {
+        // The first tick fires at once: a starting proxy reports in and pulls
+        // its remote config straight away, rather than serving one full
+        // interval on its boot config alone.
+        let mut interval = tokio::time::interval(cfg.interval);
+        loop {
+            interval.tick().await;
+            let sop_status = crate::sops::sop_status_snapshot();
+            let body = build_heartbeat_body(
+                started.elapsed().as_secs(),
+                sop_status.as_ref().map(|s| s.sop_count),
+                sop_status.as_ref().map(|s| s.sop_hash.clone()),
+                reconciler.applied_version,
+            );
+            let token = current_token.read().await.clone();
+            match http_client
+                .post(&heartbeat_url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::debug!(gateway_id = %gateway_id, "gateway heartbeat sent");
+                    let parsed = match resp.json::<HeartbeatResponse>().await {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            tracing::warn!(
+                                gateway_id = %gateway_id,
+                                error = %e,
+                                "heartbeat response body unparsable — skipping this tick's config and rotation-age checks"
+                            );
+                            continue;
+                        }
+                    };
+                    // Before any rotation below, so the pull uses the token
+                    // this heartbeat just authenticated with.
+                    reconciler
+                        .reconcile(
+                            &http_client,
+                            &config_url,
+                            &token,
+                            &gateway_id,
+                            parsed.desired_config_version,
+                        )
+                        .await;
+                    if let Some(rotation_interval) = rotation_interval {
+                        if should_self_rotate(parsed.key_rotated_at.as_deref(), rotation_interval) {
+                            self_rotate(
+                                &http_client,
+                                &self_rotate_url,
+                                &current_token,
+                                &gateway_id,
+                                token_state_file.as_deref(),
+                                k8s_secret_writer.as_ref(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(
+                        gateway_id = %gateway_id,
+                        status = %resp.status(),
+                        "gateway heartbeat rejected by control plane — will retry next tick"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        gateway_id = %gateway_id,
+                        error = %e,
+                        "gateway heartbeat request failed — will retry next tick"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Calls `POST .../self-rotate` and, on success, swaps the loop's in-memory
+/// token for the new one. A failure here is never urgent enough to log
+/// above `warn` or to interrupt heartbeating — the current token (or, if
+/// this races a *previous* rotation's grace period, still-valid old token)
+/// keeps authenticating, and the age check simply fires again next tick.
+async fn self_rotate(
+    http_client: &reqwest::Client,
+    url: &str,
+    current_token: &RwLock<String>,
+    gateway_id: &str,
+    token_state_file: Option<&std::path::Path>,
+    k8s_secret_writer: Option<&crate::k8s_token_writer::K8sSecretWriter>,
+) {
+    let token = current_token.read().await.clone();
+    match http_client.post(url).bearer_auth(&token).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<SelfRotateResponse>().await {
+            Ok(parsed) => {
+                *current_token.write().await = parsed.token.clone();
+                tracing::info!(gateway_id = %gateway_id, "gateway token self-rotated");
+                if let Some(path) = token_state_file {
+                    if let Err(e) = write_token_state_file(path, &parsed.token).await {
+                        // The rotation itself already succeeded and the
+                        // in-memory token is updated -- this process keeps
+                        // working. Only a future restart (reading this file
+                        // stale or missing) is affected, so a warn is
+                        // proportionate, not a reason to treat the
+                        // rotation as failed.
+                        tracing::warn!(
+                            gateway_id = %gateway_id,
+                            path = %path.display(),
+                            error = %e,
+                            "failed to persist self-rotated token to state file — a restart before the next successful write will use a stale token"
+                        );
+                    }
+                }
+                // Independent of the state-file write above: a
+                // Kubernetes pod reschedule or rolling redeploy gets a fresh
+                // filesystem, so only a Secret patch survives that case. Same
+                // proportionate-warn posture -- the rotation already
+                // succeeded and this process keeps serving either way.
+                if let Some(writer) = k8s_secret_writer {
+                    if let Err(e) = writer.patch_token(&parsed.token).await {
+                        tracing::warn!(
+                            gateway_id = %gateway_id,
+                            error = %e,
+                            "failed to patch the Kubernetes Secret with the self-rotated token — a pod reschedule before the next successful patch will boot with a stale token"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    gateway_id = %gateway_id,
+                    error = %e,
+                    "self-rotate response body unparsable — token not updated, will retry next tick"
+                );
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(
+                gateway_id = %gateway_id,
+                status = %resp.status(),
+                "self-rotate request rejected — will retry next tick"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                gateway_id = %gateway_id,
+                error = %e,
+                "self-rotate request failed — will retry next tick"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_body_reports_online_and_real_version() {
+        let body = build_heartbeat_body(42, None, None, None);
+        assert_eq!(body.status, "online");
+        assert_eq!(body.proxy_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(body.uptime_seconds, 42);
+    }
+
+    #[test]
+    fn heartbeat_body_serializes_to_the_route_schema() {
+        // Matches heartbeatSchema in
+        // The control plane —
+        // status ∈ {"online","degraded"}, proxyVersion/uptimeSeconds present.
+        let json = serde_json::to_value(build_heartbeat_body(7, None, None, None)).unwrap();
+        assert_eq!(json["status"], "online");
+        assert!(json["proxyVersion"].is_string());
+        assert_eq!(json["uptimeSeconds"], 7);
+    }
+
+    #[test]
+    fn heartbeat_body_omits_sop_fields_when_none() {
+        let json = serde_json::to_value(build_heartbeat_body(1, None, None, None)).unwrap();
+        assert!(
+            json.get("sopCount").is_none(),
+            "None must omit the key, not null it"
+        );
+        assert!(
+            json.get("sopHash").is_none(),
+            "None must omit the key, not null it"
+        );
+    }
+
+    #[test]
+    fn heartbeat_body_includes_sop_fields_when_present() {
+        let json = serde_json::to_value(build_heartbeat_body(
+            7,
+            Some(3),
+            Some("abc123".into()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(json["sopCount"], 3);
+        assert_eq!(json["sopHash"], "abc123");
+    }
+
+    #[test]
+    fn heartbeat_body_reports_the_applied_config_version_once_there_is_one() {
+        let before = serde_json::to_value(build_heartbeat_body(1, None, None, None)).unwrap();
+        assert!(
+            before.get("appliedConfigVersion").is_none(),
+            "nothing pulled yet must omit the key, not report version 0"
+        );
+        let after = serde_json::to_value(build_heartbeat_body(1, None, None, Some(4))).unwrap();
+        assert_eq!(after["appliedConfigVersion"], 4);
+        let zero = serde_json::to_value(build_heartbeat_body(1, None, None, Some(0))).unwrap();
+        assert_eq!(zero["appliedConfigVersion"], 0);
+    }
+
+    #[test]
+    fn config_pull_is_due_once_at_boot_then_whenever_the_desired_version_differs() {
+        // An older control plane sends no version: never pull.
+        assert!(!config_pull_due(None, None));
+        assert!(!config_pull_due(None, Some(3)));
+        // Nothing applied yet: pull, even at version 0.
+        assert!(config_pull_due(Some(0), None));
+        assert!(config_pull_due(Some(5), None));
+        // Ahead: pull. Behind (a reset counter): pull. Equal: don't.
+        assert!(config_pull_due(Some(4), Some(3)));
+        assert!(config_pull_due(Some(2), Some(3)));
+        assert!(config_pull_due(Some(0), Some(3)));
+        assert!(!config_pull_due(Some(3), Some(3)));
+    }
+
+    #[test]
+    fn config_response_needs_both_the_version_and_the_config_object() {
+        let ok: GatewayConfigResponse = serde_json::from_value(
+            serde_json::json!({ "configVersion": 2, "config": { "requireVk": true } }),
+        )
+        .unwrap();
+        assert_eq!(ok.config_version, 2);
+        assert_eq!(ok.config["requireVk"], true);
+        for partial in [
+            serde_json::json!({ "config": {} }),
+            serde_json::json!({ "configVersion": 2 }),
+            serde_json::json!({ "configVersion": "2", "config": {} }),
+            serde_json::json!({ "configVersion": 2, "config": [] }),
+        ] {
+            assert!(
+                serde_json::from_value::<GatewayConfigResponse>(partial.clone()).is_err(),
+                "{partial}"
+            );
+        }
+    }
+
+    // Every scenario below touches process-global env vars, so — same
+    // discipline as gateway.rs's env_var_scenarios_run_sequentially_to_avoid_a_cross_test_race
+    // — they're consolidated into one #[test] rather than split out, since
+    // cargo runs tests in parallel threads by default and concurrent
+    // set_var/remove_var on the same keys races.
+    #[test]
+    fn from_env_scenarios_run_sequentially_to_avoid_a_cross_test_race() {
+        // 1. Neither var set → disabled, the common case.
+        std::env::remove_var("INTUTIC_GATEWAY_TOKEN");
+        std::env::remove_var("INTUTIC_GATEWAY_ID");
+        std::env::remove_var("CONTROL_PLANE_URL");
+        assert!(HeartbeatConfig::from_env().is_none());
+
+        // 2. Only the token set (ID and control-plane URL both missing) →
+        //    disabled. Isolates the token-alone case before either of the
+        //    other two guards could independently explain a None.
+        std::env::set_var("INTUTIC_GATEWAY_TOKEN", "gwk_test_token");
+        assert!(HeartbeatConfig::from_env().is_none());
+
+        // 3. Token + control-plane URL set, ID still missing → disabled.
+        //    CONTROL_PLANE_URL is deliberately set *before* this assertion
+        //    (unlike step 2) so a broken/removed ID check is the only thing
+        //    that could make this return None — if CONTROL_PLANE_URL were
+        //    still unset here, that guard alone would produce the same
+        //    None and this assertion would pass even with the ID check
+        //    deleted entirely.
+        std::env::set_var("CONTROL_PLANE_URL", "https://cp.example.com");
+        assert!(HeartbeatConfig::from_env().is_none());
+
+        // 4. All three set → enabled, with the expected default interval.
+        std::env::set_var("INTUTIC_GATEWAY_ID", "gw_test123");
+        let cfg = HeartbeatConfig::from_env().expect("fully configured, should be Some");
+        assert_eq!(cfg.gateway_id, "gw_test123");
+        assert_eq!(cfg.gateway_token, "gwk_test_token");
+        assert_eq!(cfg.control_plane_url, "https://cp.example.com");
+        assert_eq!(cfg.interval, Duration::from_secs(30));
+        assert_eq!(
+            cfg.rotation_interval,
+            Some(Duration::from_secs(DEFAULT_ROTATION_INTERVAL_DAYS * 86_400))
+        );
+        assert_eq!(cfg.token_state_file, None);
+
+        // 5. Custom interval respected; a non-numeric value falls back to
+        //    the default rather than panicking or disabling the client.
+        std::env::set_var("INTUTIC_GATEWAY_HEARTBEAT_INTERVAL_SECS", "10");
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().interval,
+            Duration::from_secs(10)
+        );
+        std::env::set_var("INTUTIC_GATEWAY_HEARTBEAT_INTERVAL_SECS", "not-a-number");
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().interval,
+            Duration::from_secs(30)
+        );
+        std::env::set_var("INTUTIC_GATEWAY_HEARTBEAT_INTERVAL_SECS", "0");
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().interval,
+            Duration::from_secs(30)
+        );
+
+        // 6. rotation_interval: explicit "0" opts out entirely; a custom
+        //    value is honored; cleanup restores the default so this doesn't
+        //    leak into a later test in this same #[test] if reordered.
+        std::env::set_var("INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS", "0");
+        assert_eq!(HeartbeatConfig::from_env().unwrap().rotation_interval, None);
+        std::env::set_var("INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS", "7");
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().rotation_interval,
+            Some(Duration::from_secs(7 * 86_400))
+        );
+        std::env::remove_var("INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS");
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().rotation_interval,
+            Some(Duration::from_secs(DEFAULT_ROTATION_INTERVAL_DAYS * 86_400))
+        );
+
+        // 7. token_state_file: unset means None (already asserted above at
+        //    step 4); a set value is picked up verbatim when the file does
+        //    not exist (ENOENT falls back silently, gateway_token unchanged
+        //    — see step 9 below for the explicit assertion of that).
+        std::env::set_var(
+            "INTUTIC_GATEWAY_TOKEN_STATE_FILE",
+            "/tmp/gateway-token-state",
+        );
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().token_state_file,
+            Some(PathBuf::from("/tmp/gateway-token-state"))
+        );
+        std::env::remove_var("INTUTIC_GATEWAY_TOKEN_STATE_FILE");
+
+        // 8. A state file holding a token that differs from
+        //    INTUTIC_GATEWAY_TOKEN is preferred.
+        //    Same directory-mutation discipline as write_token_state_file's
+        //    own tests: a dedicated temp subdir, cleaned before and after.
+        let state_dir = std::env::temp_dir().join("intutic-heartbeat-test-from-env-state-file");
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("gateway-token");
+
+        std::fs::write(&state_path, "gwk_self_rotated\n").unwrap(); // trailing newline must be trimmed
+        std::env::set_var("INTUTIC_GATEWAY_TOKEN_STATE_FILE", &state_path);
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().gateway_token,
+            "gwk_self_rotated"
+        );
+
+        // 9. Missing file → falls back silently to the configured token
+        //    (first boot / nothing has rotated yet).
+        std::fs::remove_file(&state_path).unwrap();
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().gateway_token,
+            "gwk_test_token"
+        );
+
+        // 10. Unreadable path (a directory, not a file — IsADirectory is a
+        //     non-ENOENT read error) → warns and falls back, same outcome
+        //     as step 9 but exercising the other error branch.
+        std::fs::create_dir_all(&state_path).unwrap();
+        assert_eq!(
+            HeartbeatConfig::from_env().unwrap().gateway_token,
+            "gwk_test_token"
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::env::remove_var("INTUTIC_GATEWAY_TOKEN_STATE_FILE");
+
+        // Clean up so other tests in the binary that read these same env
+        // vars (there are none today, but future ones) start from a known
+        // state.
+        std::env::remove_var("INTUTIC_GATEWAY_TOKEN");
+        std::env::remove_var("INTUTIC_GATEWAY_ID");
+        std::env::remove_var("CONTROL_PLANE_URL");
+        std::env::remove_var("INTUTIC_GATEWAY_HEARTBEAT_INTERVAL_SECS");
+        std::env::remove_var("INTUTIC_GATEWAY_ROTATION_INTERVAL_DAYS");
+        std::env::remove_var("INTUTIC_GATEWAY_TOKEN_STATE_FILE");
+    }
+
+    #[test]
+    fn heartbeat_url_joins_control_plane_url_and_gateway_id_correctly() {
+        // Not exercised by from_env directly (the URL is built inside
+        // spawn_heartbeat_loop), so assert the join logic itself: a trailing
+        // slash on CONTROL_PLANE_URL must not produce a double slash.
+        let joined = format!(
+            "{}/api/v1/gateways/{}/heartbeat",
+            "https://cp.example.com/".trim_end_matches('/'),
+            "gw_abc"
+        );
+        assert_eq!(
+            joined,
+            "https://cp.example.com/api/v1/gateways/gw_abc/heartbeat"
+        );
+    }
+
+    #[test]
+    fn self_rotate_url_joins_control_plane_url_and_gateway_id_correctly() {
+        let joined = format!(
+            "{}/api/v1/gateways/{}/self-rotate",
+            "https://cp.example.com/".trim_end_matches('/'),
+            "gw_abc"
+        );
+        assert_eq!(
+            joined,
+            "https://cp.example.com/api/v1/gateways/gw_abc/self-rotate"
+        );
+    }
+
+    #[test]
+    fn should_self_rotate_is_false_when_key_rotated_at_is_missing_or_unparseable() {
+        let interval = Duration::from_secs(30 * 86_400);
+        assert!(!should_self_rotate(None, interval));
+        assert!(!should_self_rotate(Some("not-a-timestamp"), interval));
+    }
+
+    #[test]
+    fn should_self_rotate_is_false_for_a_fresh_key_and_true_once_the_interval_elapses() {
+        let interval = Duration::from_secs(30 * 86_400);
+
+        let fresh = chrono::Utc::now();
+        assert!(!should_self_rotate(Some(&fresh.to_rfc3339()), interval));
+
+        let stale = chrono::Utc::now() - chrono::Duration::days(31);
+        assert!(should_self_rotate(Some(&stale.to_rfc3339()), interval));
+
+        // Exactly at the boundary counts as due (>=), not "not yet."
+        let boundary =
+            chrono::Utc::now() - chrono::Duration::days(30) - chrono::Duration::seconds(5);
+        assert!(should_self_rotate(Some(&boundary.to_rfc3339()), interval));
+    }
+
+    #[test]
+    fn should_self_rotate_treats_a_future_timestamp_as_not_due_rather_than_erroring() {
+        // Clock skew / control-plane clock ahead of this process — a
+        // negative age must never be misread as "very much overdue."
+        let future = chrono::Utc::now() + chrono::Duration::days(1);
+        assert!(!should_self_rotate(
+            Some(&future.to_rfc3339()),
+            Duration::from_secs(30 * 86_400)
+        ));
+    }
+
+    #[test]
+    fn heartbeat_response_deserializes_key_rotated_at() {
+        let json = serde_json::json!({ "ok": true, "desiredConfigVersion": 0, "keyRotatedAt": "2026-08-13T00:00:00.000Z" });
+        let parsed: HeartbeatResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            parsed.key_rotated_at.as_deref(),
+            Some("2026-08-13T00:00:00.000Z")
+        );
+        assert_eq!(parsed.desired_config_version, Some(0));
+
+        let json_null =
+            serde_json::json!({ "ok": true, "desiredConfigVersion": 0, "keyRotatedAt": null });
+        let parsed_null: HeartbeatResponse = serde_json::from_value(json_null).unwrap();
+        assert_eq!(parsed_null.key_rotated_at, None);
+
+        // A control plane that predates config versions omits the field.
+        let older: HeartbeatResponse =
+            serde_json::from_value(serde_json::json!({ "ok": true, "keyRotatedAt": null }))
+                .unwrap();
+        assert_eq!(older.desired_config_version, None);
+    }
+
+    #[tokio::test]
+    async fn write_token_state_file_creates_parent_dirs_and_writes_the_token() {
+        let dir = std::env::temp_dir().join("intutic-heartbeat-test-creates-parent-dirs");
+        let path = dir.join("nested").join("gateway-token");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+
+        write_token_state_file(&path, "gwk_abc123").await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents, "gwk_abc123");
+        // The write-then-rename temp file must not be left behind.
+        assert!(!path.with_extension("tmp").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn write_token_state_file_overwrites_an_existing_file() {
+        let dir = std::env::temp_dir().join("intutic-heartbeat-test-overwrites");
+        let path = dir.join("gateway-token");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(&path, "gwk_stale").await.unwrap();
+
+        write_token_state_file(&path, "gwk_fresh").await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents, "gwk_fresh");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn self_rotate_response_deserializes_the_new_token() {
+        let json = serde_json::json!({
+            "gatewayId": "gw_abc",
+            "token": "gwk_newtoken",
+            "previousTokenValidUntil": "2026-08-14T00:00:00.000Z",
+        });
+        let parsed: SelfRotateResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.token, "gwk_newtoken");
+    }
+}

@@ -1,0 +1,1155 @@
+/**
+ * `@ai-sdk/harness` adapter: `intuticApprovalResponder()`, `intuticSubmitApprovals()`,
+ * `intuticStaticApprovals()`, `recommendedHarnessSettings()`, and
+ * `intuticSandboxBootstrap()`.
+ *
+ * `@intutic/gate/harness` — the same idea `vercel.ts` implements for the base
+ * `ai` package (wrap the framework's own veto point around this package's
+ * `Gate.guard()`), reshaped for Vercel's sandboxed coding-agent runtime,
+ * whose veto surface is materially different from `generateText`'s.
+ *
+ * ## Confirmed against a real install
+ *
+ * `@ai-sdk/harness@1.0.75` (plus `@ai-sdk/harness-claude-code@1.0.78` and
+ * `@ai-sdk/harness-grok-build@1.0.12`) were installed and their shipped
+ * `.d.ts`/compiled source read directly (not inferred from docs alone);
+ * points 1-3 re-read on `@ai-sdk/harness@1.0.138` (the current devDependency,
+ * on `ai@7.0.127`) — only the continuation element type changed (point 2):
+ *
+ * 1. **The `toolApproval` setting is STATIC.** `HarnessAgentSettings.toolApproval`
+ *    is `HarnessAgentToolApprovalConfiguration = Readonly<Record<string,
+ *    ToolApprovalStatus>>` (`dist/agent/index.d.ts`), whose own doc comment says
+ *    it mirrors "AI SDK `toolApproval` object configuration for host-executed
+ *    tools, **without callback support**". `vercel.ts`'s callback-shaped
+ *    `intuticToolApproval()` therefore does NOT apply here — there is no place
+ *    to hang a function. Per-call gating instead goes through the approval
+ *    FLOW: mark tools `'user-approval'` (see {@link intuticStaticApprovals}),
+ *    let the turn pause, and answer each pending approval with the gate
+ *    (see {@link intuticApprovalResponder}).
+ * 2. **The portable answer path is continuation-based.**
+ *    `continueTurn`/`continueGenerate`/`continueStream` accept
+ *    `toolApprovalContinuations` (dist/agent/index.d.ts) — in 1.0.75 an array
+ *    of `HarnessAgentToolApprovalContinuation` (`{ approvalResponse, toolCall
+ *    }`), since 1.0.101 an array of bare `ToolApprovalResponse` parts (the
+ *    old type is no longer exported in 1.0.138); see
+ *    {@link HarnessToolApprovalContinuation} for how one value serves both. The adapter-session
+ *    method `session.submitToolApproval?({approvalId, approved, reason})` is
+ *    OPTIONAL (`dist/index.d.ts` — `HarnessV1PromptControl`), and support
+ *    genuinely varies per adapter: `@ai-sdk/harness-claude-code@1.0.78`
+ *    implements it; `@ai-sdk/harness-grok-build@1.0.12` does not (zero
+ *    occurrences in its shipped dist). This module therefore builds the
+ *    responder on the continuation path and treats `submitToolApproval` as an
+ *    optimization when present ({@link intuticSubmitApprovals}).
+ * 3. **Built-in sandbox tools are NOT governed by `toolApproval` at all.**
+ *    They are governed by `permissionMode: 'allow-reads' | 'allow-edits'
+ *    | 'allow-all'`, which **defaults to `'allow-all'`** — the shipped doc
+ *    comment says so verbatim: "Defaults to `'allow-all'`, preserving the
+ *    existing bypass-permissions behavior unless users opt in." Under
+ *    `'allow-all'` nothing pauses. Under the stricter modes the mode decides
+ *    WHICH built-ins pause, and each paused call is then a genuine per-call
+ *    approval this gate answers: the
+ *    `@ai-sdk/harness-claude-code` bridge (`dist/bridge/index.mjs`,
+ *    `createPermissionSettings`/`nativeToolRequiresApproval`) adds `ask` rules
+ *    for bash-kind tools (`Bash`, `Monitor`) under `'allow-edits'`, and for
+ *    edit- and bash-kind tools under `'allow-reads'`, emitting a
+ *    `tool-approval-request` and blocking on the host's answer;
+ *    `@ai-sdk/harness/agent` records it as a pending approval with
+ *    `kind: 'builtin'`, pauses the turn, and delivers the continuation's
+ *    decision through the adapter's `submitToolApproval`. What never pauses:
+ *    read-kind built-ins (Read/Glob/Grep/WebFetch/...) in ANY mode, and
+ *    write/edit under `'allow-edits'`. {@link recommendedHarnessSettings}
+ *    exists to steer callers off the `'allow-all'` default.
+ * 4. **Execution is server-side, in a sandbox.** The agent's tools run inside
+ *    a microVM (`@ai-sdk/sandbox-vercel` and friends), NOT on the machine
+ *    where the Intutic proxy runs — the laptop proxy cannot see sandbox
+ *    egress. The only egress control available at this layer is the sandbox's
+ *    own `HarnessV1NetworkPolicy` (`{mode:'allow-all'|'deny-all'} | {mode:
+ *    'custom', allowedHosts/allowedCIDRs/deniedCIDRs}`), applied via the
+ *    sandbox session's optional `setNetworkPolicy?.()`. That is coarse
+ *    host-level filtering, not Intutic DLP — stated plainly in
+ *    `apps/docs/integrations/ai-sdk-harness.md` rather than oversold.
+ *
+ * ## What this module does NOT import
+ *
+ * Deliberately no runtime dependency on `@ai-sdk/harness` — the structural
+ * types below capture only the shapes this adapter touches, matching the
+ * convention `vercel.ts`/`mastra.ts`/`dsh.ts` established. The real package
+ * is a devDependency used by `__tests__/harness.test.ts` to (a) structurally
+ * check these types against the shipped ones and (b) run this responder's
+ * output through the REAL `collectHarnessAgentToolApprovalContinuations`
+ * machinery.
+ *
+ * @module
+ */
+
+import { createHash } from 'node:crypto'
+import { active as activeGate, type Gate, type ToolInput } from './gate.js'
+import { IntuticGateRefusal } from './errors.js'
+import { MCP_ALLOWLIST_JS_SOURCE, MCP_REGISTRY_JS_SOURCE, MCP_SNAPSHOT_UNVERIFIED_JS_SOURCE } from './mcpRegistryRecord.js'
+import { INTERVENTION_MODE_RECORD_TAG, OPAQUE_REFUSAL_MESSAGE } from './opaqueRefusal.js'
+import { PHRASES_JS_SOURCE } from './phrases.js'
+import { SEQUENCE_JS_SOURCE } from './sequence.js'
+import { ARGUMENTS_SIZE_LIMIT, COMMAND_SIZE_LIMIT, GATE_DEADLINE_MS, HOOK_TIMEOUT_SECONDS } from './limits.js'
+
+/** Structural copy of `ai`'s `ToolApprovalResponse` prompt part (re-exported
+ *  from `@ai-sdk/provider-utils` — confirmed field-for-field on 5.0.27 and
+ *  5.0.53). This is
+ *  the part a `role: 'tool'` message carries to answer an approval request. */
+export interface HarnessToolApprovalResponse {
+  type: 'tool-approval-response'
+  approvalId: string
+  approved: boolean
+  reason?: string
+  providerExecuted?: boolean
+}
+
+/** Structural copy of the `toolCall` member of `@ai-sdk/harness` <= 1.0.100's
+ *  `HarnessAgentToolApprovalContinuation` (dist/agent/index.d.ts). */
+export interface HarnessToolCallPart {
+  readonly type: 'tool-call'
+  readonly toolCallId: string
+  readonly toolName: string
+  readonly input: unknown
+  readonly providerExecuted?: boolean
+}
+
+/**
+ * One element of the `toolApprovalContinuations` array
+ * `continueGenerate`/`continueStream` accept — shaped to satisfy BOTH
+ * upstream contracts, because the shape changed in a patch release:
+ *
+ *   - `@ai-sdk/harness` <= 1.0.100 reads `HarnessAgentToolApprovalContinuation`
+ *     = `{ approvalResponse, toolCall }`.
+ *   - `@ai-sdk/harness` >= 1.0.101 (2026-09-03) reads a bare
+ *     `ToolApprovalResponse` and keys it by its top-level `approvalId`; an
+ *     element without one is silently ignored and the paused turn never
+ *     resumes (observed live, `uat/evidence/live-verify/harness-docker/`).
+ *     Still the contract in 1.0.138, whose `collectHarnessAgentToolApproval
+ *     Continuations` also returns bare `ToolApprovalResponse` parts.
+ *
+ * So each continuation IS the `tool-approval-response` part (top-level
+ * fields) and also carries `approvalResponse`/`toolCall` for older runtimes.
+ */
+export interface HarnessToolApprovalContinuation extends HarnessToolApprovalResponse {
+  readonly approvalResponse: HarnessToolApprovalResponse
+  readonly toolCall: HarnessToolCallPart
+}
+
+/**
+ * One pending tool-approval request, in the shape this responder consumes.
+ *
+ * Covers BOTH places a HarnessAgent surfaces one:
+ *
+ *   - the `tool-approval-request` stream/message parts of a running turn
+ *     (paired with their `tool-call` parts — `input` is the parsed value), and
+ *   - `HarnessAgentPendingToolApproval` rows from a suspended session, where
+ *     `input` is a JSON **string** (confirmed: `HarnessV1PendingToolApproval.
+ *     input: string` in `@ai-sdk/harness@1.0.75`'s dist/index.d.ts). String
+ *     inputs are JSON-parsed before the gate evaluates them — see
+ *     {@link renderHarnessToolInput}.
+ */
+export interface HarnessApprovalRequest {
+  readonly approvalId: string
+  readonly toolCallId: string
+  readonly toolName: string
+  /** Parsed input object, or the JSON string a pending-approval row carries. */
+  readonly input: unknown
+  readonly providerExecuted?: boolean
+}
+
+/** Structural copy of `@ai-sdk/harness`'s `HarnessV1PermissionMode`. */
+export type HarnessPermissionMode = 'allow-reads' | 'allow-edits' | 'allow-all'
+
+/** Structural copy of `@ai-sdk/harness`'s `HarnessV1NetworkPolicy`. The two
+ *  `custom` branches of the real union each require at least one allow field;
+ *  this single structural branch keeps both optional and relies on the test
+ *  suite's assignability check against the real (stricter) type for the
+ *  values this module itself constructs. */
+export type HarnessNetworkPolicy =
+  | { mode: 'allow-all' }
+  | { mode: 'deny-all' }
+  | {
+      mode: 'custom'
+      allowedHosts?: readonly string[]
+      allowedCIDRs?: readonly string[]
+      deniedCIDRs?: readonly string[]
+    }
+
+/** The slice of `@ai-sdk/harness`'s adapter-session control surface this
+ *  module touches — `submitToolApproval` is OPTIONAL in the real
+ *  `HarnessV1PromptControl` too, and per-adapter support varies (see module
+ *  doc point 2). */
+export interface HarnessSessionLike {
+  submitToolApproval?(input: { approvalId: string; approved: boolean; reason?: string }): PromiseLike<void>
+}
+
+export interface IntuticApprovalResponderOptions {
+  /** Overrides the process-wide installed gate (`install(new Gate(...))`). */
+  gate?: Gate
+}
+
+/**
+ * Render a pending approval's `input` as the `tool_input` object
+ * {@link Gate.guard} evaluates.
+ *
+ * Mirrors `dsh.ts`'s `renderDshToolInput`, plus one harness-specific case: a
+ * `HarnessAgentPendingToolApproval` carries its input as a JSON **string**,
+ * so strings are parsed first. A string that does not parse (or parses to a
+ * non-object) falls back to `{ args: [...] }` so the gate still has
+ * something to evaluate rather than throwing on a shape it does not
+ * recognise.
+ */
+export function renderHarnessToolInput(input: unknown): ToolInput {
+  let value = input
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value)
+    } catch {
+      return { args: [input] }
+    }
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return value as ToolInput
+  }
+  return { args: [value] }
+}
+
+/** Parsed-if-possible view of a request's input, used on the continuation's
+ *  `toolCall.input` so the shape matches what the tool call actually carried
+ *  (a pending-approval row serializes it to a JSON string in transit). */
+function parsedInput(input: unknown): unknown {
+  if (typeof input !== 'string') return input
+  try {
+    return JSON.parse(input)
+  } catch {
+    return input
+  }
+}
+
+/**
+ * Build an approval responder: a function that evaluates each pending
+ * tool-approval request via `Gate.guard()` and produces the
+ * `toolApprovalContinuations` array for the continue-turn call —
+ * `agent.continueGenerate({ session, toolApprovalContinuations })` /
+ * `continueStream(...)`:
+ *
+ * ```ts
+ * import { HarnessAgent } from '@ai-sdk/harness/agent'
+ * import { Gate, install } from '@intutic/gate'
+ * import {
+ *   intuticApprovalResponder,
+ *   intuticStaticApprovals,
+ *   recommendedHarnessSettings,
+ * } from '@intutic/gate/harness'
+ *
+ * install(new Gate({ workspaceId: process.env.INTUTIC_WORKSPACE_ID }))
+ *
+ * const agent = new HarnessAgent({
+ *   harness,
+ *   sandbox,
+ *   tools,
+ *   ...recommendedHarnessSettings(),           // permissionMode: 'allow-edits'
+ *   toolApproval: intuticStaticApprovals(tools), // every custom tool -> 'user-approval'
+ * })
+ *
+ * const respond = intuticApprovalResponder()
+ * // ...run a turn; when it pauses awaiting approval, collect the pending
+ * // tool-approval requests (stream parts or suspended-session rows), then:
+ * const toolApprovalContinuations = await respond(pendingApprovals)
+ * await agent.continueGenerate({ session, toolApprovalContinuations })
+ * ```
+ *
+ * Decision mapping, per request:
+ *
+ *   - gate allows              -> `approved: true`
+ *   - `IntuticGateRefusal`     -> `approved: false`, `reason` = the
+ *     `[Intutic Governance] BLOCKED: ...` message (the runtime submits an
+ *     `execution-denied` result to the model in place of a tool result)
+ *   - any OTHER throw          -> `approved: false` with a "gate crashed"
+ *     reason — **fail closed**, same posture as `dsh.ts`'s listener: this
+ *     responder's output is a decision list consumed by a paused turn, and a
+ *     deny is deliverable and auditable where an escaped throw could leave
+ *     the turn suspended with no answer at all.
+ *
+ * Requires a `Gate` — either passed via `{ gate }`, or installed process-wide
+ * with `install(new Gate(...))`. A call with neither rejects before
+ * evaluating anything, refusing to answer approvals unguarded.
+ */
+export function intuticApprovalResponder(
+  opts: IntuticApprovalResponderOptions = {},
+): (requests: readonly HarnessApprovalRequest[]) => Promise<HarnessToolApprovalContinuation[]> {
+  return async (requests) => {
+    const g = opts.gate ?? activeGate()
+    if (g === null) {
+      throw new Error(
+        'No gate configured: call install(new Gate(...)) from @intutic/gate, or pass ' +
+          '{ gate } to intuticApprovalResponder(). Refusing to answer tool approvals unguarded.',
+      )
+    }
+
+    const continuations: HarnessToolApprovalContinuation[] = []
+    for (const req of requests) {
+      let approved = true
+      let reason: string | undefined
+      try {
+        await g.guard(req.toolName, renderHarnessToolInput(req.input))
+      } catch (exc) {
+        approved = false
+        if (exc instanceof IntuticGateRefusal) {
+          reason = exc.message
+        } else {
+          const detail = exc instanceof Error ? exc.message : String(exc)
+          reason =
+            `[Intutic Governance] BLOCKED: gate crashed (${detail}) — failing closed rather ` +
+            'than approving an unevaluated call.'
+        }
+      }
+      const approvalResponse: HarnessToolApprovalResponse = {
+        type: 'tool-approval-response',
+        approvalId: req.approvalId,
+        approved,
+        ...(reason !== undefined ? { reason } : {}),
+        ...(req.providerExecuted !== undefined ? { providerExecuted: req.providerExecuted } : {}),
+      }
+      continuations.push({
+        ...approvalResponse, // read by @ai-sdk/harness >= 1.0.101
+        approvalResponse, // read by <= 1.0.100 (with toolCall)
+        toolCall: {
+          type: 'tool-call',
+          toolCallId: req.toolCallId,
+          toolName: req.toolName,
+          input: parsedInput(req.input),
+          ...(req.providerExecuted !== undefined ? { providerExecuted: req.providerExecuted } : {}),
+        },
+      })
+    }
+    return continuations
+  }
+}
+
+export interface IntuticSubmitApprovalsResult {
+  /** The evaluated decisions, always produced — pass these to
+   *  `continueGenerate`/`continueStream` when `submitted` is false. */
+  continuations: HarnessToolApprovalContinuation[]
+  /** True when the session supported `submitToolApproval` and every decision
+   *  was delivered through it; false when the caller must use the
+   *  continuation path instead. */
+  submitted: boolean
+}
+
+/**
+ * Evaluate pending approvals and deliver the decisions through
+ * `session.submitToolApproval` when the adapter supports it.
+ *
+ * `submitToolApproval` is an OPTIONAL adapter-session method and per-adapter
+ * support varies (`harness-claude-code` implements it, `harness-grok-build`
+ * does not — see module doc point 2). This helper treats it as an
+ * optimization: when present, every decision is submitted directly (the turn
+ * resumes in place); when absent, nothing is submitted and the caller passes
+ * the returned `continuations` to `continueGenerate`/`continueStream` — the
+ * portable path — instead. Either way the SAME evaluated decisions are
+ * returned, so the caller never re-runs the gate for one delivery mechanism
+ * vs. the other.
+ */
+export async function intuticSubmitApprovals(
+  session: HarnessSessionLike,
+  requests: readonly HarnessApprovalRequest[],
+  opts: IntuticApprovalResponderOptions = {},
+): Promise<IntuticSubmitApprovalsResult> {
+  const continuations = await intuticApprovalResponder(opts)(requests)
+  const submit = session.submitToolApproval?.bind(session)
+  if (submit === undefined) {
+    return { continuations, submitted: false }
+  }
+  for (const c of continuations) {
+    await submit({
+      approvalId: c.approvalResponse.approvalId,
+      approved: c.approvalResponse.approved,
+      ...(c.approvalResponse.reason !== undefined ? { reason: c.approvalResponse.reason } : {}),
+    })
+  }
+  return { continuations, submitted: true }
+}
+
+export interface IntuticStaticApprovalsOptions {
+  /** Tool names to mark `'denied'` unconditionally instead of
+   *  `'user-approval'` — for tools that should never run under this agent
+   *  regardless of what the gate would say about a specific call. */
+  deny?: readonly string[]
+}
+
+/**
+ * Build the static `toolApproval` record for `HarnessAgentSettings`.
+ *
+ * The record shape is `Readonly<Record<string, ToolApprovalStatus>>` — STATIC
+ * per-tool statuses "without callback support" (the shipped doc comment's own
+ * words), so a per-call gate function cannot be expressed here at all. What a
+ * static record CAN express is deny-by-default **routing**: every listed tool
+ * is marked `'user-approval'`, which pauses the turn on every call to it, and
+ * {@link intuticApprovalResponder} then answers each pause with a real
+ * per-call `Gate.guard()` verdict. `'denied'` is deliberately NOT the default
+ * here — it would refuse every call to the tool unconditionally, without the
+ * gate ever seeing the arguments; use `{ deny: [...] }` for tools where that
+ * is actually what you want.
+ *
+ * Two scope limits, stated plainly:
+ *
+ *   - This covers CUSTOM host-executed tools only. Built-in sandbox tools
+ *     (read/write/edit/bash/...) never consult `toolApproval` — which of them
+ *     pause is decided by `permissionMode` (default `'allow-all'`: none), and
+ *     a paused built-in reaches {@link intuticApprovalResponder} the same way
+ *     a custom tool's approval does. See {@link recommendedHarnessSettings}.
+ *   - A tool absent from this record has status `undefined` =
+ *     "not-applicable" and runs WITHOUT any approval pause. Pass the same
+ *     `tools` record you give the agent (or every tool name), not a subset.
+ */
+export function intuticStaticApprovals(
+  tools: readonly string[] | Record<string, unknown>,
+  opts: IntuticStaticApprovalsOptions = {},
+): Readonly<Record<string, 'user-approval' | 'denied'>> {
+  const names = Array.isArray(tools) ? tools : Object.keys(tools)
+  const denied = new Set(opts.deny ?? [])
+  const record: Record<string, 'user-approval' | 'denied'> = {}
+  for (const name of names) {
+    record[name] = denied.has(name) ? 'denied' : 'user-approval'
+  }
+  return record
+}
+
+export interface RecommendedHarnessSettingsOptions {
+  /** `'allow-reads'` is stricter (built-ins can read but not write); the
+   *  default recommendation is `'allow-edits'` (read + write inside the
+   *  sandbox, but not the unrestricted `'allow-all'` the framework itself
+   *  defaults to). `'allow-all'` is deliberately not accepted here — asking
+   *  this function for the framework's own bypass default would make the
+   *  helper's name a lie. */
+  permissionMode?: 'allow-reads' | 'allow-edits'
+  /** Hosts sandbox egress should be limited to. When omitted, the
+   *  recommended policy is `{ mode: 'deny-all' }` — deny-by-default until
+   *  the caller decides what the sandbox legitimately needs to reach. */
+  allowedHosts?: readonly string[]
+  /**
+   * Whether to also recommend excluding the sandbox's native `bash` builtin
+   * from the tool set entirely, via `HarnessAgentSettings.inactiveTools`.
+   * Defaults to `true` — see {@link RecommendedHarnessSettings.inactiveTools}
+   * for what this does and does not guarantee.
+   */
+  filterBash?: boolean
+}
+
+/** The exact policy shapes {@link recommendedHarnessSettings} constructs —
+ *  narrower than {@link HarnessNetworkPolicy} so the value is assignable to
+ *  the REAL `HarnessV1NetworkPolicy` union (whose `custom` branches each
+ *  require an allow field) without a cast; the test suite pins that
+ *  assignability against the shipped type. */
+export type RecommendedNetworkPolicy =
+  | { mode: 'deny-all' }
+  | { mode: 'custom'; allowedHosts: readonly string[]; deniedCIDRs: readonly string[] }
+
+export interface RecommendedHarnessSettings {
+  /** Spread into `HarnessAgentSettings`. */
+  permissionMode: 'allow-reads' | 'allow-edits'
+  /**
+   * NOT a `HarnessAgentSettings` field — apply it to the sandbox session via
+   * its optional `setNetworkPolicy?.()` (e.g. from `sandboxConfig.onSession`),
+   * or configure the equivalent on the sandbox provider. Optional-call it:
+   * providers without a local enforcement primitive omit the method, and a
+   * missing implementation means NO egress policy is applied at all — check
+   * for `undefined` and treat that as an uncovered surface, not a silent ok.
+   */
+  networkPolicy: RecommendedNetworkPolicy
+  /**
+   * Spread into `HarnessAgentSettings.inactiveTools` — `undefined` when
+   * `filterBash: false` was passed. `HarnessV1BuiltinToolFiltering` (the
+   * same package's own type, `dist/index.d.ts`/`dist/agent/index.d.ts`)
+   * genuinely CAN drop `bash` at config time, confirmed against real
+   * shipped `dist/index.js` for both wrapped harnesses, Claude Code and
+   * Grok Build (not just their `.d.ts` — the behaviour lives in compiled
+   * logic no type file states):
+   *
+   *   - `@ai-sdk/harness-claude-code@1.0.78` sets BOTH
+   *     `supportsBuiltinToolApprovals: true` AND
+   *     `supportsBuiltinToolFiltering: true` on its adapter object, and its
+   *     `doStart`/`doContinueTurn` forward `builtinToolFiltering` verbatim
+   *     onto the bridge `start`/`continue` message — true native exclusion,
+   *     enforced by the wrapped Claude Agent SDK inside the sandbox itself,
+   *     not merely a framework-side veto. `bash` never becomes callable.
+   *   - `@ai-sdk/harness-grok-build@1.0.12` sets neither flag directly, but
+   *     is built on `@ai-sdk/harness-acp@1.0.13` (its exact pinned
+   *     dependency, confirmed via `npm pack`), which sets
+   *     `supportsBuiltinToolApprovals: true` (and
+   *     `supportsBuiltinToolFiltering: false`) — so Grok Build gets the
+   *     FRAMEWORK's own fallback instead: `@ai-sdk/harness/agent`'s compiled
+   *     `resolveHarnessAgentToolFiltering` (`dist/agent/index.js`) routes
+   *     every inactive-builtin call through the approval path and
+   *     auto-denies it before execution. Different mechanism, same practical
+   *     outcome — `bash` is still never executed.
+   *   - Confirmed further: if an adapter supported NEITHER flag, the
+   *     framework does not silently ignore `inactiveTools` for a builtin —
+   *     `HarnessAgent`'s constructor throws `HarnessCapabilityUnsupportedError`
+   *     (`dist/agent/index.js`) rather than accepting a setting it cannot
+   *     honour. So this recommendation is never a silent no-op for any
+   *     adapter that accepts it at all.
+   *
+   * This is a coarse, all-or-nothing exclusion decided once at
+   * session-construction time — never a `Gate.guard()`-evaluated verdict per
+   * call. A workspace that genuinely needs `bash` passes `filterBash: false`
+   * and keeps `permissionMode: 'allow-edits'` (or `'allow-reads'`): every
+   * bash call then pauses as a builtin approval request and
+   * {@link intuticApprovalResponder} gives it a per-call verdict (see the
+   * `permissionMode` bullet on {@link recommendedHarnessSettings}).
+   */
+  inactiveTools?: readonly ['bash']
+}
+
+/**
+ * The settings posture this integration recommends, as a value callers can
+ * spread/apply rather than prose they have to transcribe:
+ *
+ *   - `permissionMode: 'allow-edits'` (or `'allow-reads'`) — because the
+ *     framework's own default is `'allow-all'`, under which built-in sandbox
+ *     tools (including `bash`) run with no approval surface this gate can
+ *     reach. Under `'allow-edits'` every bash-kind built-in call pauses as a
+ *     `kind: 'builtin'` approval request that {@link intuticApprovalResponder}
+ *     answers per call; `'allow-reads'` adds write/edit to that. Read-kind
+ *     built-ins never pause in any mode — the mode is the only control for
+ *     them.
+ *   - `inactiveTools: ['bash']` (default) — removes bash outright. With the
+ *     default, bash calls never reach the gate because bash is never
+ *     callable; `filterBash: false` is the per-call alternative (bash stays
+ *     available and every call is gated as above).
+ *   - a `networkPolicy` for the sandbox — `{ mode: 'deny-all' }` by default,
+ *     or a `custom` allow-list (with the cloud-metadata CIDR denied) when
+ *     `allowedHosts` is given. This is the honest egress-governance story for
+ *     server-side sandbox execution: the Intutic proxy on the developer's
+ *     machine never sees sandbox traffic, and host-level filtering is what
+ *     the sandbox layer actually offers. It is coarse — no DLP, no
+ *     per-request policy — and the integration docs say so.
+ */
+export function recommendedHarnessSettings(
+  opts: RecommendedHarnessSettingsOptions = {},
+): RecommendedHarnessSettings {
+  const networkPolicy: RecommendedNetworkPolicy =
+    opts.allowedHosts !== undefined && opts.allowedHosts.length > 0
+      ? {
+          mode: 'custom',
+          allowedHosts: opts.allowedHosts,
+          // Cloud metadata endpoint — deny it even when the caller's allow
+          // list is broad; deniedCIDRs wins over allows in the real policy.
+          deniedCIDRs: ['169.254.169.254/32'],
+        }
+      : { mode: 'deny-all' }
+  return {
+    permissionMode: opts.permissionMode ?? 'allow-edits',
+    networkPolicy,
+    ...(opts.filterBash === false ? {} : { inactiveTools: ['bash'] as const }),
+  }
+}
+
+// ============================================================================
+// Sandbox bootstrap
+// ============================================================================
+//
+// `recommendedHarnessSettings()` and `intuticApprovalResponder()` above cover
+// the framework-level surface: `permissionMode`, `toolApproval`/the
+// continuation flow, and `networkPolicy`. None of that reaches Claude Code's
+// OWN native PreToolUse gate — the one the sync-daemon writes on a developer
+// laptop (`services/sync-daemon/src/harness/claudeCodeHooks.ts`, generating
+// `.intutic/hooks/claude-code-check.js` + `.claude/settings.json`). Inside a
+// `@ai-sdk/harness` sandbox there is no laptop for the sync-daemon to write
+// to, so that native gate is simply absent and the harness runs ungated.
+//
+// ## The channel — confirmed against a real install, not assumed
+//
+// `HarnessAgentSandboxConfig` (`@ai-sdk/harness/agent@1.0.75`'s shipped
+// `dist/agent/index.d.ts`) is a real, documented, TYPED consumer-facing
+// bootstrap hook — distinct from `HarnessV1.getBootstrap`, which is the
+// ADAPTER's own (e.g. Claude Code's) private bootstrap recipe, not something
+// a consumer of this package sets:
+//
+// ```ts
+// type HarnessAgentSandboxConfig = {
+//   readonly workDir?: string
+//   readonly bootstrapHash?: string
+//   readonly onBootstrap?: (opts: {
+//     readonly session: Experimental_SandboxSession
+//     readonly workDir: string
+//     readonly abortSignal?: AbortSignal
+//   }) => Promise<void>
+//   readonly onSession?: (opts: {
+//     readonly session: Experimental_SandboxSession
+//     readonly sessionWorkDir: string
+//     readonly abortSignal?: AbortSignal
+//   }) => Promise<void>
+// }
+// ```
+//
+// `onBootstrap` "is called during sandbox template creation after the
+// harness adapter's own bootstrap has run and before snapshot-capable
+// providers publish a snapshot" (the shipped doc comment, verbatim) — i.e.
+// it fires ONCE per `bootstrapHash` identity, its side effects get baked
+// into a reusable snapshot, and later sessions reusing that snapshot never
+// re-run it. That is exactly the right lifecycle for STATIC governance
+// files (a hook script + a settings file), which is why
+// {@link intuticSandboxBootstrap} uses `onBootstrap` alone and does not need
+// `onSession` (reserved for genuinely per-session state, which this module
+// has none of at this scope).
+//
+// `@ai-sdk/harness@1.0.138` (not 1.0.75) also records each successful run
+// as an empty `~/.ai-sdk-harness/.on-bootstrap/<sha256(bootstrapHash)>.ok`
+// marker, and `HarnessAgent` re-runs `onBootstrap` on every session it
+// acquires unless that marker is present (`skipOnBootstrapIfMarked`) — so a
+// sandbox that never went through template creation still gets these files,
+// and a new `bootstrapHash` (new rules) re-writes them. Our writes are
+// overwrite-idempotent, so a re-run is harmless.
+//
+// ## What `intuticSandboxBootstrap()` writes, and why it is NOT a byte copy
+// of the laptop artifacts
+//
+// The laptop's `claude-code-check.js` (`emitJsGate`/`emitPreImageCapture`/
+// `emitJsFailClosedPrelude` in `services/sync-daemon/src/harness/gateBody.ts`)
+// implements FOUR tiers: the policy-snapshot floor (A1), SOP rules fetched
+// live from the control plane (A3), review-hold parking, and fire-and-forget
+// event draining to the control plane over HTTPS. `services/sync-daemon` is
+// a private service package this public package must not depend on (see
+// `snapshot.ts`'s module doc for the same constraint, already established
+// for the `.rules` reader), and three of those four tiers need something a
+// sandbox-bootstrap function fundamentally cannot have at construction time:
+// a live control-plane connection (A3, review-hold, draining), which
+// `recommendedHarnessSettings()`'s own `networkPolicy` recommends denying by
+// default anyway.
+//
+// What DOES port cleanly, with no live connection and no cross-package
+// import: Tier A1, the policy-snapshot evaluator, and Tier M, the MCP server
+// registry and allowlist the snapshot carries (`mcpRegistryRecord.ts`,
+// emitted as source), with the snapshot's digest and workspace checked first
+// as every gate checks them. `snapshot.ts` in THIS
+// package already implements it (`normalise`/`evaluate`), tested for
+// fidelity against the real pattern tables in `fidelity.test.ts`. The hook
+// script below is a self-contained (zero-`require`) hand-port of that same
+// algorithm — same field order, same padding/case-sensitivity contract, same
+// severity precedence — so it can run as a standalone Node script inside the
+// sandbox with no npm install step (which the recommended `deny-all` network
+// policy would block anyway). `__tests__/harness.test.ts` proves this port
+// behaviourally, not just by inspection: it spawns the exact generated
+// script as a child process against `allFloorFixtures()` cases and asserts
+// its exit code agrees with `snapshot.evaluate()`'s verdict for the same
+// rule.
+//
+// Deliberately NOT reproduced here, and said so rather than silently
+// dropped: the SOP tier (A3), review-hold parking, and control-plane event
+// draining. A workspace relying on this bootstrap for sandbox coverage gets
+// the destructive-command floor, any SOP-authored rules already compiled
+// into the `.rules` text it supplies, and that text's MCP registry and
+// allowlist — a real but strict SUBSET of the
+// laptop gate, the same kind of documented gap `gate.ts`'s own module doc
+// already calls out for this package's Tier A1 relative to a shipped
+// harness gate.
+//
+// ## Scope: Claude Code only
+//
+// `.claude/settings.json`'s `hooks.PreToolUse` shape is Claude Code's own
+// contract. Grok Build's laptop equivalent
+// (`services/sync-daemon/src/harness/grokHooks.ts`) uses a completely
+// different mechanism — a `.grok/hooks/*.json` registry entry, a
+// `{"decision":"deny","reason":"..."}`-on-stdout block contract instead of
+// an exit code, and no adapter `env` passthrough at all (confirmed absent
+// from `GrokBuildHarnessSettings`, `dist/index.d.ts`, `@ai-sdk/harness-grok-
+// build@1.0.12`) — building that is real follow-up work, not attempted here.
+// Bootstrap-file injection (this channel) would still be Grok Build's ONLY
+// viable path, for the same reason it is Claude Code's: `env` does not
+// matter to this approach either way, since `onBootstrap` writes into the
+// sandbox filesystem directly, independent of adapter settings.
+//
+// ## Verified locally (Half C) — and what remains Vercel-only
+//
+// `uat/live-verify/harness-docker/` (enterprise) drives a real Claude Code
+// bridge turn in a Docker sandbox against a scripted local model: the bridge's
+// own PreToolUse dispatch runs this script, `process.exit(2)` stops the call
+// (the model receives an error tool result naming the block), and the files
+// survive a container stop/start + `resumeSession`. A true snapshot restore
+// (Vercel Sandbox) and Grok Build remain unverified.
+
+/** Structural copy of `@ai-sdk/provider-utils`'s `SandboxSession`, narrowed
+ *  to the methods {@link intuticSandboxBootstrap}'s `onBootstrap` calls.
+ *  Confirmed field-for-field against `@ai-sdk/provider-utils@5.0.27`'s
+ *  shipped `dist/index.d.ts` (`WriteFileOptions<string>` plus its own
+ *  `encoding` addition on `writeTextFile`; `readTextFile` resolves `null`
+ *  for a missing file). */
+export interface SandboxWriteSession {
+  writeTextFile(options: { path: string; content: string; encoding?: string }): PromiseLike<void>
+  readTextFile(options: { path: string; abortSignal?: AbortSignal }): PromiseLike<string | null>
+  run(options: { command: string; abortSignal?: AbortSignal }): PromiseLike<{ exitCode: number; stdout: string; stderr: string }>
+}
+
+/** Structural copy of `@ai-sdk/harness/agent`'s
+ *  `HarnessAgentSandboxConfig['onBootstrap']` parameter shape
+ *  (`dist/agent/index.d.ts`), narrowed to the fields this module reads. */
+export interface SandboxBootstrapCallbackOptions {
+  readonly session: SandboxWriteSession
+  readonly workDir: string
+  readonly abortSignal?: AbortSignal
+}
+
+export interface IntuticSandboxBootstrap {
+  /** Pass through unchanged to `HarnessAgentSettings.sandboxConfig.bootstrapHash`
+   *  — required alongside `onBootstrap` by the real type. Deterministic: the
+   *  same options always produce the same hash, and a snapshot-capable
+   *  sandbox provider uses it to decide whether `onBootstrap` needs to run
+   *  again. Computed the same way `snapshot.ts` computes the policy-snapshot
+   *  digest — `createHash('sha256')` over the recipe content, this module's
+   *  own existing hashing convention, not a new one. */
+  readonly bootstrapHash: string
+  /** Pass through unchanged to `HarnessAgentSettings.sandboxConfig.onBootstrap`. */
+  readonly onBootstrap: (opts: SandboxBootstrapCallbackOptions) => Promise<void>
+}
+
+export interface IntuticSandboxBootstrapOptions {
+  /**
+   * Compiled `.rules` text — the SAME artifact format `snapshot.ts` reads
+   * (`~/.intutic/hooks/policy-snapshot.rules` on a laptop). Copy the file
+   * content in, e.g. by reading it from the host running the orchestrator
+   * code before constructing this bootstrap. Omit to ship a hook script that
+   * loads zero rules (still present as a channel, evaluating nothing) —
+   * never silently skipped, so a missing snapshot shows up as an empty file
+   * inside the sandbox rather than a missing one.
+   */
+  policySnapshotRules?: string
+  /** Embedded in the recipe hash (so a workspace switch invalidates a cached
+   *  snapshot) and in the hook script, which treats rules issued to another
+   *  workspace as unverified — an integrity check, as `snapshot.ts`'s reader
+   *  makes it, not a lookup key. */
+  workspaceId?: string
+  /** Directory inside the sandbox (relative to `workDir`) the hook script
+   *  and its rules file are written under. Defaults to `.intutic/hooks`,
+   *  the same relative location the laptop writer uses. */
+  bootstrapDir?: string
+}
+
+function sandboxJoin(workDir: string, relative: string): string {
+  const base = workDir.endsWith('/') ? workDir.slice(0, -1) : workDir
+  return `${base}/${relative}`
+}
+
+/**
+ * Self-contained (built-ins only, no npm install) hand-port of `snapshot.ts`'s
+ * `loadSnapshot`/`normalise`/`evaluate` and of `gate.ts`'s Tier M — the
+ * policy-snapshot rules and the MCP server registry and allowlist. See the
+ * module-level comment above for what this deliberately does and does not
+ * cover, and `__tests__/harness.test.ts` for the behavioural-parity check
+ * against the real `snapshot.evaluate()` this port is pinned to and the
+ * shared MCP registry vectors.
+ *
+ * The rules text is checked as every gate checks it: a missing or broken
+ * `#digest`, or a `#workspace` other than `workspaceId`, leaves only its
+ * SSO-group refusals, and refuses every MCP call (`POLICY_SNAPSHOT_UNVERIFIED`)
+ * because neither MCP record can be vouched for. An empty rules text is no
+ * snapshot at all, as an absent file is.
+ *
+ * Contract matches the laptop's `claude-code-check.js`
+ * (`services/sync-daemon/src/harness/claudeCodeHooks.ts`) deliberately:
+ * Claude Code's PreToolUse hook stdin carries `{tool_name, tool_input,
+ * session_id}` (this reads both the snake_case and camelCase field names,
+ * same as the laptop script); exit `2` blocks the call, exit `0` allows it;
+ * any parse/read error fails CLOSED (exit `2`), the same posture
+ * `emitJsFailClosedPrelude` documents for the laptop's version.
+ */
+function renderSandboxGateScript(rulesFileName: string, workspaceId = ''): string {
+  return `#!/usr/bin/env node
+'use strict';
+/**
+ * Intutic sandbox PreToolUse gate (policy-snapshot rules, and the MCP server
+ * registry and allowlist the snapshot carries).
+ * Auto-generated by @intutic/gate's intuticSandboxBootstrap(). DO NOT EDIT.
+ *
+ * Unlike the laptop's claude-code-check.js, this script has no live
+ * control-plane connection at call time (the recommended sandbox network
+ * policy is deny-all) and therefore implements NEITHER the SOP tier (A3)
+ * NOR review-hold parking NOR governance-event draining.
+ */
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const RULES_PATH = path.join(__dirname, ${JSON.stringify(rulesFileName)});
+const WORKSPACE_ID = ${JSON.stringify(workspaceId)};
+// What an OPAQUE workspace's agent is told of a refusal on its policy, in place
+// of the rule (opaqueRefusal.ts).
+const OPAQUE_MESSAGE = ${JSON.stringify(OPAQUE_REFUSAL_MESSAGE)};
+
+function normalise(v) {
+  const s = v === null || v === undefined ? '' : String(v);
+  return ' ' + s.replace(/\\s+/g, ' ').trim() + ' ';
+}
+
+function stringList(v) {
+  return Array.isArray(v) ? v.filter(function (x) { return typeof x === 'string'; }) : [];
+}
+
+/** The snapshot: its rules, MCP records and whether it verified. */
+function loadSnapshot() {
+  // opaque: the @intervention_mode record of an OPAQUE workspace. Kept on a
+  // snapshot that fails its check: it only ever hides text.
+  const out = { rules: [], state: 'absent', mcpRegistry: null, mcpAllowlist: null, opaque: false };
+  let text;
+  try {
+    text = fs.readFileSync(RULES_PATH, 'utf-8');
+  } catch (e) {
+    return out;
+  }
+  // Written empty when the bootstrap was given no rules: no snapshot, not a
+  // damaged one.
+  if (!text.trim()) return out;
+  out.state = 'ok';
+  let digest = '', workspace = '';
+  const body = [];
+  for (const line of text.split('\\n')) {
+    if (line.indexOf('#digest ') === 0) { digest = line.slice(8).trim(); continue; }
+    if (line.indexOf('#workspace ') === 0) { workspace = line.slice(11).trim(); continue; }
+    if (!line || line.charAt(0) === '#') continue;
+    body.push(line);
+    const f = line.split('\\t');
+    if (f[0] === '@mcp_registry' && f.length === 2) {
+      try {
+        const r = JSON.parse(Buffer.from(f[1], 'base64').toString('utf8'));
+        const disabled = {};
+        if (r.disabledTools && typeof r.disabledTools === 'object') {
+          for (const k of Object.keys(r.disabledTools)) disabled[k] = stringList(r.disabledTools[k]);
+        }
+        out.mcpRegistry = { defaultPolicy: r.defaultPolicy === 'deny' ? 'deny' : 'allow',
+          approvedServers: stringList(r.approvedServers), blockedServers: stringList(r.blockedServers),
+          heldServers: stringList(r.heldServers), disabledTools: disabled };
+      } catch (e) { /* a damaged record is no registry */ }
+      continue;
+    }
+    if (f[0] === '${INTERVENTION_MODE_RECORD_TAG}' && f.length === 2) {
+      out.opaque = f[1] === 'OPAQUE';
+      continue;
+    }
+    if (f[0] === '@mcp_allowlist' && f.length === 3) {
+      out.mcpAllowlist = { severity: f[1] === 'shadow' ? 'shadow' : 'block', servers: f[2].split(',').filter(Boolean) };
+      continue;
+    }
+    // Column order: id, severity, flags, subject, reason, source(regex).
+    if (f.length < 6 || !f[5]) continue;
+    // Flags: i = case-insensitive, s = a sequence rule (sequence.ts).
+    const ic = f[2].indexOf('i') !== -1;
+    try {
+      out.rules.push({
+        id: f[0],
+        severity: f[1],
+        subject: f[3] || 'any',
+        reason: f[4],
+        pattern: new RegExp(f[5], ic ? 'i' : ''),
+        steps: f[2].indexOf('s') !== -1 ? compileSequence(f[5], ic) : null,
+      });
+    } catch (e) {
+      // Regex would not compile — dropped, not fatal. Matches snapshot.ts.
+    }
+  }
+  // Integrity, as snapshot.ts checks it: the digest over the data lines (a
+  // missing one fails too), and the workspace the rules were issued to.
+  const actual = crypto.createHash('sha256').update(body.join('\\n'), 'utf-8').digest('hex').slice(0, 32);
+  if (actual !== digest || (workspace && WORKSPACE_ID && workspace !== WORKSPACE_ID)) {
+    out.state = 'invalid';
+    // Only the SSO-group refusals survive, and neither MCP record does.
+    out.rules = out.rules.filter(function (r) { return r.id.indexOf('sso_group.') === 0 && r.severity === 'block'; });
+    out.mcpRegistry = null;
+    out.mcpAllowlist = null;
+  }
+  return out;
+}
+
+// The phrase matcher snapshot.ts uses, emitted from phrases.ts: a \`phrase\`
+// rule's source is |-separated phrases matched as words, not a regex.
+${PHRASES_JS_SOURCE}
+
+// The sequence-rule matcher snapshot.ts uses, emitted from sequence.ts: a rule
+// flagged \`s\` has its steps searched for in order, in linear time.
+${SEQUENCE_JS_SOURCE}
+
+// The MCP server registry and allowlist decisions, and the refusal on an
+// unverified snapshot, emitted from mcpRegistryRecord.ts.
+${MCP_REGISTRY_JS_SOURCE}
+
+${MCP_ALLOWLIST_JS_SOURCE}
+
+${MCP_SNAPSHOT_UNVERIFIED_JS_SOURCE}
+
+function evaluate(toolName, target, command, rules) {
+  const nTool = normalise(toolName);
+  const nCommand = normalise(command);
+  const nTarget = normalise(target);
+  let words = null;
+  // As snapshot.evaluate(): a shadow or warn match does not decide the call,
+  // so evaluation continues and a later hold or block wins; with none, the
+  // first advisory match is returned.
+  let advisory = null;
+  for (const rule of rules) {
+    let matched = false;
+    if (rule.subject === 'phrase') {
+      if (words === null) words = phraseText(command);
+      const w = words;
+      if (!rule.pattern.source.split('|').some(function (p) { return hasPhrase(w, p, true); })) continue;
+      matched = true;
+    } else {
+      const subjects =
+        rule.subject === 'tool' ? [nTool] :
+        rule.subject === 'command' ? [nCommand] :
+        rule.subject === 'target' ? [nTarget] :
+        [nCommand, nTarget];
+      matched = subjects.some(function (subject) {
+        return rule.steps ? sequenceMatch(rule.steps, subject) : rule.pattern.test(subject);
+      });
+    }
+    if (!matched) continue;
+    const decision = { severity: rule.severity, reason: rule.reason + ' [' + rule.id + ']' };
+    if (rule.severity === 'warn' || rule.severity === 'shadow') {
+      if (advisory === null) advisory = decision;
+      continue;
+    }
+    return decision;
+  }
+  return advisory;
+}
+
+/**
+ * Tier M, for an mcp__<server>__<tool> call: on an unverified snapshot every
+ * call is refused; otherwise the registry, then the allowlist, whose refusal
+ * under shadow (an observe-only workspace) is reported and allowed.
+ */
+function evaluateMcp(toolName, snap) {
+  if (toolName.indexOf('mcp__') !== 0) return null;
+  const rest = toolName.slice('mcp__'.length);
+  const sep = rest.indexOf('__');
+  if (sep <= 0) return null;
+  const server = rest.slice(0, sep);
+  if (snap.state === 'invalid') {
+    const u = mcpSnapshotUnverifiedRefusal(server);
+    // Says nothing about the workspace's policy, so an OPAQUE workspace sees it too.
+    return { severity: 'block', reason: u.reason + ' [' + u.ruleId + ']', code: u.code, operational: true };
+  }
+  const r = snap.mcpRegistry ? evaluateMcpRegistry(snap.mcpRegistry, server, rest.slice(sep + 2)) : null;
+  if (r) return { severity: 'block', reason: r.reason + ' [' + r.ruleId + ']', code: r.code };
+  const a = snap.mcpAllowlist ? evaluateMcpAllowlist(snap.mcpAllowlist, server) : null;
+  if (a) return { severity: snap.mcpAllowlist.severity === 'shadow' ? 'shadow' : 'block', reason: a.reason + ' [' + a.ruleId + ']', code: a.code };
+  return null;
+}
+
+let inputData = '';
+process.stdin.on('data', (chunk) => { inputData += chunk; });
+process.stdin.on('end', () => {
+  try {
+    const ctx = JSON.parse(inputData || '{}');
+    const toolName = String(ctx.tool_name || ctx.toolName || '');
+    const toolInput = ctx.tool_input || ctx.toolInput || {};
+    const target = toolInput.path || toolInput.file_path || toolInput.filePath ||
+      toolInput.new_path || toolInput.target || toolInput.notebook_path || '';
+    const command = String(toolInput.command || toolInput.cmd || toolInput.script || '');
+    // Too large to evaluate inside the hook timeout: refused before any rule
+    // runs (limits.ts). Claude Code reads a hook that times out as an allow.
+    const commandBytes = Buffer.byteLength(command, 'utf8');
+    const argumentBytes = Buffer.byteLength(JSON.stringify(toolInput) || '', 'utf8');
+    if (commandBytes > ${COMMAND_SIZE_LIMIT} || argumentBytes > ${ARGUMENTS_SIZE_LIMIT}) {
+      console.error('[Intutic Guardrail] BLOCKED: COMMAND_TOO_LARGE: the ' +
+        (commandBytes > ${COMMAND_SIZE_LIMIT} ? 'command is ' + commandBytes : 'tool arguments are ' + argumentBytes) +
+        ' bytes, over the ' + (commandBytes > ${COMMAND_SIZE_LIMIT} ? ${COMMAND_SIZE_LIMIT} : ${ARGUMENTS_SIZE_LIMIT}) +
+        '-byte limit a gate evaluates; split the work into smaller calls');
+      process.exit(2);
+    }
+    const snap = loadSnapshot();
+    // The rules run under a deadline that interrupts even a regex mid-match,
+    // measured from process start, and a call still undecided then is refused:
+    // a snapshot rule written in a workspace need not be linear.
+    let decision;
+    globalThis.__intuticEvaluate = function () {
+      return evaluate(toolName, target, command, snap.rules) || evaluateMcp(toolName, snap);
+    };
+    try {
+      decision = require('vm').runInThisContext('__intuticEvaluate()', {
+        timeout: Math.max(1, ${GATE_DEADLINE_MS} - Math.round(process.uptime() * 1000)),
+      });
+    } catch (err) {
+      if (!err || err.code !== 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw err;
+      console.error('[Intutic Guardrail] BLOCKED: GATE_DEADLINE: the policy rules did not finish within ' +
+        ${GATE_DEADLINE_MS} + ' ms, so the call is refused rather than left to the hook timeout');
+      process.exit(2);
+    }
+    // An OPAQUE workspace's agent reads the generic sentence, not the rule.
+    const shown = decision && snap.opaque && !decision.operational ? OPAQUE_MESSAGE : decision && decision.reason;
+    if (decision && (decision.severity === 'warn' || decision.severity === 'shadow')) {
+      console.error('[Intutic Guardrail] FLAGGED (' + decision.severity + '): ' + decision.reason);
+    } else if (decision && decision.severity === 'hold') {
+      // A hold asks a person first, and this script cannot reach the control
+      // plane to ask: it refuses, as every gate does with a hold it cannot record.
+      console.error('[Intutic Guardrail] HELD for approval: ' + shown +
+        ' — approval cannot be requested from inside this sandbox, so the call is refused.');
+      process.exit(2);
+    } else if (decision) {
+      // block, or a severity this script does not know: never an allow. An
+      // MCP refusal names its code, as the other gates' refusals do.
+      console.error('[Intutic Guardrail] BLOCKED: ' + (decision.code ? decision.code + ': ' : '') + shown);
+      process.exit(2);
+    }
+    process.exit(0);
+  } catch (err) {
+    // Fail CLOSED — any hook execution error blocks the tool call, the same
+    // posture emitJsFailClosedPrelude documents for the laptop script.
+    console.error('[Intutic Guardrail] Hook error (blocking for safety):', err && err.message ? err.message : err);
+    process.exit(2);
+  }
+});
+`
+}
+
+/**
+ * Compiles the `.claude/settings.json` content that registers the generated
+ * hook script — same matcher set and hook shape as the laptop writer's
+ * `hookEntry()` (`services/sync-daemon/src/harness/claudeCodeHooks.ts`):
+ * `Bash`, `Edit`, `Write`, `MultiEdit`, and `mcp__.*`.
+ */
+function renderSandboxClaudeSettings(hookScriptSandboxPath: string): string {
+  return JSON.stringify(sandboxClaudeSettings(hookScriptSandboxPath), null, 2) + '\n'
+}
+
+function sandboxClaudeSettings(hookScriptSandboxPath: string): {
+  permissions: { deny: string[] }
+  hooks: { PreToolUse: unknown[] }
+} {
+  const hookEntry = (matcher: string) => ({
+    matcher,
+    hooks: [
+      {
+        type: 'command',
+        command: `node ${hookScriptSandboxPath}`,
+        timeout: HOOK_TIMEOUT_SECONDS,
+        statusMessage: 'Verifying tool execution against Intutic SOP policy...',
+      },
+    ],
+  })
+  return {
+    permissions: { deny: [] as string[] },
+    hooks: {
+      PreToolUse: [hookEntry('Bash'), hookEntry('Edit'), hookEntry('Write'), hookEntry('MultiEdit'), hookEntry('mcp__.*')],
+    },
+  }
+}
+
+/**
+ * The same `PreToolUse` registration merged into the sandbox user's
+ * `$HOME/.claude/settings.json`. Why this is needed (observed live, Docker
+ * sandbox + real Claude Code bridge, `uat/evidence/live-verify/harness-docker/`):
+ * `onBootstrap` receives the sandbox DEFAULT working directory, but unless the
+ * caller sets `sandboxConfig.workDir` every HarnessAgent session runs Claude
+ * Code in its own `<default>/claude-code-<sessionId>` directory, and Claude
+ * Code does not read project settings from a parent directory — so the
+ * project-level file alone never fired. User-level settings load for every
+ * session regardless of cwd. An existing user settings file is merged into
+ * (our hooks appended), never overwritten; an unparseable one fails the
+ * bootstrap loudly rather than leaving the sandbox ungated. Re-running is
+ * idempotent: entries that already invoke this same hook script are replaced,
+ * not duplicated — `@ai-sdk/harness` >= 1.0.138 re-runs `onBootstrap` on a
+ * session whose marker is missing, and a new `bootstrapHash` re-runs it too.
+ */
+async function writeSandboxUserSettings(
+  session: SandboxWriteSession,
+  hookScriptSandboxPath: string,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  const home = await session.run({ command: 'printf "%s" "$HOME"', ...(abortSignal ? { abortSignal } : {}) })
+  const homeDir = home.stdout.trim()
+  if (home.exitCode !== 0 || !homeDir.startsWith('/')) {
+    throw new Error(
+      `intuticSandboxBootstrap: cannot resolve the sandbox HOME (exit ${home.exitCode}); refusing to leave ` +
+        'the PreToolUse hook unregistered.',
+    )
+  }
+  const path = sandboxJoin(homeDir, '.claude/settings.json')
+  const ours = sandboxClaudeSettings(hookScriptSandboxPath)
+  const existingText = await session.readTextFile({ path, ...(abortSignal ? { abortSignal } : {}) })
+  let merged: Record<string, unknown> = ours
+  if (existingText !== null && existingText.trim() !== '') {
+    let existing: unknown
+    try {
+      existing = JSON.parse(existingText)
+    } catch {
+      throw new Error(`intuticSandboxBootstrap: ${path} exists but is not valid JSON; refusing to overwrite it.`)
+    }
+    const base = existing !== null && typeof existing === 'object' && !Array.isArray(existing) ? (existing as Record<string, unknown>) : {}
+    const hooks = (base.hooks ?? {}) as Record<string, unknown>
+    const ourCommand = `node ${hookScriptSandboxPath}`
+    const isOurs = (entry: unknown): boolean =>
+      Array.isArray((entry as { hooks?: unknown } | null)?.hooks) &&
+      ((entry as { hooks: unknown[] }).hooks).some((h) => (h as { command?: unknown } | null)?.command === ourCommand)
+    const pre = (Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : []).filter((e: unknown) => !isOurs(e))
+    merged = { ...base, hooks: { ...hooks, PreToolUse: [...pre, ...ours.hooks.PreToolUse] } }
+  }
+  await session.writeTextFile({ path, content: JSON.stringify(merged, null, 2) + '\n' })
+}
+
+/**
+ * Builds `{ bootstrapHash, onBootstrap }` for
+ * `HarnessAgentSettings.sandboxConfig` — a channel the framework provides
+ * but nothing used:
+ *
+ * ```ts
+ * import { HarnessAgent } from '@ai-sdk/harness/agent'
+ * import { intuticSandboxBootstrap, recommendedHarnessSettings } from '@intutic/gate/harness'
+ *
+ * const agent = new HarnessAgent({
+ *   harness,
+ *   sandbox,
+ *   ...recommendedHarnessSettings(),
+ *   sandboxConfig: intuticSandboxBootstrap({
+ *     policySnapshotRules: fs.readFileSync(snapshotPath(), 'utf-8'),
+ *     workspaceId: process.env.INTUTIC_WORKSPACE_ID,
+ *   }),
+ * })
+ * ```
+ *
+ * Writes two files under `<workDir>/<bootstrapDir>` (default
+ * `.intutic/hooks`) — the rules text verbatim, and a self-contained hook
+ * script implementing Tier A1 against it (see
+ * {@link renderSandboxGateScript}) — plus `.claude/settings.json` at
+ * `<workDir>/.claude/settings.json` registering that script as a
+ * `PreToolUse` hook, and the same registration merged into the sandbox user's
+ * `$HOME/.claude/settings.json` (see {@link writeSandboxUserSettings} — the
+ * project-level file alone does not reach per-session work directories). See
+ * the module-level comment above this section for what this does and does
+ * not cover, and why.
+ */
+export function intuticSandboxBootstrap(opts: IntuticSandboxBootstrapOptions = {}): IntuticSandboxBootstrap {
+  const bootstrapDir = opts.bootstrapDir ?? '.intutic/hooks'
+  const rulesRelPath = `${bootstrapDir}/policy-snapshot.rules`
+  const scriptRelPath = `${bootstrapDir}/claude-code-check.js`
+
+  const rulesContent = opts.policySnapshotRules ?? ''
+  const scriptContent = renderSandboxGateScript('policy-snapshot.rules', opts.workspaceId ?? '')
+
+  // Same hashing convention `snapshot.ts` already uses for the policy
+  // digest (`createHash('sha256')` from node:crypto) — not a new mechanism.
+  const bootstrapHash = createHash('sha256')
+    .update(`workspace:${opts.workspaceId ?? ''} `)
+    .update(`${rulesRelPath}\x00${rulesContent}\x00${scriptRelPath}\x00${scriptContent}`)
+    .digest('hex')
+
+  return {
+    bootstrapHash,
+    onBootstrap: async ({ session, workDir, abortSignal }) => {
+      // Absolute paths throughout, matching the laptop writer's own
+      // convention (claudeCodeHooks.ts's hookEntry() always joins an
+      // absolute workspaceRoot) - a PreToolUse hook's invocation cwd is not
+      // guaranteed to be workDir, so a relative command would be fragile.
+      const scriptAbsPath = sandboxJoin(workDir, scriptRelPath)
+      const files: ReadonlyArray<{ path: string; content: string }> = [
+        { path: sandboxJoin(workDir, rulesRelPath), content: rulesContent },
+        { path: scriptAbsPath, content: scriptContent },
+        { path: sandboxJoin(workDir, '.claude/settings.json'), content: renderSandboxClaudeSettings(scriptAbsPath) },
+      ]
+      for (const f of files) {
+        await session.writeTextFile({ path: f.path, content: f.content })
+      }
+      await writeSandboxUserSettings(session, scriptAbsPath, abortSignal)
+    },
+  }
+}

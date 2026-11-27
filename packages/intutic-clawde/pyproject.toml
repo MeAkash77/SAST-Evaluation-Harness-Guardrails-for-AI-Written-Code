@@ -1,0 +1,114 @@
+[tool.poetry]
+name = "intutic-clawde"
+version = "3.2.3"
+description = "Programmatic proxy connection wrappers and warm-path budget gates for Intutic"
+authors = ["Intutic <engineering@intutic.ai>"]
+readme = "README.md"
+packages = [{include = "intutic_clawde"}]
+
+[tool.poetry.dependencies]
+# 3.9 reached end of life in October 2025. The patched releases of requests and
+# urllib3 below both require >=3.10, so supporting 3.9 means shipping known CVEs.
+python = "^3.10"
+requests = "^2.33.0"
+urllib3 = ">=2.8.0"
+# The gate's image-integrity tier parses the Kubernetes manifests a deploy
+# command references; see intutic_clawde/gate/imagecheck.py.
+pyyaml = "^6.0"
+# Wave 1/2 framework adapters (intutic_clawde/gate/adapters/) — each import is
+# guarded (`try: import ... except ImportError`), so intutic-clawde installs
+# and runs with NONE of these present; a framework is only required to
+# INSTANTIATE its adapter. LangGraph needs no entry here: its tools are plain
+# callables/duck-typed objects the framework-agnostic @guard/guard_tools
+# already governs, so it has no optional import to declare.
+langchain = {version = ">=1.0", optional = true}
+# crewai is deliberately not an extra. Every crewai release pins crewai-cli
+# exactly, and crewai-cli pins uv~=0.11.6, below the fix for
+# GHSA-hq85-5cpj-mr62 (0.13.4), so locking crewai would lock a vulnerable uv.
+# The adapter needs only crewai itself: `pip install intutic-clawde crewai`.
+# >=3.11 and 2.14.1 for the same reason as autogen below: every google-adk that
+# allows opentelemetry-api 1.45.2 (GHSA-mf5v-w3w3-f6cg, traceparent ReDoS) requires 3.11.
+google-adk = {version = ">=2.14.1", optional = true, python = ">=3.11"}
+openai-agents = {version = "*", optional = true}
+# Wave 2 additions below. Checked live against PyPI's `requires_python` for
+# each (`curl -s https://pypi.org/pypi/<pkg>/json | ...['info']['requires_python']`)
+# before adding — the exact check Wave 1's crewai bug should have had from
+# the start. All four report ">=3.10" with NO upper bound at the
+# versions installed while building this adapter (autogen-agentchat/-core/-ext
+# 0.7.5, ag2 1.0.2, pydantic-ai-slim 2.31.1, smolagents 1.26.0), so none of
+# them needs a `python = "..."` constraint for Poetry's solver. autogen and
+# smolagents carry one anyway, `>=3.11`: they pull in Pillow, every Pillow up
+# to 12.3.0 is vulnerable (2026-10-20 advisories), and the fix, 13.0.0,
+# requires Python 3.11, which no patched release for 3.10 offers.
+autogen-agentchat = {version = ">=0.7.5", optional = true, python = ">=3.11"}
+autogen-core = {version = ">=0.7.5", optional = true, python = ">=3.11"}
+autogen-ext = {version = ">=0.7.5", optional = true, python = ">=3.11"}
+ag2 = {version = ">=1.0.2", optional = true}
+# Floor raised to 2.53.0: every release before it carries open security
+# advisories (the newest, GHSA-6fqq-452j-qhrp, is fixed in 2.53.0).
+pydantic-ai-slim = {version = ">=2.53.0", optional = true}
+smolagents = {version = ">=1.26.0", optional = true, python = ">=3.11"}
+# A4 (AWS Strands Agents). Same live PyPI `requires_python` check as Wave 2:
+# strands-agents reports ">=3.10" with NO upper bound at 1.52.0 (the version
+# installed while building this adapter), so it needs
+# no explicit `python = "..."` constraint for Poetry's solver to accept the
+# full ^3.10 range this project declares. Floor raised to 1.57.2 (still
+# ">=3.10", no upper bound): bidi graduated to the stable `strands.bidi`
+# namespace there, and since 1.55.0 the shared ToolExecutor fires the stable
+# BeforeToolCallEvent for BidiAgent too — the adapter's BidiAgent coverage
+# depends on both.
+strands-agents = {version = ">=1.57.2", optional = true}
+# Microsoft Agent Framework. Depends on agent-framework-core, NOT the
+# `agent-framework` meta-package: at 1.20.0 that is `agent-framework-core[all]`,
+# ~30 provider/connector packages (most still 1.0.0b pre-releases) that the
+# adapter never imports and that `dep-audit.yml`'s all-extras install would
+# drag into every audit. Same live PyPI `requires_python` check as above:
+# ">=3.10", no upper bound, at 1.20.0 (the version installed while building
+# this adapter).
+agent-framework-core = {version = ">=1.20.0", optional = true}
+# Checks the Ed25519 signature on a compliance evidence archive
+# (intutic_clawde/evidence.py) and on a sealed trace root
+# (intutic_clawde/integrity.py); the archive's hashes need nothing beyond the
+# standard library. Optional so the SDK keeps its two-package footprint for
+# everyone who never verifies an archive.
+cryptography = {version = ">=44.0.1", optional = true}
+
+[tool.poetry.extras]
+langchain = ["langchain"]
+google-adk = ["google-adk"]
+openai-agents = ["openai-agents"]
+autogen = ["autogen-agentchat", "autogen-core", "autogen-ext"]
+ag2 = ["ag2"]
+pydantic-ai = ["pydantic-ai-slim"]
+smolagents = ["smolagents"]
+strands = ["strands-agents"]
+agent-framework = ["agent-framework-core"]
+compliance = ["cryptography"]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.3"
+# Dev-only, for tests/test_adapter_managed_agents.py: constructs real
+# anthropic.types.beta.sessions event models to check managed_agents.py's
+# duck-typed field reads against the actual shipped shapes. Not a runtime
+# dependency of the adapter itself (see managed_agents.py's module doc: it
+# duck-types `client`/event objects rather than importing `anthropic`), so —
+# unlike the optional adapters above — this carries no risk to the `^3.10`
+# extras-resolution incident: it is not `optional = true` and not part of any
+# extra. PyPI reports `anthropic==0.122.0` (the version installed while
+# building this adapter) as `Requires-Python: >=3.9`, no upper bound, so it
+# needs no explicit `python = "..."` constraint either way. Locked at 1.11.0
+# since the 1.x bump (`Requires-Python: >=3.10`, inside this package's `^3.10`;
+# switches its HTTP client from httpx to httpx2 — dev group only).
+anthropic = ">=0.122.0"
+# Dev-only, for the generated API reference on the docs site
+# (tools/scripts/gen-sdk-reference-python.py, `pnpm gen:sdk-reference`). Reads
+# the package's source statically, so the reference does not depend on which
+# optional framework extras happen to be installed. griffelib is griffe's
+# library half, with no dependencies of its own; pinned exactly so a new
+# release cannot change the committed pages under CI's staleness check (the
+# version the openai-agents and pydantic-ai extras already resolve).
+griffelib = "2.2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

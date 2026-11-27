@@ -1,0 +1,194 @@
+/**
+ * Seeding the daemon's policy cache from the local snapshot.
+ *
+ * The interesting assertions here are the negative ones. The snapshot carries
+ * two rule arrays and they are not interchangeable: `rules` is the *gate*
+ * projection (space-padded EREs, `{source, severity, subject}`, `warn` rules
+ * already dropped), `sopRules` is the resolve response (`{toolPattern, action}`).
+ * Seeding from `rules` passes this module's own parse and is then rejected
+ * wholesale by `isSopRule` downstream — producing a cache that reports entries
+ * and enforces nothing. That failure is silent, which is why it is tested
+ * directly rather than left to review.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import * as http from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { seedFromSnapshot, invalidatePolicy, resolvePolicy } from '../../daemon/policyCache.js'
+import { isSopRule } from '../../policy.js'
+
+const WS = 'ws_seed_test'
+
+function writeSnapshot(dir: string, body: Record<string, unknown>): string {
+  const p = join(dir, 'policy-snapshot.json')
+  writeFileSync(p, JSON.stringify(body, null, 2))
+  return p
+}
+
+describe('seedFromSnapshot default path', () => {
+  it("reads the sync daemon's verified copy, not the live snapshot beside it", async () => {
+    const home = mkdtempSync(join(tmpdir(), 'intutic-seed-home-'))
+    const saved = { home: process.env['HOME'], snap: process.env['INTUTIC_POLICY_SNAPSHOT'] }
+    try {
+      process.env['HOME'] = home
+      delete process.env['INTUTIC_POLICY_SNAPSHOT']
+      const hooks = join(home, '.intutic', 'hooks')
+      mkdirSync(join(hooks, 'verified'), { recursive: true })
+      const body = (workspaceId: string) => JSON.stringify({ workspaceId, generatedAt: new Date().toISOString(), sopRules: [] })
+      writeFileSync(join(hooks, 'policy-snapshot.json'), body('ws_seed_live_edit'))
+      writeFileSync(join(hooks, 'verified', 'policy-snapshot.json'), body('ws_seed_verified'))
+      expect(await seedFromSnapshot()).toBe('ws_seed_verified')
+    } finally {
+      if (saved.home === undefined) delete process.env['HOME']
+      else process.env['HOME'] = saved.home
+      if (saved.snap !== undefined) process.env['INTUTIC_POLICY_SNAPSHOT'] = saved.snap
+      invalidatePolicy('ws_seed_verified')
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('seedFromSnapshot', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'intutic-seed-'))
+  })
+
+  afterEach(() => {
+    invalidatePolicy(WS)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('seeds rules the downstream guard actually accepts', async () => {
+    const file = writeSnapshot(dir, {
+      workspaceId: WS,
+      generatedAt: new Date().toISOString(),
+      interventionMode: 'ENFORCE',
+      sopRules: [{ id: 's1', toolPattern: 'Bash', action: 'block', reason: 'no shell' }],
+      rules: [{ id: 'sop.s1', source: ' (Bash) ', subject: 'tool', severity: 'block', reason: 'no shell' }],
+    })
+
+    expect(await seedFromSnapshot(file)).toBe(WS)
+
+    // Resolves with no network call — the whole point.
+    const policy = await resolvePolicy(WS)
+    expect(policy).not.toBeNull()
+    expect(policy!.sopRules).toHaveLength(1)
+
+    // The load-bearing assertion: these survive `isSopRule`. Seeding the `rules`
+    // array instead would satisfy every check above and fail this one.
+    expect(
+      policy!.sopRules.filter((r) => isSopRule(r)),
+      'seeded rules were dropped by isSopRule — the cache would enforce nothing',
+    ).toHaveLength(1)
+  })
+
+  it('refuses to seed a snapshot that carries only the gate projection', async () => {
+    // An older snapshot format. Seeding an empty policy here would be
+    // indistinguishable downstream from "this workspace has no rules".
+    const file = writeSnapshot(dir, {
+      workspaceId: WS,
+      generatedAt: new Date().toISOString(),
+      rules: [{ id: 'sop.s1', source: ' (Bash) ', severity: 'block' }],
+    })
+    expect(await seedFromSnapshot(file)).toBeNull()
+    expect(await resolvePolicy(WS).catch(() => null)).not.toMatchObject({ sopRules: [] })
+  })
+
+  it('carries the snapshot’s own age rather than stamping it fresh', async () => {
+    // A snapshot written three days ago must seed AND be recognised as stale, so
+    // the first request answers instantly and refreshes behind it. Stamping
+    // Date.now() would present three-day-old policy as current for a full TTL.
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString()
+    const file = writeSnapshot(dir, {
+      workspaceId: WS,
+      generatedAt: threeDaysAgo,
+      sopRules: [{ id: 's1', toolPattern: 'Bash', action: 'block', reason: 'x' }],
+    })
+    expect(await seedFromSnapshot(file)).toBe(WS)
+    const policy = await resolvePolicy(WS)
+    expect(policy).not.toBeNull()
+    expect(
+      Date.now() - policy!.cachedAt,
+      'the snapshot was stamped fresh, so its staleness is now invisible',
+    ).toBeGreaterThan(24 * 60 * 60 * 1000)
+  })
+
+  it('treats an unparseable timestamp as maximally stale, not as fresh', async () => {
+    const file = writeSnapshot(dir, {
+      workspaceId: WS,
+      generatedAt: 'not a date',
+      sopRules: [{ id: 's1', toolPattern: 'Bash', action: 'block', reason: 'x' }],
+    })
+    expect(await seedFromSnapshot(file)).toBe(WS)
+    const policy = await resolvePolicy(WS)
+    expect(policy!.cachedAt).toBe(0)
+  })
+
+  it('returns null instead of throwing on a missing or malformed snapshot', async () => {
+    // This runs inside the daemon's main(), whose rejections become
+    // process.exit(1) on a KeepAlive service — a throw would be a restart loop.
+    expect(await seedFromSnapshot(join(dir, 'nope.json'))).toBeNull()
+
+    const bad = join(dir, 'bad.json')
+    writeFileSync(bad, '{ not json')
+    expect(await seedFromSnapshot(bad)).toBeNull()
+
+    const noWs = writeSnapshot(dir, { sopRules: [] })
+    expect(await seedFromSnapshot(noWs)).toBeNull()
+  })
+  it('seeds no registry, and refreshes a fresh-looking seed on first use so the registry arrives', async () => {
+    // The snapshot carries no MCP registry. Seeding "allow" would let a deny
+    // workspace's unapproved servers through after every daemon restart, so
+    // the entry carries none — and counts as stale however recent it is.
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        sopRules: [],
+        mcpRegistry: { defaultPolicy: 'deny', approvedServers: ['github'], blockedServers: [], disabledTools: {} },
+      }))
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    const previous = process.env['CONTROL_PLANE_URL']
+    process.env['CONTROL_PLANE_URL'] = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    try {
+      const file = writeSnapshot(dir, {
+        workspaceId: WS,
+        generatedAt: new Date().toISOString(),
+        sopRules: [{ id: 's1', toolPattern: 'Bash', action: 'block', reason: 'x' }],
+      })
+      expect(await seedFromSnapshot(file)).toBe(WS)
+      const seeded = await resolvePolicy(WS)
+      expect(seeded!.mcpRegistry).toBeUndefined()
+
+      // The first resolve served the seed and refreshed behind it.
+      let refreshed = await resolvePolicy(WS)
+      for (let i = 0; i < 50 && refreshed?.mcpRegistry === undefined; i++) {
+        await new Promise((r) => setTimeout(r, 20))
+        refreshed = await resolvePolicy(WS)
+      }
+      expect(refreshed!.mcpRegistry).toEqual({
+        defaultPolicy: 'deny', approvedServers: ['github'], blockedServers: [], heldServers: [], disabledTools: {},
+      })
+    } finally {
+      if (previous === undefined) delete process.env['CONTROL_PLANE_URL']
+      else process.env['CONTROL_PLANE_URL'] = previous
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+  })
+  it("seeds the snapshot's server allowlist and marks the entry as a snapshot", async () => {
+    const file = writeSnapshot(dir, {
+      workspaceId: WS,
+      generatedAt: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
+      sopRules: [{ id: 's1', toolPattern: 'Bash', action: 'block', reason: 'x' }],
+      mcpAllowedServers: ['github', 7],
+    })
+    expect(await seedFromSnapshot(file)).toBe(WS)
+    const policy = await resolvePolicy(WS)
+    expect(policy!.allowedServers).toEqual(['github'])
+    expect(policy!.fromSnapshot).toBe(true)
+  })
+})

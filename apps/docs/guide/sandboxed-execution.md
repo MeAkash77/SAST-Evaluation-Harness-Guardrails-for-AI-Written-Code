@@ -1,0 +1,175 @@
+---
+title: Sandboxed Execution
+description: Running agents inside an isolated runtime whose only egress is the governing proxy — backends, platform support, and enforcement levels.
+---
+
+# Sandboxed Execution <Badge type="tip" text="Open-Core" />
+
+`intutic exec` normally runs an agent directly on your machine, with the
+proxy environment injected. `intutic exec --sandbox` runs it inside an
+isolated runtime instead — a dropped capability set, a read-only root
+filesystem, resource caps, and egress locked to the proxy — so the agent
+cannot reach the network except through governance, and cannot alter the
+firewall it runs behind.
+
+```bash
+intutic exec --sandbox --sandbox-image my-agent-sandbox -- claude
+intutic exec --sandbox=firecracker -- python my_agent.py
+```
+
+It needs no login: with [`intutic start`](/reference/cli#intutic-start)
+running, the agent's own provider keys are handed into the sandbox and the
+proxy passes them through.
+
+## No silent fallback
+
+A sandbox backend that isn't actually available is refused, never silently
+swapped for a weaker one or skipped in favor of running on the bare host.
+If Docker isn't running, `--sandbox` fails with an error telling you to
+start it — it does **not** fall back to running the agent ungoverned.
+
+## Backends and what they actually support today
+
+There are exactly two backends. Nothing else — no Kubernetes-native
+runtime, no spot-instance orchestration, no serverless or "stateless
+agent" execution mode, no MCP-server-specific sandbox — exists in the code
+today. If you run agents on one of those platforms, `intutic exec
+--sandbox` still works the same way any other command does there: the OCI
+backend is a `docker run`/`podman run` invocation, so it runs on any host
+where one of those is installed, including inside a Kubernetes pod, a VM,
+or a spot instance — but there's no platform-specific integration beyond
+that.
+
+### OCI containers (`--sandbox` or `--sandbox=oci`, the default)
+
+Runs the agent in a Docker or Podman container (`tools/cli/src/lib/sandbox/oci.ts`).
+This is the backend to reach for by default — it only needs a container
+runtime, which is available almost everywhere a developer or a CI/build
+agent already runs.
+
+The isolation envelope:
+
+| Control | What it does |
+|---|---|
+| `--cap-drop=ALL` + a narrow `--cap-add` | Starts from zero Linux capabilities; only what the entrypoint needs to install the firewall and drop privilege is added back — the agent itself runs with an empty capability set |
+| `--security-opt=no-new-privileges` | No setuid-root escalation inside the container |
+| `--read-only` rootfs + `tmpfs` scratch | The container's filesystem can't be modified; `/tmp`, `/run`, and the sandbox home are writable scratch space only, emptied when the container exits |
+| `--pids-limit` / `--memory` / `--cpus` | Bounds on fork-bombs and resource exhaustion |
+| A default-deny egress firewall inside the container | Installed by the image's entrypoint before the agent starts; permits only the proxy (reached via `host.docker.internal`), DNS, and any CIDRs passed with `--sandbox-allow` |
+
+The proxy listens on loopback by default. Docker Desktop (macOS, Windows)
+delivers the container's `host.docker.internal` connections to the host's
+loopback, so nothing more is needed there. With Docker or Podman on Linux,
+`host.docker.internal` is the bridge's address on the host, so start the proxy
+listening there too, for example
+`INTUTIC_PROXY_BIND=127.0.0.1,172.17.0.1` (see
+[`INTUTIC_PROXY_BIND`](/reference/configuration#core)).
+
+**The image** must contain `nftables` and `capsh`, which the entrypoint uses
+to install the firewall and drop privilege, plus your agent. The default,
+`intutic/sandbox:<CLI version>`, is built on your machine from the
+Dockerfile that ships with the CLI the first time you run `--sandbox`, and
+reused after that; nothing is pulled from a registry. It is a small Alpine
+image with the firewall tooling, `bash` and `curl`, and no agent. To run
+your agent, extend it with your toolchain and pass the result with
+`--sandbox-image`:
+
+```dockerfile
+ARG INTUTIC_VERSION
+FROM intutic/sandbox:${INTUTIC_VERSION}
+RUN apk add --no-cache python3 py3-pip
+```
+
+```bash
+intutic exec --sandbox -- true    # builds intutic/sandbox:<CLI version> once
+docker build --build-arg INTUTIC_VERSION="$(intutic --version)" -t my-agent-sandbox .
+intutic exec --sandbox --sandbox-image my-agent-sandbox -- python3 my_agent.py
+```
+
+For an agent that runs on Node — Claude Code, Codex, Gemini CLI — start from
+`intutic/sandbox:<CLI version>-node` instead: the default image plus Node.js
+and npm, with the same entrypoint, firewall and capability drop. It is built
+on first use the same way, from the default image:
+
+```dockerfile
+ARG INTUTIC_VERSION
+FROM intutic/sandbox:${INTUTIC_VERSION}-node
+RUN npm install -g @anthropic-ai/claude-code
+```
+
+```bash
+intutic exec --sandbox --sandbox-image "intutic/sandbox:$(intutic --version)-node" -- node --version   # builds it once
+docker build --build-arg INTUTIC_VERSION="$(intutic --version)" -t my-agent-sandbox .
+intutic exec --sandbox --sandbox-image my-agent-sandbox -- claude
+```
+
+Any other image works too, as long as it has `nftables`, `capsh` and the
+entrypoint's behaviour; a name other than the two built-in ones is pulled by
+Docker or Podman as usual.
+
+### Firecracker microVMs (`--sandbox=firecracker`)
+
+Runs the agent in a Firecracker microVM instead of a container — a
+separate guest kernel over KVM rather than shared-kernel namespaces, which
+is a stronger isolation boundary. The egress model is the same in spirit
+(the microVM's only route out is the governing proxy) but enforced
+**outside the guest**, by a default-deny firewall on the host side of the
+guest's tap interface — the agent inside the VM cannot reach or alter it.
+
+::: warning Maturity status — read before relying on this in production
+The microVM genuinely **boots on real KVM** — this has been validated on
+a nested-virtualization host, where Firecracker loaded and ran a guest
+kernel through this backend's exact launch sequence. What has **not** been
+validated end-to-end is an agent running to completion inside a
+fully-booted guest. `health()` gates on KVM being available, the
+`firecracker` binary, and an operator-supplied kernel + rootfs pair
+(`INTUTIC_FC_KERNEL` / `INTUTIC_FC_ROOTFS` — you build these the same way
+you build an OCI image for the container backend, containing your agent).
+If any of that is missing, the backend refuses rather than pretending to
+run — it will not fall back to the container backend for you.
+:::
+
+**Requires KVM** (so a bare-metal host or a VM host with nested
+virtualization enabled — not every cloud VM size supports this) plus the
+`firecracker` binary and your own kernel/rootfs images. The agent runs in
+the guest over ssh, so the rootfs needs an sshd, and `INTUTIC_FC_GUEST_KEY`
+must name the private key it accepts for `root`. Without that key the run
+fails with exit `2` before the microVM is set up.
+
+The guest reaches the proxy at the host's address on the tap link, which
+exists only once the microVM starts, so the proxy has to listen on every
+interface: `INTUTIC_PROXY_BIND=0.0.0.0`.
+
+## Enforcement levels
+
+A workspace can require sandboxing rather than leaving it to each
+developer to remember `--sandbox`:
+
+| Level | Behavior |
+|---|---|
+| **Off** (default) | Agents run on the host as normal. Developers can still opt in with `--sandbox`. |
+| **Recommend** | An un-sandboxed `intutic exec` still runs, but prints a warning nudging the developer to add `--sandbox`. |
+| **Require** | An un-sandboxed `intutic exec` is refused — the developer must re-run with `--sandbox`. |
+
+Set this from **Settings → Security → Sandboxed Execution** in the
+dashboard, or resolved directly by the CLI from workspace settings
+(`GET /api/v1/workspace/settings`, cached locally so an offline developer
+still sees the last-known requirement rather than defaulting open).
+
+::: warning This is a client-side, advisory layer
+`intutic exec --sandbox` is what enforces this — a determined developer
+can bypass the requirement entirely by not using `intutic exec` at all
+and calling their agent directly. Pair it with
+[Network Egress Control](/guide/policies#network-egress-control) and
+`intutic enforce`'s host firewall for the layer that closes that gap:
+even a bypassed sandbox requirement still can't route traffic anywhere
+but the governing proxy once host-level enforcement is on.
+:::
+
+## Related
+
+| Page | What it covers |
+|---|---|
+| [Network Egress Control](/guide/policies#network-egress-control) | The proxy-level and host-firewall guardrails sandboxing pairs with |
+| [Policies & Enforcement](/guide/policies) | Where the workspace-level sandbox requirement is set |
+| [CLI Reference — `intutic exec`](/reference/cli#intutic-exec) | Every `--sandbox*` flag |

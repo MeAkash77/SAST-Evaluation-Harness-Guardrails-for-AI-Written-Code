@@ -1,0 +1,1314 @@
+//! Integration tests for the local deterministic reward loop.
+//!
+//! Since the storage spike these run over *both* `LocalStore` implementations.
+//! `MemoryStore` always runs; `ValkeyStore` runs additionally when `VALKEY_URL`
+//! is set (e.g. `redis://127.0.0.1:6379`), so `cargo test` stays green on
+//! machines without Valkey while still covering the path that ships.
+//!
+//! Backend-specific tests — wire format, cloud takeover — are marked as such
+//! and skip when Valkey is absent.
+
+use intutic_proxy::config::{RewardConfig, RoutingConfig};
+use intutic_proxy::routing::bandit::{route_model, CandidatePool};
+use intutic_proxy::routing::reward::{apply_update, RewardEngine, RewardSignals};
+use intutic_proxy::store::valkey::sha256_hex;
+use intutic_proxy::store::{
+    BreakGlassScope, CachedResponse, ControlPlaneAuth, ControlPlaneCache, FeatureFlags,
+    HardCapStatus, JudgeScope, LocalStore, MemoryStore, NotifyScope, NullControlPlaneCache,
+    Ownership, ValkeyControlPlaneCache, ValkeyStore,
+};
+use redis::AsyncCommands;
+use std::sync::Arc;
+
+const MODEL: &str = "claude-3-5-sonnet";
+const SOP_TIER: &str = "TIER_1";
+const TASK_TYPE: &str = "coding";
+
+/// Agreement bound between the Lua path and the Rust path. Two sources of
+/// divergence, both bounded and both on the Valkey side:
+///
+///   * arithmetic — Lua computes `math.log(n)/math.log(2)`, Rust uses `log2`
+///   * serialization — `cjson.encode` emits `%.14g`, so every arm round-trips
+///     through 14 significant digits while `MemoryStore` keeps the f64
+///
+/// Serialization dominates by roughly three orders of magnitude, which is the
+/// interesting direction: the in-memory store is *more* precise than Valkey,
+/// so moving a workspace local cannot lose fidelity.
+const EPSILON: f64 = 1e-12;
+
+type Backend = (
+    &'static str,
+    Arc<dyn LocalStore>,
+    Arc<dyn ControlPlaneCache>,
+);
+
+async fn valkey_conn() -> Option<Arc<redis::aio::ConnectionManager>> {
+    let url = std::env::var("VALKEY_URL").ok()?;
+    let client = redis::Client::open(url).ok()?;
+    let mgr = redis::aio::ConnectionManager::new(client).await.ok()?;
+    Some(Arc::new(mgr))
+}
+
+/// Every backend under test. Memory always; Valkey when reachable.
+async fn backends() -> Vec<Backend> {
+    let mut out: Vec<Backend> = vec![(
+        "memory",
+        Arc::new(MemoryStore::new()),
+        Arc::new(NullControlPlaneCache),
+    )];
+    if let Some(conn) = valkey_conn().await {
+        out.push((
+            "valkey",
+            Arc::new(ValkeyStore::new(conn.clone())),
+            Arc::new(ValkeyControlPlaneCache::new(conn)),
+        ));
+    } else {
+        eprintln!("note: VALKEY_URL not set or unreachable — Valkey backend skipped");
+    }
+    out
+}
+
+/// Unique workspace id per test run so parallel/repeated runs never collide.
+fn unique_ws(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("test-reward-{}-{}", tag, nanos)
+}
+
+fn success_signals() -> RewardSignals {
+    RewardSignals {
+        upstream_ok: true,
+        latency_ms: 1_000,
+        token_anomaly: false,
+        raw_cost_usd: 0.01,
+        actual_cost_usd: 0.01,
+        response_integrity: intutic_proxy::routing::integrity::RIS_MAX,
+    }
+}
+
+fn arm_field() -> String {
+    format!("arm:{}:{}:{}", MODEL, SOP_TIER, TASK_TYPE)
+}
+
+/// Valkey-only cleanup; `MemoryStore` is dropped with the test.
+async fn cleanup(ws: &str, session: Option<&str>) {
+    let Some(valkey) = valkey_conn().await else {
+        return;
+    };
+    let mut conn = valkey.as_ref().clone();
+    let _: Result<(), _> = conn.del(format!("bandit:{}", ws)).await;
+    let _: Result<(), _> = conn.del(format!("bandit:reward_mode:{}", ws)).await;
+    if let Some(scope) = session {
+        let _: Result<(), _> = conn.del(format!("v2:routing:{}", scope)).await;
+    }
+}
+
+#[tokio::test]
+async fn local_mode_claims_ownership_and_updates_arm() {
+    for (name, store, _cp) in backends().await {
+        let ws = unique_ws("claim");
+        let engine = RewardEngine::new();
+        let cfg = RewardConfig::default();
+
+        engine
+            .record(
+                &store,
+                &ws,
+                MODEL,
+                SOP_TIER,
+                TASK_TYPE,
+                success_signals(),
+                &cfg,
+            )
+            .await;
+
+        assert_eq!(
+            store.reward_mode(&ws).await.unwrap(),
+            Some(Ownership::Local),
+            "[{name}] first local update must claim ownership"
+        );
+
+        let arms = store.load_arms(&ws).await.unwrap();
+        let arm = arms
+            .get(&arm_field())
+            .unwrap_or_else(|| panic!("[{name}] arm must exist"));
+        // pulls 0 → scale 1.0; a clean equal-cost success now scores the
+        // NO_FAULT_BASELINE of 0.8, not 1.0 — so alpha 1.8, beta 1.2.
+        //
+        // The rebase is what gives the two-sided cost term room to move upward:
+        // at a 1.0 baseline the clamp ate every cheapness bonus and the term was
+        // a silent no-op for the case it exists to reward. This test encoded the
+        // old arithmetic and was outside the `--lib routing::reward` filter, so
+        // it survived the change by not being run.
+        assert_eq!(arm.pulls, 1, "[{name}]");
+        assert!(
+            (arm.alpha - (1.0 + intutic_proxy::routing::reward::NO_FAULT_BASELINE)).abs() < 1e-6,
+            "[{name}] alpha={}",
+            arm.alpha
+        );
+        assert!(
+            (arm.beta - (2.0 - intutic_proxy::routing::reward::NO_FAULT_BASELINE)).abs() < 1e-6,
+            "[{name}] beta={}",
+            arm.beta
+        );
+        assert!(!arm.last_updated.is_empty(), "[{name}]");
+
+        cleanup(&ws, None).await;
+    }
+}
+
+/// Valkey-only by construction, not by omission: a `"cloud"` marker is written
+/// by the control plane, and a standalone `MemoryStore` has no control plane
+/// that could write one. The trait deliberately exposes no way to set it.
+#[tokio::test]
+async fn cloud_marker_suppresses_local_writes() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("cloud");
+    let mut conn = valkey.as_ref().clone();
+    let _: () = conn
+        .set(format!("bandit:reward_mode:{}", ws), "cloud")
+        .await
+        .unwrap();
+
+    let store: Arc<dyn LocalStore> = Arc::new(ValkeyStore::new(valkey.clone()));
+    let engine = RewardEngine::new();
+    engine
+        .record(
+            &store,
+            &ws,
+            MODEL,
+            SOP_TIER,
+            TASK_TYPE,
+            success_signals(),
+            &RewardConfig::default(),
+        )
+        .await;
+
+    assert!(
+        store.load_arms(&ws).await.unwrap().is_empty(),
+        "cloud-owned workspace must receive no local arm writes"
+    );
+
+    cleanup(&ws, None).await;
+}
+
+#[tokio::test]
+async fn twenty_rewards_exit_cold_start_and_enable_sampling() {
+    for (name, store, cp) in backends().await {
+        let ws = unique_ws("coldstart");
+        // route_model's scope parameter must be tool_history_scope's shape,
+        // {workspace_id}:{agent} — never a bare session id (see the
+        // debug_assert in session_routing/set_session_locked_model/
+        // clear_session_locked_model, which now enforces exactly this).
+        let scope = format!("{ws}:agent");
+        let engine = RewardEngine::new();
+        let cfg = RewardConfig::default();
+
+        for _ in 0..20 {
+            engine
+                .record(
+                    &store,
+                    &ws,
+                    MODEL,
+                    SOP_TIER,
+                    TASK_TYPE,
+                    success_signals(),
+                    &cfg,
+                )
+                .await;
+        }
+
+        let arms = store.load_arms(&ws).await.unwrap();
+        let arm = arms.get(&arm_field()).unwrap();
+        assert_eq!(arm.pulls, 20, "[{name}]");
+        assert!(arm.alpha > 1.0, "[{name}]");
+
+        // With 20 cumulative pulls the router must leave the cold-start bypass
+        // and Thompson-sample from the candidate pool.
+        let candidates: Vec<String> = vec![
+            "claude-3-5-sonnet".to_string(),
+            "gpt-4o".to_string(),
+            "gemini-2.0-flash".to_string(),
+        ];
+        let pool = CandidatePool {
+            requested_arm: "gpt-4o".to_string(),
+            arms: candidates.clone(),
+        };
+        let decision = route_model(
+            &store,
+            &cp,
+            &ws,
+            &scope,
+            "gpt-4o",
+            "write a function to add two numbers",
+            Some(&pool),
+            &RoutingConfig::default(),
+        )
+        .await
+        .unwrap();
+        let (selected, sop_tier, task_type) =
+            (decision.model, decision.sop_tier, decision.task_type);
+        assert!(
+            candidates.contains(&selected),
+            "[{name}] sampled model {selected} must come from the candidate pool"
+        );
+        assert_eq!(sop_tier, "TIER_1", "[{name}]");
+        assert_eq!(task_type, "coding", "[{name}]");
+
+        // The sampled choice must be locked for the scope.
+        let locked = store.session_routing(&scope).await.unwrap().locked_model;
+        assert_eq!(locked.as_deref(), Some(selected.as_str()), "[{name}]");
+
+        cleanup(&ws, Some(&scope)).await;
+    }
+}
+
+/// The defect this closes: routing state used to key on the bare
+/// `x-session-id` header alone, which is "unknown" for effectively all
+/// traffic — so every unidentified caller in every tenant shared one lock.
+/// `agent` here is deliberately identical across both scopes; only the
+/// workspace differs.
+#[tokio::test]
+async fn two_workspaces_with_identical_agent_suffixes_must_not_share_a_lock() {
+    for (name, store, _cp) in backends().await {
+        let ws_a = unique_ws("scope-a");
+        let ws_b = unique_ws("scope-b");
+        let agent = "agent-shared-suffix";
+        let scope_a = format!("{ws_a}:{agent}");
+        let scope_b = format!("{ws_b}:{agent}");
+
+        store
+            .set_session_locked_model(&scope_a, "claude-3-5-sonnet")
+            .await
+            .unwrap();
+
+        let a = store.session_routing(&scope_a).await.unwrap();
+        let b = store.session_routing(&scope_b).await.unwrap();
+
+        assert_eq!(
+            a.locked_model.as_deref(),
+            Some("claude-3-5-sonnet"),
+            "[{name}]"
+        );
+        assert!(
+            b.locked_model.is_none(),
+            "[{name}] workspace B must not see workspace A's lock despite an identical agent suffix"
+        );
+
+        cleanup(&ws_a, Some(&scope_a)).await;
+        cleanup(&ws_b, Some(&scope_b)).await;
+    }
+}
+
+/// The `debug_assert!` catching a fifth instance of the bare-session-id bug:
+/// a scope with no `:` cannot be `tool_history_scope`'s `{workspace}:{agent}`
+/// output, so `cargo test` (a debug build) must panic rather than silently
+/// accept it.
+#[tokio::test]
+#[should_panic(expected = "session routing scope must be")]
+async fn a_bare_session_id_with_no_colon_trips_the_scope_guard() {
+    let store = MemoryStore::new();
+    let _ = store
+        .set_session_locked_model("ses_bare_no_colon", "claude-3-5-sonnet")
+        .await;
+}
+
+/// The bytes the enterprise reward cron reads must not change. Field names are
+/// the contract — `lastUpdated` in particular is camelCase via serde rename,
+/// and the Lua script writes it as a literal string key.
+#[tokio::test]
+async fn valkey_wire_format_is_unchanged() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("wire");
+    let store: Arc<dyn LocalStore> = Arc::new(ValkeyStore::new(valkey.clone()));
+    let engine = RewardEngine::new();
+
+    engine
+        .record(
+            &store,
+            &ws,
+            MODEL,
+            SOP_TIER,
+            TASK_TYPE,
+            success_signals(),
+            &RewardConfig::default(),
+        )
+        .await;
+
+    let mut conn = valkey.as_ref().clone();
+    let raw: std::collections::HashMap<String, String> =
+        conn.hgetall(format!("bandit:{}", ws)).await.unwrap();
+    let arm_json = raw.get(&arm_field()).expect("arm must exist");
+    let parsed: serde_json::Value = serde_json::from_str(arm_json).unwrap();
+
+    for field in ["alpha", "beta", "pulls", "lastUpdated"] {
+        assert!(
+            parsed.get(field).is_some(),
+            "wire format lost `{field}`: {arm_json}"
+        );
+    }
+    // And it must still deserialize into the shared struct both sides use.
+    let _: intutic_proxy::routing::bandit::BanditArmState = serde_json::from_str(arm_json).unwrap();
+
+    cleanup(&ws, None).await;
+}
+
+/// No control plane → `None`, which is what lets `config.yaml` decide. Both
+/// backends: standalone by construction, and Valkey with no key written.
+#[tokio::test]
+async fn absent_feature_flags_mean_no_control_plane() {
+    for (name, _store, cp) in backends().await {
+        let ws = unique_ws("flags-absent");
+        assert_eq!(
+            cp.feature_flags(&ws).await,
+            None,
+            "[{name}] absent flags must not resolve to all-false"
+        );
+        cleanup(&ws, None).await;
+    }
+}
+
+/// The distinction the `Option` exists to protect: a present-but-malformed
+/// payload keeps the control plane authoritative (every flag false) rather
+/// than handing control back to local config. Previously this was a comment
+/// beside a `flags_key_present` boolean; now it is the return type.
+#[tokio::test]
+async fn present_but_unparseable_flags_stay_authoritative() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("flags-garbage");
+    let mut conn = valkey.as_ref().clone();
+    let _: () = conn
+        .set(format!("workspace:feature_flags:{}", ws), "}{ not json")
+        .await
+        .unwrap();
+
+    let cp = ValkeyControlPlaneCache::new(valkey.clone());
+    assert_eq!(
+        cp.feature_flags(&ws).await,
+        Some(FeatureFlags::default()),
+        "a malformed payload must stay authoritative, not fall back to config"
+    );
+
+    let _: Result<(), _> = conn.del(format!("workspace:feature_flags:{}", ws)).await;
+}
+
+#[tokio::test]
+async fn feature_flags_parse_from_control_plane_payload() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("flags-parse");
+    let mut conn = valkey.as_ref().clone();
+    let _: () = conn
+        .set(
+            format!("workspace:feature_flags:{}", ws),
+            r#"{"ff_bandit_routing":true,"ff_response_cache_semantic":true,"ff_unknown":true}"#,
+        )
+        .await
+        .unwrap();
+
+    let cp = ValkeyControlPlaneCache::new(valkey.clone());
+    assert_eq!(
+        cp.feature_flags(&ws).await,
+        Some(FeatureFlags {
+            bandit_routing: true,
+            response_cache_exact: false, // omitted → false, not an error
+            response_cache_semantic: true,
+            // Same "omitted → false" rule, and it matters more for this one:
+            // a shadow flag that defaulted true would silently disable
+            // enforcement for every workspace whose payload predates it.
+            shadow_enforcement: false,
+            // Same rule again. A shadow-routing flag defaulting true would make
+            // every workspace stop routing without saying so.
+            shadow_routing: false,
+        })
+    );
+
+    let _: Result<(), _> = conn.del(format!("workspace:feature_flags:{}", ws)).await;
+}
+
+/// The single most dangerous confusion in the port. `validate_virtual_key` used
+/// to return `KeyNotFound` for a missing `v2:auth:apikey:*`, which `proxy.rs`
+/// turns into a 401. Standalone has no such key for *any* token, so a null cache
+/// that reported "not found" would reject every request ever made. `Unmanaged`
+/// is a distinct variant precisely so that cannot happen.
+#[tokio::test]
+async fn standalone_auth_is_unmanaged_not_rejected() {
+    let cp = NullControlPlaneCache;
+    for token in ["", "sk-ant-whatever", "vk_live_123"] {
+        assert!(
+            matches!(cp.auth_context(token).await, ControlPlaneAuth::Unmanaged),
+            "standalone must never reject a key it has no way to know about (token {token:?})"
+        );
+    }
+}
+
+/// The mirror of the above: with a control plane present, an unknown key is
+/// still a 401. Standalone permissiveness must not leak into the managed path.
+#[tokio::test]
+async fn managed_auth_still_rejects_unknown_keys() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let cp = ValkeyControlPlaneCache::new(valkey);
+    let unknown = format!("vk_nonexistent_{}", unique_ws("auth"));
+    assert!(
+        matches!(cp.auth_context(&unknown).await, ControlPlaneAuth::Rejected),
+        "a managed deployment must still 401 an unrecognised key"
+    );
+}
+
+/// Standalone must not silently enable paid-tier or control-plane-gated
+/// behaviour. These are constants, but they are constants the standalone
+/// security posture depends on.
+#[tokio::test]
+async fn standalone_gates_are_all_closed() {
+    let cp = NullControlPlaneCache;
+    assert_eq!(
+        cp.hard_block("ws").await,
+        HardCapStatus::Clear,
+        "no cap without a control plane"
+    );
+    assert!(
+        cp.break_glass_grant("any-token", "ws").await.is_none(),
+        "no issuer means no valid break-glass token"
+    );
+    assert!(
+        !cp.auto_judge_active(JudgeScope::Session, "s").await,
+        "auto-judge is a control-plane feature"
+    );
+    assert!(!cp.auto_judge_active(JudgeScope::Loop, "l").await);
+    assert_eq!(cp.loop_status("run").await, None);
+    assert_eq!(cp.wasm_plugins("ws").await.unwrap(), None);
+    assert_eq!(cp.wasm_binary("deadbeef").await.unwrap(), None);
+}
+
+/// The break-glass defect this closes: a token approved for one workspace
+/// must never bypass policy for another. Pre-scoping, `break_glass_valid`
+/// checked only whether the Valkey key existed — any workspace's token
+/// worked for every workspace.
+#[tokio::test]
+async fn break_glass_grant_is_scoped_to_the_issuing_workspace() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let owner_ws = unique_ws("bg-owner");
+    let other_ws = unique_ws("bg-other");
+    let token = format!("bg_{}", unique_ws("token"));
+    let request_id = format!("bgr_{}", unique_ws("req"));
+    let mut conn = valkey.as_ref().clone();
+    // The approval is keyed on the token's SHA-256 — the control plane never
+    // stores the raw token, so neither store holds anything replayable.
+    let key = format!("bg:token:{}", sha256_hex(&token));
+    let _: () = conn
+        .set(
+            &key,
+            serde_json::json!({
+                "requestId": request_id,
+                "workspaceId": owner_ws,
+                "policyId": null,
+                "expiresAt": "2099-01-01T00:00:00.000Z",
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    let cp = ValkeyControlPlaneCache::new(valkey.clone());
+
+    let grant = cp.break_glass_grant(&token, &owner_ws).await;
+    assert_eq!(
+        grant.as_ref().map(|g| g.request_id.clone()),
+        Some(request_id),
+        "the issuing workspace must be granted, carrying the real request id"
+    );
+    assert_eq!(
+        grant.map(|g| g.scope()),
+        Some(BreakGlassScope::Global),
+        "a token with no policy id is the global bypass every existing token was"
+    );
+
+    assert!(
+        cp.break_glass_grant(&token, &other_ws).await.is_none(),
+        "a token approved for one workspace must not bypass policy for another"
+    );
+
+    // A key written under the RAW token (the pre-hashing layout) is not a grant.
+    let _: () = conn.set(format!("bg:token:{}", token), r#"{"requestId":"bgr_raw","workspaceId":"x","policyId":null,"expiresAt":"2099-01-01T00:00:00.000Z"}"#).await.unwrap();
+    assert!(
+        cp.break_glass_grant(&token, "x").await.is_none(),
+        "the lookup is by hash; a raw-token key must not grant"
+    );
+    let _: Result<(), _> = conn.del(format!("bg:token:{}", token)).await;
+
+    let _: Result<(), _> = conn.del(&key).await;
+}
+
+/// A scoped token names one WASM rule or one detector and skips nothing
+/// else; a legacy unprefixed id narrows to a WASM rule rather than staying a
+/// global bypass.
+#[tokio::test]
+async fn break_glass_grant_carries_its_scope() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("bg-scope");
+    let mut conn = valkey.as_ref().clone();
+    let cp = ValkeyControlPlaneCache::new(valkey.clone());
+    for (policy_id, expected) in [
+        (
+            "wasm:pcas_exfiltration_001",
+            BreakGlassScope::WasmRule("pcas_exfiltration_001".into()),
+        ),
+        (
+            "detector:consecutive_repeat",
+            BreakGlassScope::Detector("consecutive_repeat".into()),
+        ),
+        (
+            "pcas_exfiltration_001",
+            BreakGlassScope::WasmRule("pcas_exfiltration_001".into()),
+        ),
+    ] {
+        let token = format!("bg_{}", unique_ws("token"));
+        let key = format!("bg:token:{}", sha256_hex(&token));
+        let _: () = conn
+            .set(
+                &key,
+                serde_json::json!({ "requestId": "bgr_scoped", "workspaceId": ws, "policyId": policy_id, "expiresAt": "2099-01-01T00:00:00.000Z" }).to_string(),
+            )
+            .await
+            .unwrap();
+        let grant = cp
+            .break_glass_grant(&token, &ws)
+            .await
+            .expect("a scoped token is still a grant for its workspace");
+        assert_eq!(grant.scope(), expected, "policyId {policy_id}");
+        let _: Result<(), _> = conn.del(&key).await;
+    }
+}
+
+/// Present but unparseable must DENY here — the opposite rule from
+/// `present_but_unparseable_flags_stay_authoritative` above. Feature flags
+/// stay authoritative on garbage because "no flags on" is already the safe
+/// reading; break-glass existing at all is itself the risky state, so a
+/// payload this code cannot verify must not be trusted as a grant.
+#[tokio::test]
+async fn break_glass_grant_denies_an_unparseable_payload() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("bg-garbage");
+    let token = format!("bg_{}", unique_ws("token"));
+    let key = format!("bg:token:{}", sha256_hex(&token));
+    let mut conn = valkey.as_ref().clone();
+    let _: () = conn.set(&key, "}{ not json").await.unwrap();
+
+    let cp = ValkeyControlPlaneCache::new(valkey.clone());
+    assert!(
+        cp.break_glass_grant(&token, &ws).await.is_none(),
+        "an unparseable break-glass payload must deny, not fail open"
+    );
+
+    let _: Result<(), _> = conn.del(&key).await;
+}
+
+/// Tool-sequence anomaly detection keeps only the newest `cap` entries, and
+/// both backends must agree on which ones — an off-by-one here silently changes
+/// what the WASM rules see.
+#[tokio::test]
+async fn tool_sequence_trims_to_the_newest_entries() {
+    for (name, store, _cp) in backends().await {
+        let session = unique_ws("tools");
+        let batch: Vec<String> = (0..25).map(|i| format!("tool_{i:02}")).collect();
+
+        let got = store
+            .record_tool_sequence(&session, &batch, 20)
+            .await
+            .unwrap();
+
+        assert_eq!(got.len(), 20, "[{name}] must trim to the cap");
+        assert_eq!(got.first().unwrap(), "tool_05", "[{name}] oldest kept");
+        assert_eq!(got.last().unwrap(), "tool_24", "[{name}] newest kept");
+
+        // A read with nothing new must not disturb the stored sequence.
+        let again = store.record_tool_sequence(&session, &[], 20).await.unwrap();
+        assert_eq!(again, got, "[{name}] empty append is a pure read");
+
+        // The key must carry a TTL. It had none: the list was length-capped by
+        // LTRIM, but the key *count* grew without bound — one key per session
+        // id ever seen, kept forever. TTL -1 (persistent) is the regression.
+        if name == "valkey" {
+            if let Some(valkey) = valkey_conn().await {
+                let mut conn = valkey.as_ref().clone();
+                let ttl: i64 = redis::cmd("TTL")
+                    .arg(format!("v2:session:{}:tools", session))
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(-3);
+                assert!(
+                    ttl > 0,
+                    "[{name}] tool-sequence key must expire; TTL was {ttl} (-1 = persistent, the bug)"
+                );
+                assert!(
+                    ttl <= 86_400,
+                    "[{name}] TTL should be at most the documented day, got {ttl}"
+                );
+            }
+        }
+
+        if let Some(valkey) = valkey_conn().await {
+            let mut conn = valkey.as_ref().clone();
+            let _: Result<(), _> = conn.del(format!("v2:session:{}:tools", session)).await;
+        }
+    }
+}
+
+/// `calls_last_60s` counts a time window, not a fixed entry count — the
+/// property `tool_sequence`'s cap cannot express. Both backends must agree
+/// on when a call ages out of the window, not just on how many arrived.
+#[tokio::test]
+async fn calls_last_60s_counts_the_window_not_the_whole_history() {
+    for (name, store, _cp) in backends().await {
+        let session = unique_ws("calls");
+        let now = 1_700_000_000i64; // fixed epoch — the test owns time, not the clock
+
+        let count = store
+            .record_calls_and_count_window(&session, 3, now, 60)
+            .await
+            .unwrap();
+        assert_eq!(count, 3, "[{name}] three calls land in the window");
+
+        let count = store
+            .record_calls_and_count_window(&session, 2, now, 60)
+            .await
+            .unwrap();
+        assert_eq!(count, 5, "[{name}] two more join the same window");
+
+        // Two hours later, a read that adds nothing new must see the earlier
+        // burst as fully aged out — the whole point of a window over a
+        // fixed-entry cap, which `tool_sequence` cannot express at all.
+        let count = store
+            .record_calls_and_count_window(&session, 0, now + 7_200, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "[{name}] the earlier burst has aged out of the window"
+        );
+
+        let count = store
+            .record_calls_and_count_window(&session, 1, now + 7_200, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "[{name}] only the fresh call is in the new window"
+        );
+
+        // Same TTL discipline as `tool_sequence`'s key: capped by aging out
+        // entries is not the same guarantee as the key itself expiring, and
+        // the tool-sequence regression this mirrors was exactly that gap.
+        if name == "valkey" {
+            if let Some(valkey) = valkey_conn().await {
+                let mut conn = valkey.as_ref().clone();
+                let ttl: i64 = redis::cmd("TTL")
+                    .arg(format!("v2:session:{}:calls", session))
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(-3);
+                assert!(
+                    ttl > 0,
+                    "[{name}] call-window key must expire; TTL was {ttl} (-1 = persistent, the bug)"
+                );
+            }
+        }
+
+        if let Some(valkey) = valkey_conn().await {
+            let mut conn = valkey.as_ref().clone();
+            let _: Result<(), _> = conn.del(format!("v2:session:{}:calls", session)).await;
+        }
+    }
+}
+
+/// The response cache round-trips through both backends with its camelCase
+/// wire format intact — the field names the control plane also reads.
+#[tokio::test]
+async fn response_cache_round_trips_and_preserves_wire_format() {
+    for (name, store, _cp) in backends().await {
+        let hash = format!("spike{}", unique_ws("cache").replace('-', ""));
+        assert!(
+            store.cached_response(&hash).await.is_none(),
+            "[{name}] cold cache must miss"
+        );
+
+        let entry = CachedResponse {
+            prompt: "p".into(),
+            response: "r".into(),
+            model: MODEL.into(),
+            prompt_tokens: 11,
+            completion_tokens: 22,
+            cached_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.store_response(&hash, &entry, 60).await.unwrap();
+
+        let got = store.cached_response(&hash).await.expect("must hit");
+        assert_eq!(got.prompt_tokens, 11, "[{name}]");
+        assert_eq!(got.completion_tokens, 22, "[{name}]");
+        assert_eq!(got.model, MODEL, "[{name}]");
+
+        if let Some(valkey) = valkey_conn().await {
+            let mut conn = valkey.as_ref().clone();
+            let raw: Option<String> = conn.get(format!("cache:response:{}", hash)).await.unwrap();
+            if let Some(raw) = raw {
+                let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                for field in ["promptTokens", "completionTokens", "cachedAt"] {
+                    assert!(json.get(field).is_some(), "cache lost `{field}`: {raw}");
+                }
+                let _: Result<(), _> = conn.del(format!("cache:response:{}", hash)).await;
+            }
+        }
+    }
+}
+
+/// The point of durability: a per-session CLI proxy restarts constantly, and
+/// without this the `>= 20 pulls` gate would never open, so intelligent routing
+/// — the headline open-core feature — would never activate.
+#[tokio::test]
+async fn standalone_learning_survives_restart() {
+    let dir = std::env::temp_dir().join(unique_ws("durable"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bandit-state.json");
+    let ws = unique_ws("persist");
+    let cfg = RewardConfig::default();
+
+    // First "process": 20 rewards, enough to clear the cold-start gate.
+    {
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+        let engine = RewardEngine::new();
+        for _ in 0..20 {
+            engine
+                .record(
+                    &store,
+                    &ws,
+                    MODEL,
+                    SOP_TIER,
+                    TASK_TYPE,
+                    success_signals(),
+                    &cfg,
+                )
+                .await;
+        }
+        store
+            .set_workspace_credential(&ws, "anthropic_api_key", "sk-ant-secret")
+            .await;
+    }
+
+    // Second "process": same path, fresh store.
+    let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+    let arms = store.load_arms(&ws).await.unwrap();
+    let arm = arms.get(&arm_field()).expect("arm must survive restart");
+    assert_eq!(arm.pulls, 20, "all pulls must survive");
+    assert!(arm.alpha > 1.0);
+    assert_eq!(
+        store.reward_mode(&ws).await.unwrap(),
+        Some(Ownership::Local),
+        "local ownership must survive so the second process keeps writing"
+    );
+
+    // Credentials must NOT survive — they are never written to disk.
+    assert_eq!(
+        store
+            .workspace_credential(&ws, &["anthropic_api_key"])
+            .await,
+        None,
+        "credentials must never be persisted"
+    );
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !raw.contains("sk-ant-secret") && !raw.contains("anthropic_api_key"),
+        "snapshot must contain no credential material: {raw}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A corrupt snapshot must degrade to cold-start, never prevent boot.
+#[tokio::test]
+async fn corrupt_snapshot_starts_fresh_instead_of_failing() {
+    let dir = std::env::temp_dir().join(unique_ws("corrupt"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bandit-state.json");
+    std::fs::write(&path, "}{ not json at all").unwrap();
+
+    let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+    assert!(store.load_arms("anything").await.unwrap().is_empty());
+
+    // And it must recover: a subsequent update overwrites the bad file.
+    store
+        .update_arm("ws", "arm:a:b:c", 1.0, "now")
+        .await
+        .unwrap();
+    let reloaded: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+    assert_eq!(
+        reloaded
+            .load_arms("ws")
+            .await
+            .unwrap()
+            .get("arm:a:b:c")
+            .unwrap()
+            .pulls,
+        1
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `MemoryStore::new()` must stay ephemeral — tests and the Valkey path rely on
+/// it never touching disk.
+#[tokio::test]
+async fn ephemeral_store_writes_nothing() {
+    let before = std::fs::metadata(
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+            .join(".intutic")
+            .join("bandit-state.json"),
+    )
+    .and_then(|m| m.modified())
+    .ok();
+
+    let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new());
+    store
+        .update_arm("ws", "arm:x:y:z", 1.0, "now")
+        .await
+        .unwrap();
+
+    let after = std::fs::metadata(
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+            .join(".intutic")
+            .join("bandit-state.json"),
+    )
+    .and_then(|m| m.modified())
+    .ok();
+    assert_eq!(before, after, "ephemeral store must not touch the snapshot");
+}
+
+/// The open-core → Cloud upgrade must not reset the workspace to cold start.
+/// Without this, connecting a control plane silently discards every arm and the
+/// user watches intelligent routing switch itself off.
+#[tokio::test]
+async fn upgrading_to_valkey_carries_standalone_learning() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let dir = std::env::temp_dir().join(unique_ws("upgrade"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bandit-state.json");
+    let ws = unique_ws("upgrade");
+    let cfg = RewardConfig::default();
+
+    // Learn standalone, past the cold-start gate.
+    {
+        let local: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+        let engine = RewardEngine::new();
+        for _ in 0..20 {
+            engine
+                .record(
+                    &local,
+                    &ws,
+                    MODEL,
+                    SOP_TIER,
+                    TASK_TYPE,
+                    success_signals(),
+                    &cfg,
+                )
+                .await;
+        }
+    }
+
+    // Connect a control plane.
+    let remote: Arc<dyn LocalStore> = Arc::new(ValkeyStore::new(valkey.clone()));
+    let seeded = intutic_proxy::store::migrate_local_learning(&remote, &path)
+        .await
+        .unwrap();
+    assert!(seeded >= 1, "at least the learned arm must carry over");
+
+    let arms = remote.load_arms(&ws).await.unwrap();
+    let arm = arms.get(&arm_field()).expect("arm must exist in Valkey");
+    assert_eq!(arm.pulls, 20, "pull count must survive the upgrade");
+
+    // Re-running must not double-apply or clobber.
+    let again = intutic_proxy::store::migrate_local_learning(&remote, &path)
+        .await
+        .unwrap();
+    assert_eq!(again, 0, "migration must be idempotent");
+    let after = remote.load_arms(&ws).await.unwrap();
+    assert_eq!(after.get(&arm_field()).unwrap().pulls, 20);
+
+    // And it must never overwrite state the control plane already owns.
+    remote
+        .update_arm(&ws, &arm_field(), 1.0, "2026-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let cloud_pulls = remote.load_arms(&ws).await.unwrap()[&arm_field()].pulls;
+    intutic_proxy::store::migrate_local_learning(&remote, &path)
+        .await
+        .unwrap();
+    assert_eq!(
+        remote.load_arms(&ws).await.unwrap()[&arm_field()].pulls,
+        cloud_pulls,
+        "migration must never clobber control-plane state"
+    );
+
+    cleanup(&ws, None).await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Auth fails CLOSED when the control plane cannot be reached.
+///
+/// OWASP's `Fail Securely` test for an authentication control is whether taking
+/// the credential store offline lets you in. `Unavailable` is distinct from
+/// `Rejected` so the caller can answer 503 (retry — the key may be fine) rather
+/// than 401 (your key is bad), but either way the request is not admitted.
+#[tokio::test]
+async fn unreachable_control_plane_does_not_admit_unvalidated_keys() {
+    let client = redis::Client::open("redis://127.0.0.1:6399").unwrap();
+    let Ok(mgr) = redis::aio::ConnectionManager::new(client).await else {
+        eprintln!("skipping: could not construct a manager for the dead address");
+        return;
+    };
+    let cp = ValkeyControlPlaneCache::new(Arc::new(mgr));
+    assert!(
+        matches!(
+            cp.auth_context("vk_some_key").await,
+            ControlPlaneAuth::Unavailable
+        ),
+        "an unreachable control plane must not report a key as Known"
+    );
+}
+
+/// The hard spend cap fails CLOSED when it cannot be verified.
+///
+/// This is deliberately the opposite of the usual rate-limiter convention. A
+/// cap is a financial control that its operator explicitly opted into, so the
+/// workspace most likely to be capped is exactly the one that would resume
+/// spending if an unreachable control plane resolved to "allow".
+#[tokio::test]
+async fn unverifiable_spend_is_not_clear() {
+    // A well-formed URL that nothing is listening on: reads fail rather than
+    // returning "no cap".
+    let client = redis::Client::open("redis://127.0.0.1:6399").unwrap();
+    let Ok(mgr) = redis::aio::ConnectionManager::new(client).await else {
+        // Couldn't even build a manager — nothing to assert against.
+        eprintln!("skipping: could not construct a manager for the dead address");
+        return;
+    };
+    let cp = ValkeyControlPlaneCache::new(Arc::new(mgr));
+    assert_eq!(
+        cp.hard_block("any-workspace").await,
+        HardCapStatus::Unverifiable,
+        "an unreachable control plane must not report a workspace as uncapped"
+    );
+}
+
+/// Standalone answers `Clear`, never `Unverifiable` — there is no control plane
+/// to have set a cap, so the answer is definite. Getting this wrong would 503
+/// every standalone request.
+#[tokio::test]
+async fn standalone_spend_is_clear_not_unverifiable() {
+    assert_eq!(
+        NullControlPlaneCache.hard_block("ws").await,
+        HardCapStatus::Clear
+    );
+}
+
+/// A live control plane with no cap set reports `Clear`, and one with the
+/// marker set reports `Blocked`.
+#[tokio::test]
+async fn live_control_plane_distinguishes_clear_from_blocked() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("cap");
+    let cp = ValkeyControlPlaneCache::new(valkey.clone());
+    assert_eq!(cp.hard_block(&ws).await, HardCapStatus::Clear);
+
+    let mut conn = valkey.as_ref().clone();
+    let _: () = conn
+        .set(format!("v2:budget:hard_block:{}", ws), "1")
+        .await
+        .unwrap();
+    assert_eq!(cp.hard_block(&ws).await, HardCapStatus::Blocked);
+
+    let _: Result<(), _> = conn.del(format!("v2:budget:hard_block:{}", ws)).await;
+}
+
+/// Both ported modules read only control-plane-written keys, so standalone they
+/// are inert by construction rather than by a caller remembering to skip them.
+#[tokio::test]
+async fn standalone_token_and_notification_reads_are_empty() {
+    let cp = NullControlPlaneCache;
+    assert_eq!(cp.predict_gate_threshold("ws").await, None);
+    assert!(cp
+        .token_baseline("ws", "claude-3-5-sonnet", "0-5k")
+        .await
+        .is_none());
+    assert!(cp
+        .drain_notifications(NotifyScope::Session, "s")
+        .await
+        .is_empty());
+    assert!(cp
+        .drain_notifications(NotifyScope::Workspace, "w")
+        .await
+        .is_empty());
+}
+
+/// Draining is read-and-delete in one atomic step, so a notification is
+/// delivered at most once.
+#[tokio::test]
+async fn draining_notifications_consumes_them_once() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let sid = unique_ws("notify");
+    let mut conn = valkey.as_ref().clone();
+    let payload = r#"{"notification_id":"n1","session_id":"s","workspace_id":"w","priority":"high","category":"budget","title":"t","body":"b","action_url":null,"created_at":"2026-01-01T00:00:00Z"}"#;
+    let _: () = conn
+        .rpush(format!("gov:notify:{}", sid), payload)
+        .await
+        .unwrap();
+
+    let cp = ValkeyControlPlaneCache::new(valkey.clone());
+    let first = cp.drain_notifications(NotifyScope::Session, &sid).await;
+    assert_eq!(first.len(), 1, "first drain must yield the notification");
+    let second = cp.drain_notifications(NotifyScope::Session, &sid).await;
+    assert!(
+        second.is_empty(),
+        "a drained notification must not reappear"
+    );
+}
+
+/// Two processes sharing one snapshot must not erase each other's learning.
+/// Atomic replace alone would let the last writer win; the merge is what makes
+/// concurrent standalone proxies converge.
+#[tokio::test]
+async fn concurrent_snapshot_writers_do_not_clobber() {
+    let dir = std::env::temp_dir().join(unique_ws("concurrent"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bandit-state.json");
+
+    // Two independent stores, as two processes would be.
+    let a: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+    let b: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+
+    for _ in 0..5 {
+        a.update_arm("ws", "arm:a", 1.0, "now").await.unwrap();
+    }
+    for _ in 0..3 {
+        b.update_arm("ws", "arm:b", 1.0, "now").await.unwrap();
+    }
+
+    // A third process reads what survived.
+    let c: Arc<dyn LocalStore> = Arc::new(MemoryStore::durable_at(path.clone()));
+    let arms = c.load_arms("ws").await.unwrap();
+    assert_eq!(
+        arms.get("arm:a").map(|x| x.pulls),
+        Some(5),
+        "writer A's arm must survive writer B"
+    );
+    assert_eq!(
+        arms.get("arm:b").map(|x| x.pulls),
+        Some(3),
+        "writer B's arm must survive writer A"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Differential: the Lua path and the Rust path must agree within [`EPSILON`]
+/// after enough sequential updates for drift to accumulate. This is the test
+/// that justifies the constant rather than asserting it.
+#[tokio::test]
+async fn backends_agree_within_epsilon() {
+    let Some(valkey) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let ws = unique_ws("differential");
+    let valkey_store: Arc<dyn LocalStore> = Arc::new(ValkeyStore::new(valkey.clone()));
+    let memory_store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new());
+    let field = arm_field();
+
+    // Varied rewards — a constant 1.0 would hide scale-dependent divergence.
+    let rewards: Vec<f64> = (0..40).map(|i| (i as f64 % 7.0) / 6.0).collect();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    for r in &rewards {
+        valkey_store
+            .update_arm(&ws, &field, *r, &now)
+            .await
+            .unwrap();
+        memory_store
+            .update_arm(&ws, &field, *r, &now)
+            .await
+            .unwrap();
+    }
+
+    let v_arms = valkey_store.load_arms(&ws).await.unwrap();
+    let m_arms = memory_store.load_arms(&ws).await.unwrap();
+    let v = v_arms.get(&field).unwrap();
+    let m = m_arms.get(&field).unwrap();
+
+    assert_eq!(
+        v.pulls, m.pulls,
+        "pull counts are integers and must be exact"
+    );
+    let d_alpha = (v.alpha - m.alpha).abs();
+    let d_beta = (v.beta - m.beta).abs();
+    eprintln!(
+        "differential after {} updates: d_alpha={:e} d_beta={:e} (epsilon={:e})",
+        rewards.len(),
+        d_alpha,
+        d_beta,
+        EPSILON
+    );
+    assert!(
+        d_alpha < EPSILON,
+        "alpha drift {d_alpha:e} exceeds {EPSILON:e}"
+    );
+    assert!(
+        d_beta < EPSILON,
+        "beta drift {d_beta:e} exceeds {EPSILON:e}"
+    );
+
+    // Independently: the in-memory result is exactly the in-tree oracle, so
+    // any drift is attributable to the Valkey side.
+    let (mut a, mut b, mut p) = (1.0_f64, 1.0_f64, 0_u32);
+    for r in &rewards {
+        (a, b, p) = apply_update(a, b, p, *r);
+    }
+    assert_eq!(m.pulls, p);
+    assert_eq!(m.alpha, a, "memory must match apply_update exactly");
+    assert_eq!(m.beta, b, "memory must match apply_update exactly");
+
+    cleanup(&ws, None).await;
+}
+
+/// The tenancy property workspace-namespaced graph keys exist for: two workspaces that choose the SAME
+/// graph id must not see each other's membership, spend, broadcast claims, or
+/// notification queues. graph_id is client-supplied free text from a baggage
+/// header, so before the workspace segment was added to every graph key,
+/// isolation was an accident of id uniqueness on a shared Valkey.
+///
+/// MemoryStore no-ops every one of these paths, so this is Valkey-gated — a
+/// green run without VALKEY_URL proves nothing about the keys.
+#[tokio::test]
+async fn graph_keys_are_isolated_between_workspaces() {
+    let Some(conn) = valkey_conn().await else {
+        eprintln!("skipping: VALKEY_URL not set or Valkey unreachable");
+        return;
+    };
+    let store: Arc<dyn LocalStore> = Arc::new(ValkeyStore::new(conn.clone()));
+    // Publish lives on LocalStore; drain lives on ControlPlaneCache.
+    let cp: Arc<dyn ControlPlaneCache> = Arc::new(ValkeyControlPlaneCache::new(conn.clone()));
+
+    let graph = unique_ws("shared-graph-id");
+    let (ws_a, ws_b) = (unique_ws("tenant-a"), unique_ws("tenant-b"));
+
+    // Same graph id, two tenants.
+    store.touch_graph_node(&ws_a, &graph, "node-a1", 60).await;
+    store.touch_graph_node(&ws_a, &graph, "node-a2", 60).await;
+    store.touch_graph_node(&ws_b, &graph, "node-b1", 60).await;
+
+    // Membership must not bleed.
+    let a = store.graph_members(&ws_a, &graph).await;
+    let b = store.graph_members(&ws_b, &graph).await;
+    assert_eq!(a.len(), 2, "tenant A sees only its own nodes");
+    assert_eq!(
+        b,
+        vec!["node-b1".to_string()],
+        "tenant B sees only its own node"
+    );
+    assert!(
+        !a.contains(&"node-b1".to_string()),
+        "A must not see B's node"
+    );
+
+    // Spend must not aggregate across tenants — it feeds the budget detector.
+    store.add_graph_spend(&ws_a, &graph, 5.0, 60).await;
+    let b_spend = store.graph_spend(&ws_b, &graph).await;
+    assert!(
+        b_spend.is_none() || b_spend == Some(0.0),
+        "tenant B must not inherit tenant A's spend, got {b_spend:?}"
+    );
+
+    // A's broadcast claim must not consume B's once-per-graph-per-kind budget.
+    assert!(store.claim_broadcast(&ws_a, &graph, "LOOP_DETECTED").await);
+    assert!(
+        store.claim_broadcast(&ws_b, &graph, "LOOP_DETECTED").await,
+        "tenant B's first claim must succeed even though A claimed the same kind on the same graph id"
+    );
+    // And the claim still dedupes within a tenant.
+    assert!(!store.claim_broadcast(&ws_a, &graph, "LOOP_DETECTED").await);
+
+    // The raw keys carry the workspace segment — asserted against Valkey
+    // directly so a regression to unscoped keys cannot pass.
+    let mut raw = conn.as_ref().clone();
+    let a_nodes: bool = redis::cmd("EXISTS")
+        .arg(format!("graph:{ws_a}:{graph}:nodes"))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let unscoped: bool = redis::cmd("EXISTS")
+        .arg(format!("graph:{graph}:nodes"))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(a_nodes, "workspace-scoped key must exist");
+    assert!(!unscoped, "the old unscoped key must NOT be written");
+
+    // Notification queues: fan-out to A's sibling must be invisible to B's
+    // identically-named node.
+    store
+        .publish_notification(
+            NotifyScope::Graph,
+            &format!("{ws_a}:{graph}:node-a2"),
+            "{\"category\":\"LOOP_DETECTED\"}",
+        )
+        .await;
+    let b_drain = cp
+        .drain_notifications(NotifyScope::Graph, &format!("{ws_b}:{graph}:node-a2"))
+        .await;
+    assert!(
+        b_drain.is_empty(),
+        "B must not drain A's queue for an identically-named node"
+    );
+    let a_drain = cp
+        .drain_notifications(NotifyScope::Graph, &format!("{ws_a}:{graph}:node-a2"))
+        .await;
+    assert_eq!(a_drain.len(), 1, "A's own sibling drains its copy");
+
+    // Cleanup.
+    for ws in [&ws_a, &ws_b] {
+        for suffix in ["nodes", "spend", "bcast:LOOP_DETECTED", "bcast:rate"] {
+            let _: Result<(), _> = raw.del(format!("graph:{ws}:{graph}:{suffix}")).await;
+        }
+    }
+}

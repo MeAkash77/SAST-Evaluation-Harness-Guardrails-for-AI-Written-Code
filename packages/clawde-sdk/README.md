@@ -1,0 +1,28 @@
+# @intutic/clawde
+
+Programmatic client SDK for intercepting, wrapping, and enforcing policies on AI coding agent scripts.
+
+## Installation
+
+```bash
+npm install @intutic/clawde
+```
+
+## Features
+
+- **Governed chat:** `chat()` sends a request through the proxy and resolves with `verdict: 'allow'`. A governance refusal (policy block, reask, loop run held for review, spend cap, DLP block) throws `ClawdeBlockedError` with the proxy's `verdict`, `code`, `ruleId` (when the proxy names the rule) and reason, and is never retried; transport failures and 5xx answers are retried, except a 5xx the proxy already retried upstream.
+- **Withheld tool calls:** when the proxy withholds a tool call from the model's answer (a tool an SOP denies, the SSO group policy, destructive SQL, sensitive output), the answer arrives as a 200 that names the refusal in the `x-intutic-refusal` and `x-intutic-refusal-rule` headers. `chat()` reads them and throws `ClawdeBlockedError` too. For a stream you read yourself, pass each line to `streamRefusal()`, which finds the `: intutic-refusal` marker the proxy writes before the refusal text. See [Verdicts and Errors](https://docs.intutic.ai/reference/clawde-sdk#_5-verdicts-and-errors) for every refusal code.
+- **Verdict Events:** `client.on('kill' | 'reask' | 'hold', ...)` fires on a refusal, before `chat()` throws.
+- **Anthropic requests:** `provider: 'anthropic'` translates OpenAI-style parameters to an Anthropic Messages body, sends it to the proxy's `/v1/messages` route, and translates the reply back.
+- **Budget Check:** `checkBudget()` reports whether the workspace has budget left, from the control plane's `GET /api/v1/budget`. It needs a control plane address (`controlPlaneUrl` or `INTUTIC_CONTROL_PLANE_URL`); without one it throws `ClawdeConnectionError`, and no session is registered.
+- **Circuit Breaker:** `client.circuitBreaker(toolName, options)(fn)` runs `fn`, after a workspace budget check when `requireBudget` is set, failing closed unless `failOpen` is set.
+- **Context Resolution:** `resolveContext()` takes each field (git branch, Jira ticket, PagerDuty incident, CI pipeline, workspace, session) from `~/.intutic/config.json` when the file carries it, and from environment variables otherwise (`GIT_BRANCH`, `PD_INCIDENT_ID`, the CI run id, `INTUTIC_WORKSPACE_ID`, `INTUTIC_SESSION_ID`); the Jira ticket comes from the file only.
+- **Git context (`autoContext`, on by default):** with an Intutic virtual key, in a git repository, the first `chat()` registers a session with the control plane carrying the repository (the `origin` remote as `host/path`, credentials removed), the branch and the HEAD commit, so the calls count in cost per branch, commit and pull request. Pass `autoContext: false` to send none of it. See [Git context and cost attribution](https://docs.intutic.ai/reference/clawde-sdk#_1a-git-context-and-cost-attribution).
+- **Control-Plane Management (`ControlPlaneClient`):** The operator APIs the CLI exposes, callable programmatically against the control plane you name (`baseUrl` or `INTUTIC_CONTROL_PLANE_URL`; the constructor throws without one): org and workspace setup, gateways, settings and provider credentials, the MCP registry, notification rules, SIEM destinations, usage, the AI inventory, compliance evidence (with `verifyEvidenceArchive()` to check an archive offline), policy guardrails, held decisions and loop runs, incidents, findings, traces, trace integrity (with `verifyIntegrityRoot()` to check a sealed root's signature offline), WASM rules, SOPs, API keys (`listApiKeys` and the rest), the SOP Optimizer's settings (`getOptimizerSettings`, `updateOptimizerSettings`) and task-management connections (`listTaskConnections`). The Python SDK has the same methods in snake_case. See the [SDK reference](https://docs.intutic.ai/reference/clawde-sdk#control-plane-management-controlplaneclient).
+- **Decide questions:** `decide(state, questions, opts)` asks a self-hosted model a few narrow yes/no or pick-one questions about a piece of text, written as a decide rule's `questions`, and returns each answer's probability and reading (with `opts.when`, the outcome the rule would reach). The engine comes from `~/.intutic/decide/engine.json` and the `INTUTIC_DECIDE_*` variables; a hosted decision API is refused before anything is sent. An engine that is not configured, refused or cannot answer in time throws `DecideEngineError`. See [Decide rules](https://docs.intutic.ai/guide/decide#in-your-own-agent-decide).
+
+Every export, with its signature and defaults: [API reference](https://docs.intutic.ai/reference/sdk/clawde/).
+
+## License
+
+MIT

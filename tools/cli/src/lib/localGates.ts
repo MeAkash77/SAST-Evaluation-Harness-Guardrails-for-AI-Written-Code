@@ -1,0 +1,270 @@
+/**
+ * Harness gates and rules files with no control plane: what
+ * `intutic gates install` writes, and `intutic start` refreshes.
+ *
+ * The same writers `intutic connect` runs, fed from this machine only: the
+ * local `.intutic/sops` for the rules files, the `review_before:` tokens and
+ * the `decide:` rules, and a policy snapshot compiled from no workspace
+ * policy (`writeLocalPolicySnapshot`), which still carries the
+ * destructive-command and skill tiers. Nothing here fetches, drains or
+ * reports; no MCP server is wrapped and no file is made immutable. The
+ * harnesses' LLM traffic is pointed at the local proxy only with `routing`,
+ * since a harness routed at a proxy that is not running stops working.
+ *
+ * @module
+ */
+
+import * as node_fs from 'node:fs/promises'
+import * as node_path from 'node:path'
+import { homedir } from 'node:os'
+import { DECIDE_MAX_RULES_PER_CALL, gateKindForHarness, HarnessType, parseDecideLines, parseFrontMatterEnforcing, splitFrontMatter } from '@intutic/shared-types'
+import type { GateKind, SyncSopEntry } from '@intutic/shared-types'
+import {
+  buildSnapshotRules,
+  findGateFile,
+  loadLocalSopEntries,
+  localDecideRules,
+  localHoldTokensFor,
+  localResolvedPolicy,
+  noteProxyUrl,
+  SNAPSHOT_JSON,
+  SNAPSHOT_RULES,
+  updatePreToolUseHooks,
+  writeLocalPolicySnapshot,
+  writeRuntimeEnv,
+} from '@intutic/sync-daemon'
+import { getAdapter } from '../harness/detector.js'
+import { writeHarnessConfigs } from '../harness/writeHarnessConfigs.js'
+import { loadCredentials } from '../config/store.js'
+import { localProxyPort } from './localProxy.js'
+import { decideRuleNotes } from './decideLocal.js'
+
+/** The hook events log is rotated past this size; nothing drains it without a control plane. */
+export const HOOK_EVENTS_ROTATE_BYTES = 10 * 1024 * 1024
+
+export interface LocalGatesOptions {
+  workspaceRoot: string
+  /** The harnesses to install for: recorded ones, less any disconnected. */
+  harnesses: readonly string[]
+  /** Also point each harness's LLM traffic at the local proxy. */
+  routing: boolean
+  /** Compute and report, write nothing. */
+  dryRun?: boolean
+  /** Where warnings go. */
+  warn?: (line: string) => void
+}
+
+export interface LocalGate {
+  harness: string
+  kind: GateKind
+  /** The gate file on disk, for a `hook` gate; null when there is none. */
+  path: string | null
+}
+
+export interface LocalGatesResult {
+  /** Files written (on a dry run, the files that would be). */
+  files: string[]
+  gates: LocalGate[]
+  /** The snapshot written; on a dry run, its rule count and no digest. */
+  snapshot: { digest: string; ruleCount: number }
+  /** The `review_before:` tokens compiled into refusals. */
+  holdTokens: string[]
+  /** The proxy the routing names, written or not. */
+  proxyUrl: string
+}
+
+function snapshotDir(): string {
+  return node_path.join(homedir(), '.intutic', 'hooks')
+}
+
+/**
+ * Who wrote the policy snapshot the gates read: `local` (this module, marked
+ * `source: local`), `connect` (any other snapshot), or `none`.
+ */
+export async function gatesSource(): Promise<'local' | 'connect' | 'none'> {
+  let text: string
+  try {
+    text = await node_fs.readFile(node_path.join(snapshotDir(), SNAPSHOT_JSON), 'utf-8')
+  } catch {
+    return 'none'
+  }
+  try {
+    return (JSON.parse(text) as { source?: unknown }).source === 'local' ? 'local' : 'connect'
+  } catch {
+    return 'connect'
+  }
+}
+
+/** Whether the snapshot on this machine is one this module wrote. */
+export async function localGatesInstalled(): Promise<boolean> {
+  return (await gatesSource()) === 'local'
+}
+
+/** Whether `runtime.env` still holds an API key, from a control plane this machine no longer has a login for. */
+async function staleRuntimeKey(envPath: string): Promise<boolean> {
+  let text: string
+  try {
+    text = await node_fs.readFile(envPath, 'utf-8')
+  } catch {
+    return false
+  }
+  return text.split('\n').some((line) => /^INTUTIC_API_KEY=\S/.test(line.trim()))
+}
+
+/** Keeps one previous log (`.1`) once the live one passes {@link HOOK_EVENTS_ROTATE_BYTES}. */
+async function rotateHookEvents(workspaceRoot: string, dryRun: boolean): Promise<string | null> {
+  const log = node_path.join(workspaceRoot, '.intutic', 'events', 'hook-events.jsonl')
+  try {
+    if ((await node_fs.stat(log)).size <= HOOK_EVENTS_ROTATE_BYTES) return null
+  } catch {
+    return null
+  }
+  if (!dryRun) await node_fs.rename(log, `${log}.1`)
+  return `${log}.1`
+}
+
+/**
+ * One warning per `decide:` line that does not read, naming its SOP file and
+ * line number. The snapshot refuses the tools such a line names until it is
+ * fixed. A bare or non-JSON line gets the one-rule-per-line hint.
+ */
+function unreadableDecideLines(entries: readonly SyncSopEntry[]): string[] {
+  const out: string[] = []
+  for (const entry of entries) {
+    const numbered = splitFrontMatter(entry.content)
+      .front.split('\n')
+      .map((l, k) => ({ text: l.trim(), line: k + 1 }))
+      .filter((l) => l.text.startsWith('decide:'))
+    if (numbered.length === 0) continue
+    const file = `.intutic/sops/${entry.sopId.replace(/^local:/, '').replace(':', '/')}`
+    parseDecideLines(numbered.map((l) => l.text.slice('decide:'.length))).forEach((d, i) => {
+      if (d.kind === 'unreadable') out.push(`${file}:${numbered[i]!.line}: decide line ${i + 1} does not read, so its tools are refused: ${d.error}`)
+    })
+  }
+  return out
+}
+
+/**
+ * One warning per readable `decide:` rule 3.0 does not carry out as written
+ * (`decideRuleNotes`: a reserved `context`), naming its SOP file and line
+ * number.
+ */
+function notedDecideRules(entries: readonly SyncSopEntry[]): string[] {
+  const out: string[] = []
+  for (const entry of entries) {
+    const numbered = splitFrontMatter(entry.content)
+      .front.split('\n')
+      .map((l, k) => ({ text: l.trim(), line: k + 1 }))
+      .filter((l) => l.text.startsWith('decide:'))
+    if (numbered.length === 0) continue
+    const file = `.intutic/sops/${entry.sopId.replace(/^local:/, '').replace(':', '/')}`
+    parseDecideLines(numbered.map((l) => l.text.slice('decide:'.length))).forEach((d, i) => {
+      if (d.kind === 'rule') for (const note of decideRuleNotes(d.rule)) out.push(`${file}:${numbered[i]!.line}: ${note}`)
+    })
+  }
+  return out
+}
+
+/** Tools more than {@link DECIDE_MAX_RULES_PER_CALL} local decide rules name: a call evaluates only that many. */
+function crowdedDecideTools(entries: readonly SyncSopEntry[]): string[] {
+  const byTool = new Map<string, number>()
+  for (const entry of entries) {
+    const values = splitFrontMatter(entry.content)
+      .front.split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith('decide:'))
+      .map((l) => l.slice('decide:'.length))
+    for (const d of parseDecideLines(values)) {
+      if (d.kind === 'rule' && d.rule.on === 'tool_call') for (const t of new Set(d.rule.tools ?? [])) byTool.set(t, (byTool.get(t) ?? 0) + 1)
+    }
+  }
+  return [...byTool]
+    .filter(([, n]) => n > DECIDE_MAX_RULES_PER_CALL)
+    .map(([tool, n]) => `${n} decide rules name ${tool}; a call evaluates at most ${DECIDE_MAX_RULES_PER_CALL}, and an enforcing rule past that refuses the call`)
+}
+
+/**
+ * Writes (or with `dryRun`, reports) the local gates. See the module note for
+ * what it does not do.
+ */
+export async function installLocalGates(opts: LocalGatesOptions): Promise<LocalGatesResult> {
+  const root = opts.workspaceRoot
+  const harnesses = [...opts.harnesses]
+  const dryRun = Boolean(opts.dryRun)
+  const warn = opts.warn ?? (() => undefined)
+  const proxyUrl = `http://127.0.0.1:${localProxyPort()}`
+  const home = homedir()
+  const files: string[] = []
+
+  // The same reads connect makes: the rules files' SOPs (honouring the
+  // session's selection), and every local SOP's review_before: tokens.
+  const sops = await loadLocalSopEntries(root, harnesses as HarnessType[], {
+    onError: (err) =>
+      warn(`Could not read every local SOP in .intutic/sops; the rules files are written without the ones that failed: ${err instanceof Error ? err.message : String(err)}`),
+  })
+  const holdTokens = await localHoldTokensFor(root, [], undefined, harnesses as HarnessType[])
+  // Every local SOP's decide: rules, whatever the session selected, as for
+  // the holds: the selection narrows the rules files, never what is enforced.
+  const allSops = await loadLocalSopEntries(root, harnesses as HarnessType[], { ignoreSelection: true })
+  const decideRules = await localDecideRules(allSops, { decideDir: node_path.join(homedir(), '.intutic', 'decide') })
+  for (const line of [...unreadableDecideLines(allSops), ...notedDecideRules(allSops), ...crowdedDecideTools(allSops)]) warn(line)
+
+  // Every local SOP's rule records and lane holds: qualified
+  // requires_before, scope_paths_mode: enforce, plan_approval:, closed_lanes:.
+  // With no control plane, plan_approval: refuses every call that is not a
+  // read (no plan can be approved), and a lane hold refuses rather than holds.
+  for (const entry of allSops) {
+    // An enforcing plan_approval record compiles from a SOP with no roles:,
+    // not in mode: shadow (compileSopGateRecords, @intutic/shared-types).
+    const fm = parseFrontMatterEnforcing(splitFrontMatter(entry.content).front)
+    if (fm.planApproval !== null && fm.roles.length === 0 && fm.mode !== 'shadow') {
+      warn(`${entry.sopId} sets plan_approval:, and with no control plane no plan can be approved: every gated call that is not a read is refused (PLAN_NOT_APPROVED). Remove it, or connect a workspace.`)
+    }
+  }
+  let snapshot: { digest: string; ruleCount: number }
+  if (dryRun) {
+    snapshot = { digest: '', ruleCount: buildSnapshotRules({ ...localResolvedPolicy(), decideRules }, holdTokens, 'block', allSops).length }
+  } else {
+    snapshot = await writeLocalPolicySnapshot({ localHoldTokens: holdTokens, snapshotDir: snapshotDir(), decideRules, localSops: allSops })
+  }
+  files.push(node_path.join(snapshotDir(), SNAPSHOT_RULES), node_path.join(snapshotDir(), SNAPSHOT_JSON))
+
+  if (dryRun) {
+    for (const h of harnesses) {
+      const file = getAdapter(h)?.configFileName
+      if (file && sops.some((sop) => sop.harnessTargets.includes(h as HarnessType))) files.push(node_path.resolve(root, file))
+    }
+  } else {
+    // disconnect recognises the base URLs it is written into by it.
+    if (opts.routing) await noteProxyUrl(proxyUrl)
+    await writeHarnessConfigs(harnesses, root, sops, proxyUrl, false, {
+      routing: opts.routing,
+      onRulesFile: (path) => files.push(path),
+    })
+  }
+
+  if (harnesses.includes(HarnessType.CLAUDE_CODE)) {
+    if (!dryRun) await updatePreToolUseHooks(root, [], undefined)
+    files.push(node_path.join(root, '.claude', 'settings.json'))
+    if (!process.env['VITEST'] && !process.env['INTUTIC_SKIP_GLOBAL_HOOKS']) files.push(node_path.join(home, '.claude', 'settings.json'))
+  }
+
+  // A key left by an earlier connect makes every gate post its events to that
+  // control plane. With no login here, nothing should.
+  const runtimeEnv = node_path.join(home, '.intutic', 'env', 'runtime.env')
+  if ((await loadCredentials()) === null && (await staleRuntimeKey(runtimeEnv))) {
+    if (!dryRun) await writeRuntimeEnv({ controlPlaneUrl: '', apiKey: '', workspaceId: '', envPath: runtimeEnv })
+    files.push(runtimeEnv)
+  }
+
+  const rotated = await rotateHookEvents(root, dryRun)
+  if (rotated) files.push(rotated)
+
+  const gates: LocalGate[] = []
+  for (const harness of harnesses) {
+    const kind = gateKindForHarness(harness as HarnessType)
+    gates.push({ harness, kind, path: kind === 'hook' ? await findGateFile(harness, root, home) : null })
+  }
+
+  return { files: [...new Set(files)], gates, snapshot, holdTokens, proxyUrl }
+}

@@ -1,0 +1,63 @@
+# Cline
+
+Integrate Intutic governance with [Cline](https://github.com/cline/cline) — the VS Code extension for autonomous agentic coding.
+
+## How it works
+
+Cline runs *file hooks*: an executable named `PreToolUse` in a hooks directory runs before every tool call, with the call as JSON on stdin. Intutic installs its gate as `.clinerules/hooks/PreToolUse`. It refuses a call by printing `{"cancel": true, "errorMessage": "…"}` on stdout, with the refusal's `code` and `ruleId` ([refusal codes](/reference/harness-security-matrix#hook-refusal-codes)) — Cline ignores the hook's exit code. The hook has no tool filter, so it sees every tool call, including MCP calls (`use_mcp_tool`). Governance rules are written next to it as `.clinerules/intutic-governance.md`, which Cline reads as a rules file.
+
+The same file serves the VS Code extension and the Cline CLI, which read different payload shapes; the gate accepts both. In the VS Code extension, turn on **Enable Hooks** in Cline's feature settings — hooks do not run until you do.
+
+**A refusal stops the whole task, not just the call.** Cline's hooks cannot skip one tool call: `cancel` ends the run (Cline 3.0.73), so a refused or held call ends the task, and the model never reads why. The Cline CLI does not show the gate's `errorMessage` either: `cline --json` reports the run as aborted (`finishReason: "aborted"`, `run_aborted` with `reason: "external_abort"`). The reason is in the gate's log, `~/.intutic/events/cline-hook-events.jsonl`, one JSON line per decision. Once Cline can refuse a single call from a hook, the gate will use it.
+
+## Setup
+
+### 1. Initialize Intutic
+
+```bash
+intutic init
+```
+
+The CLI detects Cline and registers it as a harness:
+
+```
+  ✔ cline → /path/to/project/.clinerules/intutic-governance.md
+```
+
+`intutic init` only detects the harness and records it in `~/.intutic/config.json`; it writes no harness files. The files described on this page are written by `intutic gates install` (open core, no control plane), from the rule sets in `.intutic/sops/` — see [What writes harness files](/integrations/#what-writes-harness-files):
+
+```bash
+intutic gates install
+```
+
+### 2. Start the proxy
+
+```bash
+intutic start
+```
+
+<!-- ENTERPRISE_ONLY_START -->
+> Have an Intutic account or run your own control plane? Use `intutic connect` instead. It writes the same files, starts the same proxy and adds bidirectional config sync.
+<!-- ENTERPRISE_ONLY_END -->
+
+## What gets written
+
+* **Gate:** `.clinerules/hooks/PreToolUse` — an executable Node.js script that evaluates shell commands, file edits and MCP tool calls against the built-in protections and your SOPs.
+* **Rules:** `.clinerules/intutic-governance.md` — your SOP text.
+
+`.clinerules` has to be a directory for both to fit. A flat `.clinerules` file that an earlier Intutic version wrote is converted automatically. A flat `.clinerules` file you wrote yourself is left alone, and no gate is installed until you move its content into a file inside a `.clinerules/` directory, and Intutic reports it. A `PreToolUse` hook you wrote yourself is never overwritten.
+
+An agent cannot edit or remove the gate: the Intutic gate refuses a tool call that names `.clinerules/hooks`, reading it included, under Cline and under every other harness with a hook gate. If the gate is deleted, replaced or made non-executable anyway, run `intutic gates install` to write it back<!-- ENTERPRISE_ONLY_START -->; under `intutic connect` the sync daemon writes it back on its own<!-- ENTERPRISE_ONLY_END -->. Cline runs the hooks in its other hook directories as well, and refuses a call when any of them does, so a hook added there cannot override the gate.
+
+To undo what `intutic gates install` writes here, run `intutic disconnect --harness cline`: each file goes back to what it held before Intutic first wrote it, or is deleted if Intutic created it, and edits you made since are kept. See [`intutic disconnect`](/reference/cli#intutic-disconnect).
+
+## Proxy routing
+
+To route Cline's LLM requests through the local proxy:
+1. Open the Cline panel in VS Code.
+2. Click the gear icon to open Settings.
+3. Set **API Provider** to `OpenAI Compatible`.
+4. Set **Base URL** to `http://localhost:4000/v1`.
+5. Enter your Intutic API Key.
+
+Cline keeps these in its own settings storage, not in a file Intutic writes, so this step is manual. For the **Anthropic** provider instead, check **Use custom base URL** and enter `http://localhost:4000` — Cline appends `/v1/messages` itself.

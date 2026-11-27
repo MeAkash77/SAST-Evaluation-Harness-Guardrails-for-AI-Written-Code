@@ -1,0 +1,381 @@
+/**
+ * configWriter.ts — the harness rules-file map, local SOP loading, SkillOpt
+ * config edits and the atomic write they share.
+ *
+ * The harness config files themselves are written by the CLI's adapters
+ * (tools/cli/src/harness), which `intutic connect` runs.
+ *
+ * @module
+ */
+
+import * as node_fs from 'node:fs/promises'
+import * as node_path from 'node:path'
+import { execFile as _execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { HarnessType as HarnessTypes, rulesFileOf } from '@intutic/shared-types'
+import type { HarnessType, SyncSopEntry, ConfigEdit } from '@intutic/shared-types'
+import { writeFileAtomic } from './lib/atomicWrite.js'
+import { listSopFiles, markedNotEnforced, recordedSopId, selectionKeeps } from './lib/sopFiles.js'
+
+const execFile = promisify(_execFile)
+
+/**
+ * Clear the macOS user-immutable flag so the daemon can rewrite a file it
+ * write-protected (the workspace's `bypassEnforcementTier: 'immutable'`).
+ * No-op on other platforms or if the file does not exist yet.
+ */
+export async function clearImmutable(filePath: string): Promise<void> {
+  if (process.platform !== 'darwin') return
+  try { await execFile('chflags', ['nouchg', filePath]) } catch { /* file may not exist yet */ }
+}
+
+/**
+ * Set the macOS user-immutable flag (`chflags uchg`), so a hand edit of a
+ * managed file fails with EPERM. The flag needs no root to set or clear; it
+ * stops casual editing, not a determined user. No-op on other platforms.
+ */
+export async function setImmutable(filePath: string): Promise<void> {
+  if (process.platform !== 'darwin') return
+  try { await execFile('chflags', ['uchg', filePath]) } catch { /* non-fatal */ }
+}
+
+// ─── Harness config file mapping ─────────────────────────────────────
+
+/** Every adapter that writes `.env.intutic`: Codex and the SDK-gated frameworks. */
+export const ENV_INTUTIC_WRITERS: readonly string[] = [
+  'codex',
+  'langgraph',
+  'langchain',
+  'crewai',
+  'autogen',
+  'ag2',
+  'google-adk',
+  'openai-agents',
+  'pydantic-ai',
+  'smolagents',
+  'strands',
+  'agent-framework',
+  'mastra',
+  'vercel-ai-sdk',
+  'eve',
+  'trueforge',
+  'ai-sdk-harness',
+  'ai-sdk-workflow',
+]
+
+/**
+ * The workspace file captured, watched for drift and edited by SkillOpt for
+ * each harness: its rules file (`rulesFileOf`, from `HARNESS_RULES_FILES` in
+ * `@intutic/shared-types`), else `.env.intutic` for the SDK-gated frameworks,
+ * which carries their proxy variables. An empty string means nothing in the
+ * workspace: the harness's rule sets go elsewhere (OpenClaw's agent
+ * workspace) or nowhere (see the map's `none` entries).
+ */
+export const HARNESS_FILES: Record<HarnessType, string> = Object.fromEntries(
+  (Object.values(HarnessTypes) as HarnessType[]).map((h) => [h, rulesFileOf(h) ?? (ENV_INTUTIC_WRITERS.includes(h) ? '.env.intutic' : '')]),
+) as Record<HarnessType, string>
+
+/** What {@link loadLocalSopEntries} can be asked besides the workspace. */
+export interface LoadLocalSopOptions {
+  /**
+   * Control-plane SOP ids already in hand (the synced SOPs). A local file whose
+   * `intutic_id:` names one of them is a copy `intutic sops pull` wrote, and
+   * loading it as well would put the same SOP into the rules file twice.
+   */
+  skipSopIds?: ReadonlySet<string>
+  /**
+   * Told of a read error other than a missing `.intutic/sops`; the SOPs read
+   * before it are still returned. Unset, errors are dropped.
+   */
+  onError?: (err: unknown) => void
+  /**
+   * Load every local SOP whatever the session's selection. For the gate's
+   * holds: the selection is made from inside the agent's own chat, so it may
+   * narrow what is written into the rules files as prose, never what is
+   * enforced.
+   */
+  ignoreSelection?: boolean
+}
+
+/**
+ * The workspace's local SOPs: `.intutic/sops/*.md` and `.intutic/sops/<set>/*.md`
+ * (see `lib/sopFiles.ts`), the same files the proxy enforces. A session's
+ * selection (`session-context.json`'s `activeLocalSops`: folder names and
+ * flat file names, see `listSopSets`) narrows them unless `ignoreSelection`.
+ * An empty selection is no selection: `/intutic start` without `--sops`
+ * pushes `[]`, and that means every rule set, as the daemon logs it.
+ * Skipped: `guardrail-*.md` files, which `intutic guardrails pull` writes for
+ * a proxy that reads SOPs from disk while a connected machine receives those
+ * guardrails from the control plane, and files `intutic sops pull` marked
+ * `intutic_enforced: false`. Read by `intutic connect` for the harness rules
+ * files and by the gate-cache refresh, which compiles their `review_before:`
+ * tokens into hold rules. A missing directory is an empty list.
+ */
+export async function loadLocalSopEntries(
+  workspaceRoot: string,
+  harnesses: HarnessType[],
+  opts: LoadLocalSopOptions = {},
+): Promise<SyncSopEntry[]> {
+  const localSopEntries: SyncSopEntry[] = []
+  try {
+    const sessionContextPath = node_path.join(workspaceRoot, '.intutic', 'session-context.json')
+    let activeLocalSops: string[] | undefined
+    try {
+      const raw = await node_fs.readFile(sessionContextPath, 'utf-8')
+      const parsed = JSON.parse(raw)
+      activeLocalSops = parsed.activeLocalSops
+    } catch {
+      // not configured yet
+    }
+
+    const files = await listSopFiles(node_path.join(workspaceRoot, '.intutic', 'sops'), (_folder, err) => opts.onError?.(err))
+    for (const { path, folder, file } of files) {
+      if (folder === null && file.startsWith('guardrail-')) continue
+      const content = await node_fs.readFile(path, 'utf-8')
+      if (markedNotEnforced(content)) continue
+      if (!opts.ignoreSelection && activeLocalSops !== undefined && activeLocalSops.length > 0 && !selectionKeeps({ path, folder, file }, content, activeLocalSops)) continue
+      const recorded = recordedSopId(content)
+      if (recorded !== null && opts.skipSopIds?.has(recorded)) continue
+      const label = folder === null ? file : `${folder}/${file}`
+      localSopEntries.push({
+        sopId: folder === null ? `local:${file}` : `local:${folder}:${file}`,
+        title: `Local SOP: ${label}`,
+        content,
+        contentHash: '',
+        harnessTargets: harnesses,
+      })
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') opts.onError?.(err)
+  }
+  return localSopEntries
+}
+
+/**
+ * Finds a match for a target block in content, tolerating line ending and whitespace variations.
+ */
+function findFuzzyMatch(content: string, target: string): string | null {
+  if (content.includes(target)) return target
+
+  const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim()
+  const normalizedTarget = normalize(target)
+  if (!normalizedTarget) return null
+
+  // Line-by-line normalized search
+  const targetLines = target.split(/\r?\n/).map(l => normalize(l)).filter(Boolean)
+  if (targetLines.length === 0) return null
+
+  const contentLines = content.split(/\r?\n/)
+  for (let i = 0; i <= contentLines.length - targetLines.length; i++) {
+    let match = true
+    for (let j = 0; j < targetLines.length; j++) {
+      const contentLineNorm = normalize(contentLines[i + j] || '')
+      if (contentLineNorm !== targetLines[j]) {
+        match = false
+        break
+      }
+    }
+    if (match) {
+      // Reconstruct matching section using original line endings from content
+      return contentLines.slice(i, i + targetLines.length).join('\n')
+    }
+  }
+  return null
+}
+
+/** Outcome of a single ADD/DELETE/REPLACE operation within one suggestion's edit set. */
+export interface ConfigEditOperationOutcome {
+  /** Index into the suggestion's `edits` array. */
+  index: number
+  operation: string
+  /** Whether this operation's effect actually landed in the on-disk file. */
+  applied: boolean
+  /** Present when `applied` is false — why it didn't land. */
+  reason?: string
+}
+
+/**
+ * Per-suggestion result of `applyConfigEdits` — what the daemon reports back
+ * to control-plane via `POST /api/v1/skillopt/:suggestionId/apply-result`.
+ */
+export interface ConfigEditApplyOutcome {
+  suggestionId: string
+  /** True only when every operation for this suggestion landed. */
+  ok: boolean
+  perOperation: ConfigEditOperationOutcome[]
+}
+
+/**
+ * Apply a list of custom config edits (ADD, DELETE, REPLACE) to a workspace rule file.
+ *
+ * Returns one `ConfigEditApplyOutcome` per input suggestion instead
+ * of `void` — every operation's real fate (fuzzy-match miss on DELETE/
+ * REPLACE, an unresolvable target file, or the final `atomicWrite` itself
+ * failing) is recorded here rather than only `console.warn`'d, so the caller
+ * (`applySkillOptEdits`, syncCycle.ts) can ack the daemon's actual outcome back to control-plane
+ * instead of the daemon-side write being invisible to it.
+ */
+export async function applyConfigEdits(
+  workspaceRoot: string,
+  appliedEdits: Array<{
+    suggestionId: string
+    harnessType: string
+    filePath: string
+    edits: string | ConfigEdit[]
+  }>,
+  bypassEnforcementTier?: string,
+): Promise<ConfigEditApplyOutcome[]> {
+  const outcomes: ConfigEditApplyOutcome[] = []
+
+  for (const applied of appliedEdits) {
+    // The harness's rules file only: an edit is instruction text, and a file
+    // the product does not read as instructions (`.env.intutic`) is no place for it.
+    const filename = rulesFileOf(applied.harnessType as HarnessType)
+    const editsList: ConfigEdit[] = typeof applied.edits === 'string'
+      ? JSON.parse(applied.edits)
+      : applied.edits
+
+    if (!filename) {
+      // No writable target for this harness — every operation fails to land.
+      outcomes.push({
+        suggestionId: applied.suggestionId,
+        // Vacuously ok only when there was nothing to apply in the first
+        // place — matches the `perOperation.every(...)` rule used below.
+        ok: editsList.length === 0,
+        perOperation: editsList.map((edit, index) => ({
+          index,
+          operation: edit.operation,
+          applied: false,
+          reason: `Harness "${applied.harnessType}" has no rules file in the workspace`,
+        })),
+      })
+      continue
+    }
+
+    const filePath = node_path.join(workspaceRoot, filename)
+
+    let currentContent = ''
+    try {
+      currentContent = await node_fs.readFile(filePath, 'utf-8')
+    } catch {
+      // file doesn't exist
+    }
+
+    let updatedContent = currentContent
+    const perOperation: ConfigEditOperationOutcome[] = []
+
+    editsList.forEach((edit, index) => {
+      if (edit.operation === 'ADD') {
+        // Idempotency: skip if edit content already exists in file — already
+        // landed, so this counts as applied, not a no-op failure.
+        if (edit.content && updatedContent.includes(edit.content)) {
+          perOperation.push({ index, operation: edit.operation, applied: true })
+          return
+        }
+        const header = `## ${edit.section}`
+        if (updatedContent.includes(header)) {
+          updatedContent = updatedContent.replace(header, `${header}\n${edit.content ?? ''}`)
+        } else {
+          updatedContent += `\n\n${header}\n${edit.content ?? ''}`
+        }
+        perOperation.push({ index, operation: edit.operation, applied: true })
+      } else if (edit.operation === 'DELETE') {
+        if (edit.content) {
+          const match = findFuzzyMatch(updatedContent, edit.content)
+          if (match) {
+            updatedContent = updatedContent.replace(match, '')
+            perOperation.push({ index, operation: edit.operation, applied: true })
+          } else {
+            console.warn(`[sync-daemon] [DELETE] Pattern not found in ${filename}:`, edit.content.slice(0, 100))
+            perOperation.push({
+              index,
+              operation: edit.operation,
+              applied: false,
+              reason: `DELETE target pattern not found in ${filename}`,
+            })
+          }
+        } else {
+          perOperation.push({ index, operation: edit.operation, applied: false, reason: 'DELETE edit had no content to match' })
+        }
+      } else if (edit.operation === 'REPLACE') {
+        if (edit.target) {
+          const match = findFuzzyMatch(updatedContent, edit.target)
+          if (match) {
+            updatedContent = updatedContent.replace(match, edit.content ?? '')
+            perOperation.push({ index, operation: edit.operation, applied: true })
+          } else {
+            console.warn(`[sync-daemon] [REPLACE] Target pattern not found in ${filename}:`, edit.target.slice(0, 100))
+            perOperation.push({
+              index,
+              operation: edit.operation,
+              applied: false,
+              reason: `REPLACE target pattern not found in ${filename}`,
+            })
+          }
+        } else {
+          perOperation.push({ index, operation: edit.operation, applied: false, reason: 'REPLACE edit had no target to match' })
+        }
+      } else {
+        perOperation.push({ index, operation: edit.operation, applied: false, reason: `Unknown operation "${edit.operation}"` })
+      }
+    })
+
+    try {
+      await atomicWrite(filePath, updatedContent, bypassEnforcementTier)
+      console.log(`[sync-daemon] Applied SkillOpt config edits to ${filename} (suggestion: ${applied.suggestionId})`)
+    } catch (err) {
+      // The write itself failed (e.g. protected-path/tamper guard) — nothing
+      // that "landed" in memory above actually reached disk. Every operation
+      // that had been recorded as applied must be walked back to failed.
+      const reason = `atomicWrite failed for ${filename}: ${err instanceof Error ? err.message : String(err)}`
+      console.warn(`[sync-daemon] Failed to apply config edits to ${filename}:`, err)
+      for (const op of perOperation) {
+        op.applied = false
+        op.reason = op.reason ?? reason
+      }
+    }
+
+    outcomes.push({
+      suggestionId: applied.suggestionId,
+      ok: perOperation.every((op) => op.applied),
+      perOperation,
+    })
+  }
+
+  return outcomes
+}
+
+// ─── Atomic file write ───────────────────────────────────────────────
+
+/**
+ * Write content to a file atomically.
+ *
+ * Writes to a temp sibling first, then renames to the target path
+ * (`lib/atomicWrite.ts`).
+ * This prevents partial/corrupt files if the process is interrupted mid-write.
+ *
+ * If bypassEnforcementTier === 'immutable', clears the macOS user-immutable
+ * flag before writing and re-sets it after.
+ *
+ * Exported for `lib/decisionsDigest.ts`, which regenerates whole files too.
+ */
+export async function atomicWrite(
+  filePath: string,
+  content: string,
+  bypassEnforcementTier?: string,
+): Promise<void> {
+  const dir = node_path.dirname(filePath)
+  await node_fs.mkdir(dir, { recursive: true })
+
+  // Clear immutable flag before writing (macOS only, opt-in)
+  if (bypassEnforcementTier === 'immutable') {
+    await clearImmutable(filePath)
+  }
+
+  await writeFileAtomic(filePath, content)
+
+  // Re-set immutable flag after writing (macOS only, opt-in)
+  if (bypassEnforcementTier === 'immutable') {
+    await setImmutable(filePath)
+  }
+}
