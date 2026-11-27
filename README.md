@@ -249,7 +249,7 @@ If you find Intutic useful, please give us a star on GitHub! It helps us support
 
 <div align="center">
 
-[![Star on GitHub](https://img.shields.io/github/stars/intutic/intutic?style=for-the-badge&logo=github&color=24292e)](https://github.com/intutic/intutic)
+[![Star on GitHub](https://img.shields.io/github/stars/intutic/intutic?style=for-the-badge&logo=github&color=24292e)](https://github.com/MeAkash77/SAST-Evaluation-Harness-Guardrails-for-AI-Written-Code.git)
 
 </div>
 
